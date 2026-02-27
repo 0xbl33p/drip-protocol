@@ -1,8 +1,8 @@
 # Kani Proof Strength Audit Results
 
-Generated: 2026-02-21 (updated with 9 INDUCTIVE proofs)
+Generated: 2026-02-27 (updated: 11 INDUCTIVE proofs + §5.4 regression proof + fix)
 
-157 proof harnesses across `/home/anatoly/percolator/tests/kani.rs`.
+158 proof harnesses across `/home/anatoly/percolator/tests/kani.rs`.
 
 Methodology: Each proof analyzed for:
 1. **Input classification**: concrete (hardcoded) vs symbolic (`kani::any()` with `kani::assume`) vs derived
@@ -28,7 +28,7 @@ Scaffolding policy: Concrete values that do NOT affect branch coverage in the fu
 | Classification | Count | Description |
 |---|---|---|
 | **INDUCTIVE** | 11 | Fully symbolic state, decomposed invariants, loop-free delta specs, full u128/i128 domain |
-| **STRONG** | 144 | Symbolic inputs exercise key branches, canonical_inv or equivalent strong assertions, non-vacuous |
+| **STRONG** | 145 | Symbolic inputs exercise key branches, canonical_inv or equivalent strong assertions, non-vacuous |
 | **WEAK** | 0 | -- |
 | **UNIT TEST** | 2 | Intentional meta-test and concrete-oracle scenario test |
 | **VACUOUS** | 0 | All proofs have non-vacuity assertions or trivially reachable assertions |
@@ -37,11 +37,11 @@ Scaffolding policy: Concrete values that do NOT affect branch coverage in the fu
 
 ## Criterion 6: Inductive Strength -- Global Assessment
 
-Of 157 proofs, 11 achieve INDUCTIVE classification using fully symbolic state with decomposed invariants. The remaining 146 proofs share structural patterns that prevent INDUCTIVE classification. This section evaluates the global findings for sub-criteria 6a through 6f for the non-INDUCTIVE proofs.
+Of 158 proofs, 11 achieve INDUCTIVE classification using fully symbolic state with decomposed invariants. The remaining 147 proofs share structural patterns that prevent INDUCTIVE classification. This section evaluates the global findings for sub-criteria 6a through 6f for the non-INDUCTIVE proofs.
 
 ### 6a. State Construction Method
 
-**Finding: 146 of 157 proofs use constructed state. 11 proofs (#147-157) use fully symbolic state.**
+**Finding: 147 of 158 proofs use constructed state. 11 proofs (#147-157) use fully symbolic state.**
 
 Every proof follows the pattern:
 ```rust
@@ -552,7 +552,7 @@ These bounds are necessary because:
 | 145 | `proof_flaw3_warmup_reset_increases_slope_proportionally` | **STRONG** | Constructed | 1 user | Monolithic | Loops | Out-of-cone fixed | Symbolic |
 | 146 | `proof_flaw3_warmup_converts_after_single_slot` | **STRONG** | Constructed | 1 user | Monolithic | Loops | Out-of-cone fixed | Symbolic |
 
-### INDUCTIVE: Abstract Delta Proofs (9 proofs)
+### INDUCTIVE: Abstract Delta Proofs (11 proofs)
 
 These proofs model operations algebraically on fully symbolic state (full u128/i128 domain, no RiskEngine construction, no loops, no bounds), proving decomposed invariant components are preserved for ALL possible pre-states.
 
@@ -561,14 +561,32 @@ These proofs model operations algebraically on fully symbolic state (full u128/i
 | 147 | `inductive_top_up_insurance_preserves_accounting` | **INDUCTIVE** | inv_accounting | 0.87s |
 | 148 | `inductive_set_capital_preserves_accounting` | **INDUCTIVE** | inv_accounting | 0.21s |
 | 149 | `inductive_set_pnl_preserves_pnl_pos_tot_delta` | **INDUCTIVE** | inv_aggregates | 0.47s |
-| 150 | `inductive_set_capital_delta_correct` | **INDUCTIVE** | inv_aggregates | 1.54s |
+| 150 | `inductive_set_capital_delta_correct` | **INDUCTIVE** | inv_aggregates | 1.53s |
 | 151 | `inductive_deposit_preserves_accounting` | **INDUCTIVE** | inv_accounting | 0.82s |
 | 152 | `inductive_withdraw_preserves_accounting` | **INDUCTIVE** | inv_accounting | 0.75s |
 | 153 | `inductive_settle_loss_preserves_accounting` | **INDUCTIVE** | inv_accounting | 0.17s |
-| 154 | `inductive_settle_warmup_profit_preserves_accounting` | **INDUCTIVE** | inv_accounting | 1.69s |
-| 155 | `inductive_settle_warmup_full_preserves_accounting` | **INDUCTIVE** | inv_accounting | 1.51s |
+| 154 | `inductive_settle_warmup_profit_preserves_accounting` | **INDUCTIVE** | inv_accounting | 2.26s |
+| 155 | `inductive_settle_warmup_full_preserves_accounting` | **INDUCTIVE** | inv_accounting | 2.51s |
 | 156 | `inductive_fee_transfer_preserves_accounting` | **INDUCTIVE** | inv_accounting | 0.41s |
-| 157 | `inductive_set_position_delta_correct` | **INDUCTIVE** | inv_aggregates | 1.68s |
+| 157 | `inductive_set_position_delta_correct` | **INDUCTIVE** | inv_aggregates | 1.70s |
+
+### §5.4 Regression: Liquidation Warmup Slope Reset (1 proof)
+
+This proof exercises the real `liquidate_at_oracle` code path with symbolic PnL and oracle values, verifying that warmup slope is correctly reset when mark settlement increases AvailGross during liquidation.
+
+| # | Proof Name | Classification | Property | Verification Time |
+|---|---|---|---|---|
+| 158 | `proof_liquidation_must_reset_warmup_on_mark_increase` | **STRONG** | §5.4 + canonical_inv | 169.35s |
+
+**Audit of proof #158:**
+
+- **C1 (Input classification)**: `initial_pnl` ∈ [1K, 50K] and `oracle_price` ∈ [1_000_001, 1_010_000] are symbolic via `kani::any()`. Capital (500), position (10M), entry (1M), slot (90), LP state are concrete scaffolding.
+- **C2 (Branch coverage)**: Exercises favorable-oracle mark settlement (mark_pnl > 0), liquidation trigger path, profit conversion in settle_warmup_to_capital. All branches in the bug-relevant code path are exercised.
+- **C3 (Invariant strength)**: Asserts `canonical_inv` AND domain-specific `cap_after <= cap_before` (warmup conversion bound). Stronger than canonical_inv alone.
+- **C4 (Vacuity risk)**: Non-vacuous — explicit `assert!(result.unwrap())` confirms liquidation triggers for all symbolic inputs.
+- **C5 (Symbolic collapse)**: Haircut h=1 (large residual >> pnl_pos_tot). Acceptable: bug is about warmup timing, not haircut computation.
+- **C6 (Inductive)**: Not inductive — constructed state, fixed topology, bounded ranges. This is intentional: the bug is an implementation-level missing function call that can only be caught by exercising real code.
+- **TDD**: Proof was written BEFORE the fix and confirmed to FAIL (catching the §5.4 violation). After fixing `touch_account_for_liquidation` to add the warmup slope reset, the proof PASSES.
 
 **Criteria 1-5 Assessment (all 9 proofs):**
 
@@ -870,7 +888,7 @@ These are naturally loop-free because they describe the delta to one slot, not a
 
 ### Criterion 6 (Inductive Strength)
 
-Applied globally (see section above) and per-proof (see summary table). Finding: 11 INDUCTIVE, 144 STRONG, 2 UNIT TEST. The 11 INDUCTIVE proofs (#147-157) achieve fully symbolic state, decomposed invariants, loop-free specs, and full-domain coverage. The remaining 146 proofs share structural limitations (constructed state, fixed topology, monolithic invariant, loop-based specs, out-of-cone fields fixed, bounded ranges).
+Applied globally (see section above) and per-proof (see summary table). Finding: 11 INDUCTIVE, 145 STRONG, 2 UNIT TEST. The 11 INDUCTIVE proofs (#147-157) achieve fully symbolic state, decomposed invariants, loop-free specs, and full-domain coverage. Proof #158 is STRONG (exercises real `liquidate_at_oracle` code to catch §5.4 violation). The remaining 146 proofs share structural limitations (constructed state, fixed topology, monolithic invariant, loop-based specs, out-of-cone fields fixed, bounded ranges).
 
 ---
 
