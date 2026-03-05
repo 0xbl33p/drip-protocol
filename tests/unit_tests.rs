@@ -1740,6 +1740,7 @@ fn test_account_equity_computes_correctly() {
         owner: [0; 32],
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
+        fees_earned_total: U128::ZERO,
     };
     assert_eq!(engine.account_equity(&account_pos), 7_000);
 
@@ -1760,6 +1761,7 @@ fn test_account_equity_computes_correctly() {
         owner: [0; 32],
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
+        fees_earned_total: U128::ZERO,
     };
     assert_eq!(engine.account_equity(&account_neg), 0);
 
@@ -1780,6 +1782,7 @@ fn test_account_equity_computes_correctly() {
         owner: [0; 32],
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
+        fees_earned_total: U128::ZERO,
     };
     assert_eq!(engine.account_equity(&account_profit), 15_000);
 }
