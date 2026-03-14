@@ -1,4 +1,4 @@
-# Risk Engine Spec (Source of Truth) — v9.5
+# Risk Engine Spec (Source of Truth) — v10.0
 ## (Lazy A/K ADL + Non-Compounding Quantity Basis + Exact Wide Arithmetic + Deferred Reset Finalization)
 
 **Design:** **Protected Principal + Junior Profit Claims with Global Haircut Ratio + Lazy A/K Side Indices**
@@ -7,10 +7,14 @@
 
 **Goal:** preserve oracle-manipulation resistance, conservation, bounded insolvency handling, and liveness while supporting lazy ADL across the opposing open-interest side **without global scans, without canonical-order dependencies, and without sequential prefix requirements for user settlement**.
 
-**Key changes from v9.4:**
-- The static phantom-dust cap is replaced by **dynamic per-side phantom dust bounds** that count same-epoch zeroing events since the last reset. This makes bounded dust clearance machine-checkable even after many repeated zeroing events before a full drain.
-- `execute_trade` now performs **explicit post-trade loss settlement from principal** after slippage PnL and trading fees, so the post-trade flat-account and margin checks are unambiguous and source-of-truth deterministic.
-- Reset scheduling semantics are now applied consistently across top-level instructions: `keeper_crank` MUST carry an instruction reset context and run end-of-instruction reset scheduling/finalization; `deposit` is specified as a **pure capital transfer** and MUST NOT implicitly touch positions.
+**Key changes from v9.9:**
+- Capital created by the restart-on-new-profit path must now trigger an **immediate fee-debt sweep** before later steps in the same top-level routine can consume that capital, assess margin, or absorb uncovered losses. This closes the remaining fee-seniority bypass inside `touch_account_full`.
+- Once any top-level instruction schedules a full-drain or precision-exhaustion reset in `ctx.pending_reset_*`, it must **quiesce further live-OI-dependent work** and proceed directly to the end-of-instruction reset helpers. `keeper_crank` now normatively stops processing additional accounts as soon as such a pending reset appears.
+- OI-increasing top-level instructions still preflight-finalize any side already eligible to leave `ResetPending` before applying side-mode gating. A clean empty market can therefore reopen on the same `execute_trade` that brings fresh OI, without depending on a separate keeper or withdrawal instruction.
+- Clean-empty markets still no longer re-trigger full-drain reset scheduling. End-of-instruction dust clearance fires only when there is actual residual dust or residual authoritative OI to clear. A fully drained, fully reconciled market can stably remain in `Normal`.
+- `enqueue_adl` still normatively handles the case where `beta_abs = ceil(D * POS_SCALE / OI)` is not representable as `i256`. In that case the quote deficit routes through `absorb_protocol_loss(D)` while quantity socialization still proceeds.
+- Explicit position mutations that discard a same-epoch fractional remainder still account for that orphaned sub-`1 q` quantity in the per-side `phantom_dust_bound_*_q`.
+- End-of-instruction reset finalization still auto-finalizes any side already in `ResetPending` whose `OI`, `stale_account_count`, and `stored_pos_count` have all reached zero.
 
 ---
 
@@ -84,8 +88,9 @@ The engine MUST satisfy all of the following:
 11. The calculation of same-epoch or epoch-mismatch `pnl_delta` MUST evaluate the signed numerator in an exact intermediate wider than signed 256 bits. A signed 512-bit intermediate is RECOMMENDED.
 12. The haircut paths `floor(PNL_pos_i * h_num / h_den)` and `floor(x * h_num / h_den)` MUST use exact wide `mul_div_floor` arithmetic or a formally equivalent decomposition.
 13. The ADL quote-deficit path `ceil(D * POS_SCALE / OI)` MUST use exact wide `mul_div_ceil` arithmetic or a formally equivalent decomposition.
-14. The ADL representability check MUST be based on the **final** signed addition `K_opp + delta_K_exact`. It is not sufficient to prove that `beta` and `delta_K_exact` are individually representable.
-15. `PNL_i` MUST be maintained in the closed interval `[i256::MIN + 1, i256::MAX]`. Any operation that would set `PNL_i == i256::MIN` is non-compliant and MUST fail conservatively.
+14. If `beta_abs = ceil(D * POS_SCALE / OI)` is not representable as an `i256` magnitude, the engine MUST route the quote deficit through `absorb_protocol_loss(D)` and continue the quantity-socialization path without modifying `K_opp`.
+15. The ADL representability check MUST be based on the **final** signed addition `K_opp + delta_K_exact`. It is not sufficient to prove that `beta` and `delta_K_exact` are individually representable.
+16. `PNL_i` MUST be maintained in the closed interval `[i256::MIN + 1, i256::MAX]`. Any operation that would set `PNL_i == i256::MIN` is non-compliant and MUST fail conservatively.
 
 ### 1.5.1 Reference bound
 Under the concrete bounds above, a single bounded `accrue_market_to` sub-step contributes at most:
@@ -233,6 +238,15 @@ The engine MUST provide a helper that begins a full-drain epoch rollover for one
 
 On success, the engine MUST set `mode_side = Normal`.
 
+**Normative intent:** finalization is not keeper-exclusive. Any top-level external instruction that reaches the end-of-instruction helper in §5.8 MAY automatically finalize a side once these conditions hold.
+
+### 2.8 `maybe_finalize_ready_reset_sides_before_oi_increase()`
+The engine MUST provide a helper that checks each side independently and, if all `finalize_side_reset(side)` preconditions already hold, immediately invokes `finalize_side_reset(side)`.
+
+This helper MUST NOT begin a new reset, mutate `A_side`, `K_side`, `epoch_side`, `OI_eff_side`, or any account state. It may only transition an already-eligible clean-empty side from `ResetPending` to `Normal`.
+
+**Normative intent:** a top-level instruction that may increase OI MUST call this helper after any required account touches that may reconcile stale state and before applying `DrainOnly` / `ResetPending` OI-increase gating. A fully reconciled empty market must therefore be able to reopen on the very instruction that supplies fresh OI; it must not require a separate keeper-only or withdrawal-only finalize trigger.
+
 ---
 
 ## 3. Junior-profit solvency via the global haircut ratio
@@ -305,6 +319,13 @@ For a single logical position change, `set_position_basis_q` MUST be called exac
 ### 4.5 `attach_effective_position(i, new_eff_pos_q)`
 This helper MUST convert a current effective quantity into a new position basis at the current side state.
 
+If the account currently has a nonzero same-epoch basis and this helper is about to discard that basis (by writing either `0` or a different nonzero basis), then the engine MUST first account for any orphaned unresolved same-epoch quantity remainder:
+- let `s = side(basis_pos_q_i)`,
+- if `epoch_snap_i == epoch_s`, compute `rem = (abs(basis_pos_q_i) * A_s) mod a_basis_i` in exact wide arithmetic,
+- if `rem != 0`, invoke `inc_phantom_dust_bound(s)`.
+
+A caller MUST NOT use `attach_effective_position` as a no-op refresh. If `new_eff_pos_q` equals the account's current `effective_pos_q(i)` with the same sign, the helper SHOULD preserve the existing basis and snapshots rather than discard and recreate them.
+
 If `new_eff_pos_q == 0`, it MUST:
 - `set_position_basis_q(i, 0)`
 - reset snapshots to canonical zero-position defaults in the current epoch.
@@ -318,7 +339,7 @@ If `new_eff_pos_q != 0`, it MUST:
 ### 4.6 `inc_phantom_dust_bound(side)`
 This helper MUST increment `phantom_dust_bound_side_q` by exactly `1` q-unit using checked addition.
 
-**Normative intent:** when same-epoch settlement zeroes an account (`q_eff_new == 0`), that account’s exact unresolved contribution to authoritative OI is strictly less than `1` q-unit. The per-side dust bound counts such zeroing events since the last full-drain reset.
+**Normative intent:** each time the engine discards a same-epoch fractional unresolved quantity remainder—whether by same-epoch settlement zeroing an account (`q_eff_new == 0`) or by explicitly replacing a same-epoch basis through `attach_effective_position`—the orphaned amount is strictly less than `1` q-unit. The per-side dust bound counts such events since the last full-drain reset.
 
 ### 4.7 Exact helper definitions (normative)
 The engine MUST use the following exact helpers.
@@ -495,12 +516,12 @@ The engine MUST perform the following in order:
 4. Else (`OI > 0`):
    - require `q_close_q ≤ OI`,
    - let `A_old = A_opp`,
-   - let `OI_post = OI - q_close_q`,
-   - if `D == 0`, set `beta = 0`,
-   - else compute `beta_abs = mul_div_ceil_u256(D, POS_SCALE, OI)`, then `beta = -(beta_abs as i256)` if representable.
-5. If `D > 0`, compute `delta_K_exact = A_old * beta` in an exact wide signed intermediate and test whether `K_opp + delta_K_exact` fits in `i256`.
-   - If it fits, apply `K_opp := K_opp + delta_K_exact`.
-   - If it does **not** fit, invoke `absorb_protocol_loss(D)` instead and do **not** modify `K_opp`.
+   - let `OI_post = OI - q_close_q`.
+5. If `D > 0`, compute `beta_abs = mul_div_ceil_u256(D, POS_SCALE, OI)`.
+   - If `beta_abs` is **not** representable as an `i256` magnitude, invoke `absorb_protocol_loss(D)` and do **not** modify `K_opp`.
+   - Else let `beta = -(beta_abs as i256)`, compute `delta_K_exact = A_old * beta` in an exact wide signed intermediate, and test whether `K_opp + delta_K_exact` fits in `i256`.
+     - If it fits, apply `K_opp := K_opp + delta_K_exact`.
+     - If it does **not** fit, invoke `absorb_protocol_loss(D)` instead and do **not** modify `K_opp`.
 6. If `OI_post == 0`:
    - set `OI_eff_opp := 0`,
    - set `ctx.pending_reset_opp = true`,
@@ -527,24 +548,32 @@ This helper MUST:
    - define `clear_bound_q = 0`.
    - if `stored_pos_count_long == 0`, set `clear_bound_q += phantom_dust_bound_long_q` using checked addition.
    - if `stored_pos_count_short == 0`, set `clear_bound_q += phantom_dust_bound_short_q` using checked addition.
-   - if `OI_eff_long ≤ clear_bound_q` and `OI_eff_short ≤ clear_bound_q`:
-     - set `OI_eff_long = 0`,
-     - set `OI_eff_short = 0`,
-     - set `ctx.pending_reset_long = true`,
-     - set `ctx.pending_reset_short = true`.
-   - else:
-     - fail conservatively. Under the non-compounding basis rule this state is unreachable unless state is corrupt or a required precision-exhaustion drain was skipped.
+   - define `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0) or (phantom_dust_bound_short_q > 0)`.
+   - if `has_residual_clear_work`:
+     - if `OI_eff_long ≤ clear_bound_q` and `OI_eff_short ≤ clear_bound_q`:
+       - set `OI_eff_long = 0`,
+       - set `OI_eff_short = 0`,
+       - set `ctx.pending_reset_long = true`,
+       - set `ctx.pending_reset_short = true`.
+     - else:
+       - fail conservatively. Under the non-compounding basis rule this state is unreachable unless state is corrupt or a required precision-exhaustion drain was skipped.
 2. If `mode_long == DrainOnly` and `OI_eff_long == 0`, set `ctx.pending_reset_long = true`.
 3. If `mode_short == DrainOnly` and `OI_eff_short == 0`, set `ctx.pending_reset_short = true`.
+
+**Normative intent:** a market that is already clean-empty (`stored_pos_count_* = 0`, `phantom_dust_bound_*_q = 0`, `OI_eff_* = 0`) MUST NOT schedule a fresh reset merely because it is empty.
 
 ### 5.8 End-of-instruction reset finalization
 The engine MUST provide a helper `finalize_end_of_instruction_resets(ctx)` that is called exactly once at the end of each top-level external instruction, after §5.7.
 
-It MUST:
+Once either `ctx.pending_reset_long` or `ctx.pending_reset_short` becomes true during a top-level external instruction, that instruction MUST NOT perform any additional account touches, liquidations, or explicit position mutations that rely on live authoritative OI. It MUST proceed directly to §§5.7–5.8 after completing any already-started local bookkeeping that does not read or mutate live side exposure.
+
+It MUST, in order:
 - if `ctx.pending_reset_long` and `mode_long != ResetPending`, invoke `begin_full_drain_reset(long)`.
 - if `ctx.pending_reset_short` and `mode_short != ResetPending`, invoke `begin_full_drain_reset(short)`.
+- if `mode_long == ResetPending` and `OI_eff_long == 0` and `stale_account_count_long == 0` and `stored_pos_count_long == 0`, invoke `finalize_side_reset(long)`.
+- if `mode_short == ResetPending` and `OI_eff_short == 0` and `stale_account_count_short == 0` and `stored_pos_count_short == 0`, invoke `finalize_side_reset(short)`.
 
-**Normative intent:** no helper may increment side epochs mid-instruction. All epoch transitions are deferred until after the instruction's final explicit position attachments have completed.
+**Normative intent:** no helper may increment side epochs mid-instruction. All epoch transitions are deferred until after the instruction's final explicit position attachments have completed. Once a side is already in `ResetPending`, any ordinary top-level instruction that reaches a fully reconciled empty state may also return it to `Normal` at end-of-instruction; a separate keeper-only finalization instruction is not required. Likewise, once a full-drain reset or precision-exhaustion drain has been scheduled in the current instruction, no further live-OI-dependent work may continue in that same instruction.
 
 ---
 
@@ -580,9 +609,10 @@ When an operation increases `AvailGross_i`, the invoking routine MUST provide `o
 
 The engine MUST:
 1. If `old_warmable_i > 0`, execute the profit-conversion logic of §7.4 substituting `x = old_warmable_i`.
-2. After step 1 (or immediately if `old_warmable_i == 0`), update the warmup slope per §6.4 using the **new remaining** `AvailGross_i`.
+2. If step 1 increased `C_i`, the invoking routine MUST immediately execute the fee-debt sweep of §7.5 before any subsequent step in the same top-level routine that may consume capital, assess margin, or absorb uncovered losses.
+3. After step 1 (or immediately if `old_warmable_i == 0`), update the warmup slope per §6.4 using the **new remaining** `AvailGross_i`.
 
-**Normative intent:** already matured profit may be consumed immediately; newly created profit MUST NOT inherit old dormant maturity capacity.
+**Normative intent:** already matured profit may be consumed immediately; newly created profit MUST NOT inherit old dormant maturity capacity. Converted capital MUST NOT bypass already-accrued fee debt merely because the conversion happened inside a restart-on-new-profit path.
 
 ---
 
@@ -703,7 +733,9 @@ If an account cannot be restored by partial liquidation, the engine MUST be able
 1. `touch_account_full(i, oracle_price, now_slot)`.
 2. Let `old_eff_pos_q_i = effective_pos_q(i)`, require `old_eff_pos_q_i != 0`, and let `liq_side = side(old_eff_pos_q_i)`.
 3. The liquidation policy MUST determine the fixed-point base quantity `q_close_q ≥ 0` to be closed synthetically, with `q_close_q ≤ abs(old_eff_pos_q_i)`, and MUST realize any execution slippage into `PNL_i`.
-4. Let `new_eff_pos_q_i = old_eff_pos_q_i - sign(old_eff_pos_q_i) * q_close_q`. Use `attach_effective_position(i, new_eff_pos_q_i)`.
+4. Let `new_eff_pos_q_i = old_eff_pos_q_i - sign(old_eff_pos_q_i) * q_close_q`.
+   - If `new_eff_pos_q_i != old_eff_pos_q_i`, use `attach_effective_position(i, new_eff_pos_q_i)`.
+   - Else preserve the existing basis and snapshots unchanged.
 5. `OI_eff_liq_side` MUST NOT be decremented anywhere except through `enqueue_adl`; do not separately double-decrement it here.
 6. Settle losses from principal (§7.1).
 7. Charge liquidation fee safely:
@@ -721,6 +753,8 @@ If an account cannot be restored by partial liquidation, the engine MUST be able
 **Normative intent:** any synthetically closed quantity `q_close_q` MUST route through ADL even when `D == 0`, so authoritative OI cannot leak on quantity-only bankruptcy closes.
 
 ### 9.6 Side-mode gating
+Before any top-level instruction rejects an OI-increasing operation because a side is in `ResetPending`, it MUST first invoke `maybe_finalize_ready_reset_sides_before_oi_increase()`. If that helper returns the side to `Normal`, ordinary OI-increase checks then proceed against the updated mode.
+
 If `mode_long ∈ {DrainOnly, ResetPending}`, any operation that would increase `OI_eff_long` MUST be rejected.
 If `mode_short ∈ {DrainOnly, ResetPending}`, any operation that would increase `OI_eff_short` MUST be rejected.
 
@@ -736,7 +770,10 @@ Canonical settle routine. MUST perform, in order:
 4. `old_warmable_i = WarmableGross_i` evaluated strictly before any profit-increasing state transition in this call.
 5. `settle_side_effects(i)`
 6. `new_avail = max(PNL_i, 0) - R_i`
-7. if `new_avail > old_avail`, invoke the restart-on-new-profit rule (§6.5) passing `old_warmable_i`
+7. if `new_avail > old_avail`:
+   - record `capital_before_restart = C_i`,
+   - invoke the restart-on-new-profit rule (§6.5) passing `old_warmable_i`,
+   - if `C_i > capital_before_restart`, immediately sweep fee debt (§7.5)
 8. charge account-local maintenance / extend fee debt if any
 9. settle losses from principal (§7.1)
 10. if `effective_pos_q(i) == 0` and `PNL_i < 0`, resolve uncovered loss per §7.3
@@ -773,29 +810,30 @@ Procedure:
 2. `touch_account_full(a, oracle_price, now_slot)`
 3. `touch_account_full(b, oracle_price, now_slot)`
 4. let `old_eff_pos_q_a = effective_pos_q(a)` and `old_eff_pos_q_b = effective_pos_q(b)`
-5. reject if the trade would increase OI on any side whose mode is `DrainOnly` or `ResetPending`
-6. define resulting effective positions:
+5. invoke `maybe_finalize_ready_reset_sides_before_oi_increase()`
+6. reject if the trade would increase OI on any side whose mode is `DrainOnly` or `ResetPending`
+7. define resulting effective positions:
    - `new_eff_pos_q_a = old_eff_pos_q_a + size_q`
    - `new_eff_pos_q_b = old_eff_pos_q_b - size_q`
-7. apply immediate execution-slippage alignment PnL before fees:
+8. apply immediate execution-slippage alignment PnL before fees:
    - `trade_pnl_a = floor_div_signed_conservative(size_q * ((oracle_price as i256) - (exec_price as i256)), POS_SCALE)`
    - `trade_pnl_b = -trade_pnl_a`
    - `set_pnl(a, PNL_a + trade_pnl_a)`
    - `set_pnl(b, PNL_b + trade_pnl_b)`
-8. apply the resulting effective positions using `attach_effective_position(a, new_eff_pos_q_a)` and `attach_effective_position(b, new_eff_pos_q_b)`
-9. update `OI_eff_long` / `OI_eff_short` atomically from before/after effective positions and require each side to remain `≤ MAX_OI_SIDE_Q`
-10. charge explicit trading fees per §8.1 using `size_q` and `exec_price`
-11. settle post-trade losses from principal for both accounts via §7.1
-12. for any account whose `AvailGross_i` increased relative to its post-touch pre-trade state, invoke the restart-on-new-profit rule (§6.5) passing `old_warmable_i = 0` (the pre-trade `touch_account_full` already converted matured entitlement)
-13. if funding-rate inputs changed, recompute `r_last` for the next interval only
-14. enforce post-trade margin:
+9. apply the resulting effective positions using `attach_effective_position(a, new_eff_pos_q_a)` and `attach_effective_position(b, new_eff_pos_q_b)`
+10. update `OI_eff_long` / `OI_eff_short` atomically from before/after effective positions and require each side to remain `≤ MAX_OI_SIDE_Q`
+11. charge explicit trading fees per §8.1 using `size_q` and `exec_price`
+12. settle post-trade losses from principal for both accounts via §7.1
+13. for any account whose `AvailGross_i` increased relative to its post-touch pre-trade state, invoke the restart-on-new-profit rule (§6.5) passing `old_warmable_i = 0` (the pre-trade `touch_account_full` already converted matured entitlement)
+14. if funding-rate inputs changed, recompute `r_last` for the next interval only
+15. enforce post-trade margin:
    - if the resulting effective position is nonzero, always require maintenance,
    - if risk-increasing, also require initial margin,
    - if the resulting effective position is zero, require `PNL_i ≥ 0` after the post-trade loss settlement of step 11; an organic close MUST NOT leave uncovered negative obligations
-15. perform fee-debt sweep (§7.5) if capital was created during settlement / conversion
-16. `schedule_end_of_instruction_resets(ctx)`
-17. `finalize_end_of_instruction_resets(ctx)`
-18. assert `OI_eff_long == OI_eff_short`
+16. perform fee-debt sweep (§7.5) if capital was created during settlement / conversion
+17. `schedule_end_of_instruction_resets(ctx)`
+18. `finalize_end_of_instruction_resets(ctx)`
+19. assert `OI_eff_long == OI_eff_short`
 
 ### 10.5 `liquidate(i, oracle_price, now_slot, ...)`
 Procedure:
@@ -820,7 +858,8 @@ Procedure:
    - advance warmup conversion,
    - sweep fee debt,
    - prioritize accounts on a `DrainOnly` or `ResetPending` side,
-   - and, when `stale_account_count_side == 0` for a `ResetPending` side, call `finalize_side_reset(side)`.
+   - and MAY explicitly call `finalize_side_reset(side)` when its preconditions already hold, although this is not required because step 4 auto-finalizes eligible `ResetPending` sides.
+   - If, during this work, either `ctx.pending_reset_long` or `ctx.pending_reset_short` becomes true, the keeper MUST stop processing further accounts in that instruction and proceed directly to steps 3–4.
 3. `schedule_end_of_instruction_resets(ctx)`
 4. `finalize_end_of_instruction_resets(ctx)`
 
@@ -853,8 +892,15 @@ An implementation MUST include tests that cover:
 19. **Funding anti-retroactivity:** changing rate inputs near the end of an interval does not retroactively reprice earlier slots.
 20. **Flat-account negative remainder:** a flat account with negative `PNL_i` after principal exhaustion resolves through `absorb_protocol_loss`.
 21. **Reset finalization:** after reconciling stale accounts, the side can leave `ResetPending` and accept fresh OI again.
-22. **Post-trade loss settlement:** a solvent trader who closes to flat and can pay losses from principal is not rejected due to an unperformed implicit settlement step.
-23. **Keeper reset lifecycle:** `keeper_crank` can touch the last dusty or stale account and still trigger the required end-of-instruction reset scheduling/finalization.
+22. **Immediate fee seniority after restart conversion:** if the restart-on-new-profit rule converts matured entitlement into `C_i` while fee debt is outstanding, the fee-debt sweep occurs immediately before later loss-settlement or margin logic can consume that new capital.
+23. **Post-trade loss settlement:** a solvent trader who closes to flat and can pay losses from principal is not rejected due to an unperformed implicit settlement step.
+24. **Keeper quiescence after pending reset:** if a keeper-triggered `enqueue_adl` or precision-exhaustion terminal drain schedules any reset, the same keeper instruction performs no further live-OI-dependent account processing before end-of-instruction reset handling.
+25. **Keeper reset lifecycle:** `keeper_crank` can touch the last dusty or stale account and still trigger the required end-of-instruction reset scheduling/finalization.
+26. **Clean-empty market lifecycle:** a fully drained and fully reconciled market can return to `Normal` and admit fresh OI without getting stuck in a reset loop.
+27. **Non-representable beta fallback:** if `beta_abs` is not representable as `i256`, quote deficit routes through `absorb_protocol_loss` while quantity socialization still proceeds.
+28. **Explicit-mutation dust accounting:** if a trade or liquidation discards a same-epoch basis whose exact effective quantity had a nonzero fractional remainder, `phantom_dust_bound_side_q` increases by exactly `1` q-unit.
+29. **Automatic reset finalization:** the top-level instruction that reconciles the last stale account can leave the side in `Normal` at end-of-instruction without requiring a separate keeper-only finalize call.
+30. **Trade-path reopenability:** if a side is already `ResetPending` but also already eligible for `finalize_side_reset`, an `execute_trade` instruction can auto-finalize that side before OI-increase gating and admit fresh OI in the same instruction.
 
 ---
 
@@ -923,10 +969,13 @@ enqueue_adl(ctx, liq_side, q_close_q, D):
 
     if D > 0:
         beta_abs = mul_div_ceil_u256(D, POS_SCALE, OI)
-        beta = -(beta_abs as i256)
-        delta_K_exact = A_old * beta        # wide signed intermediate
-        if fits_i256(K_opp + delta_K_exact):
-            K_opp = K_opp + delta_K_exact
+        if representable_i256_magnitude(beta_abs):
+            beta = -(beta_abs as i256)
+            delta_K_exact = A_old * beta        # wide signed intermediate
+            if fits_i256(K_opp + delta_K_exact):
+                K_opp = K_opp + delta_K_exact
+            else:
+                absorb_protocol_loss(D)
         else:
             absorb_protocol_loss(D)
 
@@ -950,7 +999,16 @@ enqueue_adl(ctx, liq_side, q_close_q, D):
     ctx.pending_reset_liq_side = true
 ```
 
-### 12.5 End-of-instruction dust clearance
+### 12.5 Finalize-ready preflight for OI-increasing instructions
+```text
+maybe_finalize_ready_reset_sides_before_oi_increase():
+    if mode_long == ResetPending and OI_eff_long == 0 and stale_account_count_long == 0 and stored_pos_count_long == 0:
+        finalize_side_reset(long)
+    if mode_short == ResetPending and OI_eff_short == 0 and stale_account_count_short == 0 and stored_pos_count_short == 0:
+        finalize_side_reset(short)
+```
+
+### 12.6 End-of-instruction dust clearance
 ```text
 schedule_end_of_instruction_resets(ctx):
     if stored_pos_count_long == 0 or stored_pos_count_short == 0:
@@ -959,13 +1017,15 @@ schedule_end_of_instruction_resets(ctx):
             clear_bound_q += phantom_dust_bound_long_q
         if stored_pos_count_short == 0:
             clear_bound_q += phantom_dust_bound_short_q
-        if OI_eff_long <= clear_bound_q and OI_eff_short <= clear_bound_q:
-            OI_eff_long = 0
-            OI_eff_short = 0
-            ctx.pending_reset_long = true
-            ctx.pending_reset_short = true
-        else:
-            fail_conservatively()
+        has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0) or (phantom_dust_bound_short_q > 0)
+        if has_residual_clear_work:
+            if OI_eff_long <= clear_bound_q and OI_eff_short <= clear_bound_q:
+                OI_eff_long = 0
+                OI_eff_short = 0
+                ctx.pending_reset_long = true
+                ctx.pending_reset_short = true
+            else:
+                fail_conservatively()
 
     if mode_long == DrainOnly and OI_eff_long == 0:
         ctx.pending_reset_long = true
@@ -977,6 +1037,10 @@ finalize_end_of_instruction_resets(ctx):
         begin_full_drain_reset(long)
     if ctx.pending_reset_short and mode_short != ResetPending:
         begin_full_drain_reset(short)
+    if mode_long == ResetPending and OI_eff_long == 0 and stale_account_count_long == 0 and stored_pos_count_long == 0:
+        finalize_side_reset(long)
+    if mode_short == ResetPending and OI_eff_short == 0 and stale_account_count_short == 0 and stored_pos_count_short == 0:
+        finalize_side_reset(short)
 ```
 
 ---
@@ -988,4 +1052,3 @@ finalize_end_of_instruction_resets(ctx):
 - Same-epoch quantity settlement is local and non-compounding. The design does **not** require a canonical-order carry allocator.
 - Rare side-precision stress is handled by `DrainOnly`, dynamically bounded dust clearance, and precision-exhaustion terminal drain rather than assertion failure or permanent market deadlock.
 - Any upgrade path from a version that did not maintain `basis_pos_q_i`, `a_basis_i`, `stored_pos_count_*`, `stale_account_count_*`, or `phantom_dust_bound_*_q` consistently MUST complete migration before OI-increasing operations are re-enabled.
-
