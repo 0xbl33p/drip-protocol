@@ -3186,3 +3186,86 @@ fn t11_54_worked_example_regression() {
     // Conservation check
     assert!(engine.check_conservation(), "conservation must hold after ADL + settle");
 }
+
+// ============================================================================
+// TIER 12: ADL TRUNCATION DUST PROOF
+// ============================================================================
+
+// ============================================================================
+// T12.53: ADL global A truncation dust must not deadlock market resets
+// ============================================================================
+
+/// Proof-driven development: verify that the floor truncation in
+/// A_candidate = floor(A_old * OI_post / OI) does NOT leave untracked
+/// phantom dust that prevents schedule_end_of_instruction_resets from
+/// succeeding when all positions are closed.
+///
+/// The scenario:
+///   1. One user on the long side with basis = 10*POS_SCALE, a_basis = 7
+///      (A_side = 7, so effective = floor(10*POS_SCALE * 7 / 7) = 10*POS_SCALE)
+///   2. ADL closes POS_SCALE on the short side, shrinking opp (long) side:
+///      OI_post = 9*POS_SCALE, A_new = floor(7 * 9 / 10) = 6
+///   3. User's new effective = floor(10*POS_SCALE * 6 / 7) ≈ 8.571*POS_SCALE
+///   4. OI_eff = 9*POS_SCALE, effective ≈ 8.571*POS_SCALE
+///      → truncation dust = OI_eff - effective ≈ 0.429*POS_SCALE ≈ 7.9e18 q-units
+///   5. phantom_dust_bound = 1 (per-user increment from closing)
+///      → 7.9e18 >> 1 → schedule_end_of_instruction_resets returns CorruptState
+///      → MARKET DEADLOCK
+#[kani::proof]
+#[kani::solver(cadical)]
+fn t12_53_adl_truncation_dust_must_not_deadlock() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
+
+    // Set up: 1 user on the long side.
+    // A_side_long = 7 (small, to maximize OI/A truncation ratio).
+    // User has basis = 10*POS_SCALE, a_basis = 7, so effective = 10*POS_SCALE.
+    engine.adl_mult_long = 7;
+    engine.adl_coeff_long = I256::ZERO;
+    engine.oi_eff_long_q = U256::from_u128(10 * POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(10 * POS_SCALE);
+
+    // ADL closes POS_SCALE on liq_side=Short.
+    // opp = Long: OI_post = 10*POS_SCALE - POS_SCALE = 9*POS_SCALE
+    // A_new = floor(7 * 9*POS_SCALE / (10*POS_SCALE)) = floor(63/10) = 6
+    let result = engine.enqueue_adl(
+        &mut ctx, Side::Short, U256::from_u128(POS_SCALE), U256::ZERO,
+    );
+    assert!(result.is_ok());
+    assert!(engine.adl_mult_long == 6, "A_new must be floor(7*9/10) = 6");
+    assert!(engine.oi_eff_long_q == U256::from_u128(9 * POS_SCALE));
+
+    // Compute the user's post-ADL effective position:
+    // floor(10*POS_SCALE * 6 / 7) — this is what OI_eff will be reduced by
+    // when the user closes.
+    let effective = mul_div_floor_u256(
+        U256::from_u128(10 * POS_SCALE),
+        U256::from_u128(6),
+        U256::from_u128(7),
+    );
+
+    // Simulate user closing: subtract their effective from OI_eff
+    engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(effective).unwrap();
+
+    // The residual in OI_eff is the global A truncation dust.
+    // It equals: 9*POS_SCALE - floor(60*POS_SCALE / 7) = 9*POS_SCALE - 8*POS_SCALE - floor(4*POS_SCALE/7)
+    //          = POS_SCALE - floor(4*POS_SCALE/7) = ceil(3*POS_SCALE/7)
+    //          ≈ 0.429 * POS_SCALE ≈ 7.9e18 q-units
+    assert!(!engine.oi_eff_long_q.is_zero(), "truncation dust must be nonzero");
+
+    // Simulate post-close state: no stored positions
+    engine.stored_pos_count_long = 0;
+    engine.stored_pos_count_short = 0;
+    // Add per-user dust increment (1 q-unit from the user's position being detached)
+    // on top of whatever enqueue_adl already contributed.
+    engine.phantom_dust_bound_long_q = engine.phantom_dust_bound_long_q
+        .checked_add(U256::from_u128(1)).unwrap();
+    engine.phantom_dust_bound_short_q = U256::ZERO;
+    engine.oi_eff_short_q = U256::ZERO;
+
+    // The market MUST be able to reset. schedule_end_of_instruction_resets
+    // should succeed so the market can transition to a fresh epoch.
+    // With the bug: returns Err(CorruptState) because OI_eff (≈0.429*POS_SCALE) > bound (1).
+    let reset_result = engine.schedule_end_of_instruction_resets(&mut ctx);
+    assert!(reset_result.is_ok(), "ADL truncation dust must not deadlock market reset");
+}

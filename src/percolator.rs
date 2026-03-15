@@ -1231,6 +1231,25 @@ impl RiskEngine {
             let a_new = u256_to_u128_sat(&a_candidate);
             self.set_a_side(opp, a_new);
             self.set_oi_eff(opp, oi_post);
+            // Step 7b: account for global A truncation dust.
+            // floor(A_old * OI_post / OI) loses up to ceil(OI / A_old) q-units
+            // of phantom OI that no individual user can ever close. Without
+            // tracking this, schedule_end_of_instruction_resets deadlocks when
+            // all positions close but OI_eff retains untracked dust.
+            let a_old_u256 = U256::from_u128(a_old);
+            let trunc_dust = ceil_div_positive_checked(oi, a_old_u256);
+            match opp {
+                Side::Long => {
+                    self.phantom_dust_bound_long_q = self.phantom_dust_bound_long_q
+                        .checked_add(trunc_dust)
+                        .unwrap_or(U256::MAX);
+                }
+                Side::Short => {
+                    self.phantom_dust_bound_short_q = self.phantom_dust_bound_short_q
+                        .checked_add(trunc_dust)
+                        .unwrap_or(U256::MAX);
+                }
+            }
             if a_new < MIN_A_SIDE {
                 self.set_side_mode(opp, SideMode::DrainOnly);
             }
