@@ -361,17 +361,17 @@ pub struct CrankOutcome {
 
 #[inline]
 fn add_u128(a: u128, b: u128) -> u128 {
-    a.saturating_add(b)
+    a.checked_add(b).expect("add_u128 overflow")
 }
 
 #[inline]
 fn sub_u128(a: u128, b: u128) -> u128 {
-    a.saturating_sub(b)
+    a.checked_sub(b).expect("sub_u128 underflow")
 }
 
 #[inline]
 fn mul_u128(a: u128, b: u128) -> u128 {
-    a.saturating_mul(b)
+    a.checked_mul(b).expect("mul_u128 overflow")
 }
 
 /// Determine which side a signed position is on. Positive = long, negative = short.
@@ -677,9 +677,31 @@ impl RiskEngine {
 
     /// attach_effective_position (spec §4.5)
     pub fn attach_effective_position(&mut self, idx: usize, new_eff_pos_q: I256) {
+        // Before replacing a nonzero same-epoch basis, account for the fractional
+        // remainder that will be orphaned (dynamic dust accounting).
+        let old_basis = self.accounts[idx].position_basis_q;
+        if !old_basis.is_zero() {
+            if let Some(old_side) = side_of_i256(&old_basis) {
+                let epoch_snap = self.accounts[idx].adl_epoch_snap;
+                let epoch_side = self.get_epoch_side(old_side);
+                if epoch_snap == epoch_side {
+                    let a_basis = self.accounts[idx].adl_a_basis;
+                    if a_basis != 0 {
+                        let a_side = self.get_a_side(old_side);
+                        let abs_basis = old_basis.abs_u256();
+                        if let Some(product) = abs_basis.checked_mul(U256::from_u128(a_side)) {
+                            if let Some(rem) = product.checked_rem(U256::from_u128(a_basis)) {
+                                if !rem.is_zero() {
+                                    self.inc_phantom_dust_bound(old_side);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if new_eff_pos_q.is_zero() {
-            // Determine old side for epoch/K reference before zeroing basis
-            let old_basis = self.accounts[idx].position_basis_q;
             self.set_position_basis_q(idx, I256::ZERO);
             // Reset snapshots to canonical zero-position defaults in current epoch (spec §4.5)
             self.accounts[idx].adl_a_basis = ADL_ONE;
@@ -1322,6 +1344,28 @@ impl RiskEngine {
         if ctx.pending_reset_short && self.side_mode_short != SideMode::ResetPending {
             self.begin_full_drain_reset(Side::Short);
         }
+        // Auto-finalize sides that are fully ready for reopening
+        self.maybe_finalize_ready_reset_sides();
+    }
+
+    /// Preflight finalize: if a side is ResetPending with OI=0, stale=0, pos_count=0,
+    /// transition it back to Normal so fresh OI can be added.
+    /// Called before OI-increase gating and at end-of-instruction.
+    pub fn maybe_finalize_ready_reset_sides(&mut self) {
+        if self.side_mode_long == SideMode::ResetPending
+            && self.get_oi_eff(Side::Long).is_zero()
+            && self.get_stale_count(Side::Long) == 0
+            && self.get_stored_pos_count(Side::Long) == 0
+        {
+            self.set_side_mode(Side::Long, SideMode::Normal);
+        }
+        if self.side_mode_short == SideMode::ResetPending
+            && self.get_oi_eff(Side::Short).is_zero()
+            && self.get_stale_count(Side::Short) == 0
+            && self.get_stored_pos_count(Side::Short) == 0
+        {
+            self.set_side_mode(Side::Short, SideMode::Normal);
+        }
     }
 
     // ========================================================================
@@ -1523,7 +1567,7 @@ impl RiskEngine {
         }
     }
 
-    /// do_profit_conversion (spec §7.4): convert warmable x to capital
+    /// do_profit_conversion (spec §7.4): convert warmable x to capital — checked.
     fn do_profit_conversion(&mut self, idx: usize, x: U256) {
         if x.is_zero() {
             return;
@@ -1535,17 +1579,15 @@ impl RiskEngine {
         } else {
             mul_div_floor_u256(x, h_num, h_den)
         };
-        let y_u128 = u256_to_u128_sat(&y);
+        let y_u128 = y.try_into_u128().expect("do_profit_conversion: y exceeds u128");
 
         // set_pnl(i, PNL_i - x)
         let x_i256 = I256::from_raw_u256_pub(x);
         let old_pnl = self.accounts[idx].pnl;
-        let new_pnl = old_pnl.checked_sub(x_i256).unwrap_or(I256::ZERO);
-        if new_pnl == I256::MIN {
-            self.set_pnl(idx, I256::from_i128(-1).saturating_add(I256::MIN)); // should not happen, but safe
-        } else {
-            self.set_pnl(idx, new_pnl);
-        }
+        let new_pnl = old_pnl.checked_sub(x_i256)
+            .expect("do_profit_conversion: PnL underflow");
+        assert!(new_pnl != I256::MIN, "do_profit_conversion: PnL == I256::MIN");
+        self.set_pnl(idx, new_pnl);
 
         // set_capital(i, C_i + y)
         let new_cap = add_u128(self.accounts[idx].capital.get(), y_u128);
@@ -1587,8 +1629,10 @@ impl RiskEngine {
         let pay = core::cmp::min(debt, cap);
         if pay > 0 {
             self.set_capital(idx, cap - pay);
+            let pay_i128 = core::cmp::min(pay, i128::MAX as u128) as i128;
             self.accounts[idx].fee_credits = self.accounts[idx].fee_credits
-                .saturating_add(pay as i128);
+                .checked_add(pay_i128)
+                .unwrap_or(I128::new(0)); // repaying debt: result should be <= 0, no overflow
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
         }
     }
@@ -1614,7 +1658,14 @@ impl RiskEngine {
         // Step 6-7: check if avail increased → restart-on-new-profit
         let new_avail = self.avail_gross(idx);
         if new_avail > old_avail {
+            let cap_before = self.accounts[idx].capital.get();
             self.restart_on_new_profit(idx, old_warmable);
+            // Fee-debt seniority: if restart conversion increased capital,
+            // sweep fee debt immediately before any later capital-consuming logic.
+            let cap_after = self.accounts[idx].capital.get();
+            if cap_after > cap_before {
+                self.fee_debt_sweep(idx);
+            }
         }
 
         // Step 8: maintenance fees
@@ -1635,18 +1686,27 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// Internal maintenance fee settle (best-effort, no margin check)
+    /// Internal maintenance fee settle — checked arithmetic, no margin check.
     fn settle_maintenance_fee_internal(&mut self, idx: usize, now_slot: u64) {
         let dt = now_slot.saturating_sub(self.accounts[idx].last_fee_slot);
         if dt == 0 {
             return;
         }
-        let due = self.params.maintenance_fee_per_slot.get().saturating_mul(dt as u128);
+        let fee_per_slot = self.params.maintenance_fee_per_slot.get();
+        // If fee_per_slot * dt would overflow u128, cap due at i128::MAX.
+        // This is a bounded-failure approach: we never silently lose the overflow,
+        // but we also don't panic on a potentially-reachable config.
+        let due = match fee_per_slot.checked_mul(dt as u128) {
+            Some(d) => d,
+            None => i128::MAX as u128,  // cap: more than enough to exhaust any credits
+        };
         self.accounts[idx].last_fee_slot = now_slot;
 
-        // Deduct from fee_credits
+        // Deduct from fee_credits — checked
+        let due_i128 = core::cmp::min(due, i128::MAX as u128) as i128;
         self.accounts[idx].fee_credits = self.accounts[idx].fee_credits
-            .saturating_sub(due as i128);
+            .checked_sub(due_i128)
+            .unwrap_or(I128::new(i128::MIN + 1)); // floor at MIN+1 to avoid I128::MIN sentinel
 
         // Pay from capital if negative
         if self.accounts[idx].fee_credits.is_negative() {
@@ -1658,8 +1718,10 @@ impl RiskEngine {
                 self.set_capital(idx, cap - pay);
                 self.insurance_fund.balance = self.insurance_fund.balance + pay;
                 self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
+                let pay_i128 = core::cmp::min(pay, i128::MAX as u128) as i128;
                 self.accounts[idx].fee_credits = self.accounts[idx].fee_credits
-                    .saturating_add(pay as i128);
+                    .checked_add(pay_i128)
+                    .unwrap_or(I128::new(0)); // should not overflow since we're repaying debt
             }
         }
     }
@@ -1903,6 +1965,12 @@ impl RiskEngine {
         self.touch_account_full(a as usize, oracle_price, now_slot)?;
         self.touch_account_full(b as usize, oracle_price, now_slot)?;
 
+        // Capture post-touch, pre-trade AvailGross and warmable for restart logic
+        let old_avail_a = self.avail_gross(a as usize);
+        let old_warmable_a = self.warmable_gross(a as usize);
+        let old_avail_b = self.avail_gross(b as usize);
+        let old_warmable_b = self.warmable_gross(b as usize);
+
         // Step 4: capture old effective positions
         let old_eff_a = self.effective_pos_q(a as usize);
         let old_eff_b = self.effective_pos_q(b as usize);
@@ -1919,6 +1987,10 @@ impl RiskEngine {
         if !new_eff_b.is_zero() && new_eff_b.abs_u256() > max_position_abs_q() {
             return Err(RiskError::Overflow);
         }
+
+        // Preflight: finalize any ResetPending sides that are fully ready,
+        // so OI-increase gating doesn't block trades on reopenable sides.
+        self.maybe_finalize_ready_reset_sides();
 
         // Step 5: reject if trade would increase OI on a blocked side
         self.check_side_mode_for_trade(&old_eff_a, &new_eff_a)?;
@@ -1976,12 +2048,15 @@ impl RiskEngine {
         self.settle_losses(a as usize);
         self.settle_losses(b as usize);
 
-        // Step 12: restart-on-new-profit for accounts whose AvailGross increased
-        for &account_idx in &[a as usize, b as usize] {
-            let new_avail = self.avail_gross(account_idx);
-            if !new_avail.is_zero() {
-                // old_warmable = 0 since touch already converted
-                self.restart_on_new_profit(account_idx, U256::ZERO);
+        // Step 12: restart-on-new-profit only for accounts whose AvailGross actually increased
+        {
+            let new_avail_a = self.avail_gross(a as usize);
+            if new_avail_a > old_avail_a {
+                self.restart_on_new_profit(a as usize, old_warmable_a);
+            }
+            let new_avail_b = self.avail_gross(b as usize);
+            if new_avail_b > old_avail_b {
+                self.restart_on_new_profit(b as usize, old_warmable_b);
             }
         }
 
@@ -2009,8 +2084,12 @@ impl RiskEngine {
                 }
             }
         } else {
-            // Flat: require PNL >= 0 (losses already settled in step 11)
-            self.resolve_flat_negative(a as usize);
+            // Flat: after settle_losses, PnL must be >= 0.
+            // Do NOT call resolve_flat_negative — that would let the protocol
+            // absorb losses that should force this trade to be rejected.
+            if self.accounts[a as usize].pnl.is_negative() {
+                return Err(RiskError::Undercollateralized);
+            }
         }
 
         // Account b
@@ -2031,8 +2110,10 @@ impl RiskEngine {
                 }
             }
         } else {
-            // Flat: require PNL >= 0 (losses already settled in step 11)
-            self.resolve_flat_negative(b as usize);
+            // Flat: after settle_losses, PnL must be >= 0.
+            if self.accounts[b as usize].pnl.is_negative() {
+                return Err(RiskError::Undercollateralized);
+            }
         }
 
         // Step 15: fee debt sweep
@@ -2049,7 +2130,7 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// Charge fee safely per spec §8.1
+    /// Charge fee per spec §8.1 — checked, panics on overflow (corruption).
     fn charge_fee_safe(&mut self, idx: usize, fee: u128) {
         let cap = self.accounts[idx].capital.get();
         let fee_paid = core::cmp::min(fee, cap);
@@ -2062,13 +2143,10 @@ impl RiskEngine {
         if fee_shortfall > 0 {
             let shortfall_i256 = I256::from_u128(fee_shortfall);
             let old_pnl = self.accounts[idx].pnl;
-            let new_pnl = old_pnl.checked_sub(shortfall_i256).unwrap_or(I256::from_i128(i128::MIN as i128 + 1));
-            if new_pnl == I256::MIN {
-                // Clamp to MIN+1
-                self.set_pnl(idx, I256::MIN.checked_add(I256::ONE).unwrap_or(I256::ZERO));
-            } else {
-                self.set_pnl(idx, new_pnl);
-            }
+            let new_pnl = old_pnl.checked_sub(shortfall_i256)
+                .expect("charge_fee_safe: PnL underflow");
+            assert!(new_pnl != I256::MIN, "charge_fee_safe: PnL == I256::MIN");
+            self.set_pnl(idx, new_pnl);
         }
     }
 
@@ -2123,13 +2201,15 @@ impl RiskEngine {
         if let Some(old_side) = side_of_i256(old_eff) {
             let abs_old = old_eff.abs_u256();
             let oi = self.get_oi_eff(old_side);
-            self.set_oi_eff(old_side, oi.saturating_sub(abs_old));
+            let new_oi = oi.checked_sub(abs_old).ok_or(RiskError::CorruptState)?;
+            self.set_oi_eff(old_side, new_oi);
         }
         // Add new to its side
         if let Some(new_side) = side_of_i256(new_eff) {
             let abs_new = new_eff.abs_u256();
             let oi = self.get_oi_eff(new_side);
-            self.set_oi_eff(new_side, oi.saturating_add(abs_new));
+            let new_oi = oi.checked_add(abs_new).ok_or(RiskError::Overflow)?;
+            self.set_oi_eff(new_side, new_oi);
         }
         Ok(())
     }
@@ -2138,11 +2218,34 @@ impl RiskEngine {
     // liquidate_at_oracle (spec §10.5 + §9.5)
     // ========================================================================
 
+    /// Top-level liquidation: creates its own InstructionContext and finalizes resets.
     pub fn liquidate_at_oracle(
         &mut self,
         idx: u16,
         now_slot: u64,
         oracle_price: u64,
+    ) -> Result<bool> {
+        let mut ctx = InstructionContext::new();
+        let result = self.liquidate_at_oracle_internal(idx, now_slot, oracle_price, &mut ctx)?;
+        if result {
+            // End-of-instruction resets (spec §10.5 steps 6-7)
+            let _ = self.schedule_end_of_instruction_resets(&mut ctx);
+            self.finalize_end_of_instruction_resets(&ctx);
+
+            // Assert OI balance (spec §10.5)
+            assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
+        }
+        Ok(result)
+    }
+
+    /// Internal liquidation routine: takes caller's shared InstructionContext.
+    /// Does NOT call schedule/finalize resets — caller is responsible.
+    fn liquidate_at_oracle_internal(
+        &mut self,
+        idx: u16,
+        now_slot: u64,
+        oracle_price: u64,
+        ctx: &mut InstructionContext,
     ) -> Result<bool> {
         self.current_slot = now_slot;
 
@@ -2153,8 +2256,6 @@ impl RiskEngine {
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
-
-        let mut ctx = InstructionContext::new();
 
         // Step 2: touch
         self.touch_account_full(idx as usize, oracle_price, now_slot)?;
@@ -2206,20 +2307,13 @@ impl RiskEngine {
 
         // Step 9: enqueue ADL
         if !q_close_q.is_zero() || !d.is_zero() {
-            self.enqueue_adl(&mut ctx, liq_side, q_close_q, d)?;
+            self.enqueue_adl(ctx, liq_side, q_close_q, d)?;
         }
 
         // Step 10: if D > 0, set_pnl(i, 0)
         if !d.is_zero() {
             self.set_pnl(idx as usize, I256::ZERO);
         }
-
-        // End-of-instruction resets (spec §10.5 steps 6-7)
-        let _ = self.schedule_end_of_instruction_resets(&mut ctx);
-        self.finalize_end_of_instruction_resets(&ctx);
-
-        // Step 8: assert OI balance (spec §10.5)
-        assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
 
         self.lifetime_liquidations = self.lifetime_liquidations.saturating_add(1);
 
@@ -2284,6 +2378,12 @@ impl RiskEngine {
         let mut slots_scanned: usize = 0;
 
         while accounts_processed < ACCOUNTS_PER_CRANK && slots_scanned < MAX_ACCOUNTS {
+            // If a pending reset has been triggered, stop live-OI-dependent work
+            // immediately — go straight to end-of-instruction reset handling.
+            if ctx.pending_reset_long || ctx.pending_reset_short {
+                break;
+            }
+
             slots_scanned += 1;
 
             let block = idx >> 6;
@@ -2296,12 +2396,12 @@ impl RiskEngine {
                 // Touch account (best-effort)
                 let _ = self.touch_account_full(idx, oracle_price, now_slot);
 
-                // Liquidation
-                if liq_budget > 0 {
+                // Liquidation — uses internal routine sharing crank's ctx
+                if liq_budget > 0 && !ctx.pending_reset_long && !ctx.pending_reset_short {
                     let eff = self.effective_pos_q(idx);
                     if !eff.is_zero() {
                         if !self.is_above_maintenance_margin(&self.accounts[idx], idx, oracle_price) {
-                            match self.liquidate_at_oracle(idx as u16, now_slot, oracle_price) {
+                            match self.liquidate_at_oracle_internal(idx as u16, now_slot, oracle_price, &mut ctx) {
                                 Ok(true) => {
                                     num_liquidations += 1;
                                     liq_budget = liq_budget.saturating_sub(1);
@@ -2313,18 +2413,6 @@ impl RiskEngine {
                             }
                         }
                     }
-                }
-
-                // Try to finalize resets for sides in ResetPending
-                if self.side_mode_long == SideMode::ResetPending
-                    && self.stale_account_count_long == 0
-                {
-                    let _ = self.finalize_side_reset(Side::Long);
-                }
-                if self.side_mode_short == SideMode::ResetPending
-                    && self.stale_account_count_short == 0
-                {
-                    let _ = self.finalize_side_reset(Side::Short);
                 }
             }
 

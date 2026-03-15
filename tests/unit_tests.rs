@@ -699,7 +699,10 @@ fn test_reset_pending_blocks_new_trades() {
     let oracle = 1000u64;
     let slot = 1u64;
 
+    // ResetPending with stale_account_count > 0 is NOT auto-finalizable,
+    // so it must still block OI-increasing trades.
     engine.side_mode_short = SideMode::ResetPending;
+    engine.stale_account_count_short = 1;
 
     // b would go long (opposite of short blocked), a goes short — short increase blocked
     let size_q = make_size_q(-50); // a goes short
