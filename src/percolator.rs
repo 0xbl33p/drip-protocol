@@ -2391,11 +2391,13 @@ impl RiskEngine {
     ) -> Result<bool> {
         let mut ctx = InstructionContext::new();
         let result = self.liquidate_at_oracle_internal(idx, now_slot, oracle_price, &mut ctx)?;
-        if result {
-            // End-of-instruction resets (spec §10.5 steps 6-7)
-            self.schedule_end_of_instruction_resets(&mut ctx)?;
-            self.finalize_end_of_instruction_resets(&ctx);
 
+        // End-of-instruction resets must run unconditionally because
+        // touch_account_full mutates state even when liquidation doesn't proceed.
+        self.schedule_end_of_instruction_resets(&mut ctx)?;
+        self.finalize_end_of_instruction_resets(&ctx);
+
+        if result {
             // Assert OI balance (spec §10.5)
             assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
         }
