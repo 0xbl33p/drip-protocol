@@ -1,4 +1,4 @@
-//! Layered A/K proof suite for Kani — v10.0 Risk Engine
+//! Layered A/K proof suite for Kani — v10.5 Risk Engine
 //!
 //! Architecture:
 //!   - Tier 0: Arithmetic helper proofs (pure, loop-free)
@@ -8,7 +8,7 @@
 //!   - Tier 4: ADL enqueue proofs
 //!   - Tier 5: Dust / fixed-point proofs
 //!   - Tier 6: Focused scenario proofs (regressions)
-//!   - Tier 7: Non-compounding basis proofs (v10.0)
+//!   - Tier 7: Non-compounding basis proofs (v10.5)
 //!   - Tier 8: Real engine integration proofs
 //!   - Tier 9: Fee / warmup proofs
 //!   - Tier 10: accrue_market_to proofs
@@ -625,11 +625,9 @@ fn t1_8_adl_deficit_only_lazy_equals_eager() {
     // Total loss per account = floor(q_base * D / OI)
     let eager_loss = ((q_base as i32) * (d as i32)) / (oi as i32);
 
-    // Lazy: beta = -ceil(D * POS_SCALE / OI), delta_K = A * beta
-    // For small model: beta_abs = ceil(d * POS_SCALE / oi)
-    let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
-    // delta_K = -(A_side * beta_abs)
-    let delta_k = -((a_side as i32) * (beta_abs as i32));
+    // Lazy (v10.5): delta_K_abs = ceil(D * A * POS_SCALE / OI) (fused)
+    let delta_k_abs = ((d as u32) * (a_side as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+    let delta_k = -(delta_k_abs as i32);
     let k_after = k_init + delta_k;
     let k_diff = k_after - k_init;
 
@@ -677,9 +675,9 @@ fn t1_9_adl_quantity_plus_deficit_lazy_conservative() {
     assert!(lazy_q <= eager_q, "lazy must not exceed eager quantity");
     assert!(eager_q - lazy_q <= 1, "lazy error bounded by 1 base unit");
 
-    // PnL: deficit is socialized via K
-    let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
-    let delta_k = -((a_old as i32) * (beta_abs as i32));
+    // PnL: deficit is socialized via K (v10.5 fused)
+    let delta_k_abs = ((d as u32) * (a_old as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+    let delta_k = -(delta_k_abs as i32);
     let lazy_loss = -lazy_pnl(basis_q, delta_k, a_old);
     let eager_loss = ((q_base as i32) * (d as i32)) / (oi as i32);
 
@@ -1275,8 +1273,8 @@ fn t4_18_precision_exhaustion_both_sides_reset() {
 // ============================================================================
 
 /// Algebraic: when OI_post == 0 and D > 0, the deficit modifies K before
-/// the pending reset is triggered. Models enqueue_adl logic:
-///   1. D > 0 → beta_abs = ceil(D * POS_SCALE / OI), delta_K = -A * beta_abs
+/// the pending reset is triggered. Models enqueue_adl logic (v10.5):
+///   1. D > 0 → delta_K_abs = ceil(D * A * POS_SCALE / OI), delta_K = -delta_K_abs
 ///   2. K_opp += delta_K
 ///   3. OI_post == 0 → pending reset signaled
 #[kani::proof]
@@ -1291,11 +1289,9 @@ fn t4_19_full_drain_terminal_k_includes_deficit() {
     let a_opp = S_ADL_ONE;
     let k_before: i32 = 0;
 
-    // Step 1: beta_abs = ceil(D * POS_SCALE / OI) in small model
-    let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
-
-    // Step 2: delta_K = -(A * beta_abs)
-    let delta_k = -((a_opp as i32) * (beta_abs as i32));
+    // Step 1 (v10.5 fused): delta_K_abs = ceil(D * A * POS_SCALE / OI)
+    let delta_k_abs = ((d as u32) * (a_opp as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+    let delta_k = -(delta_k_abs as i32);
     let k_after = k_before + delta_k;
 
     // K must have been modified (deficit routed)
@@ -1523,11 +1519,11 @@ fn t6_24_worked_example_regression() {
     let oi_post = oi - q_close; // 3
     assert!(oi_post > 0, "partial ADL: oi_post must be > 0");
 
-    // Deficit routing: beta_abs = ceil(D * POS_SCALE / OI) = ceil(2*4/8) = ceil(1) = 1
-    let beta_abs = ((d as u32) * (pos_scale as u32) + (oi as u32) - 1) / (oi as u32);
-    assert!(beta_abs == 1);
-    // delta_K = -(A_long * beta_abs) = -(256 * 1) = -256
-    let delta_k = -((a_long as i32) * (beta_abs as i32));
+    // Deficit routing (v10.5 fused): delta_K_abs = ceil(D * A * POS_SCALE / OI)
+    // = ceil(2 * 256 * 4 / 8) = ceil(256) = 256
+    let delta_k_abs = ((d as u32) * (a_long as u32) * (pos_scale as u32) + (oi as u32) - 1) / (oi as u32);
+    assert!(delta_k_abs == 256);
+    let delta_k = -(delta_k_abs as i32);
     k_long = k_long + delta_k;
     // K_long = 2560 - 256 = 2304
 
@@ -1570,12 +1566,11 @@ fn t6_25_pure_pnl_bankruptcy_regression() {
     let a_opp = S_ADL_ONE;
     let basis_q = (q_base as u16) * S_POS_SCALE;
 
-    // beta_abs = ceil(D * POS_SCALE / OI)
-    let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
-    assert!(beta_abs > 0, "beta must be positive for D > 0");
+    // v10.5 fused: delta_K_abs = ceil(D * A * POS_SCALE / OI)
+    let delta_k_abs = ((d as u32) * (a_opp as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+    assert!(delta_k_abs > 0, "delta_K_abs must be positive for D > 0");
 
-    // delta_K = -(A * beta_abs)
-    let delta_k = -((a_opp as i32) * (beta_abs as i32));
+    let delta_k = -(delta_k_abs as i32);
     assert!(delta_k < 0, "K must decrease");
 
     // Per-account PnL via lazy settlement
@@ -1702,7 +1697,7 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
 
 // ############################################################################
 //
-// TIER 7: NON-COMPOUNDING BASIS PROOFS (v10.0)
+// TIER 7: NON-COMPOUNDING BASIS PROOFS (v10.5)
 //
 // ############################################################################
 
@@ -1900,9 +1895,9 @@ fn t1_8b_adl_deficit_lazy_conservative_symbolic_a_basis() {
     // Eager loss per account: floor(q_base * D / OI)
     let eager_loss = ((q_base as i32) * (d as i32)) / (oi as i32);
 
-    // Lazy: beta_abs = ceil(D * POS_SCALE / OI), delta_K = -(a_basis * beta_abs)
-    let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
-    let delta_k = -((a_basis as i32) * (beta_abs as i32));
+    // Lazy (v10.5 fused): delta_K_abs = ceil(D * a_basis * POS_SCALE / OI)
+    let delta_k_abs = ((d as u32) * (a_basis as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+    let delta_k = -(delta_k_abs as i32);
     let lazy_loss_raw = lazy_pnl(basis_q, delta_k, a_basis);
 
     // Conservative: lazy loss >= eager loss
@@ -2069,6 +2064,8 @@ fn t4_21_precision_exhaustion_zeroes_both_sides() {
     engine.oi_eff_long_q = U256::from_u128(3 * POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(3 * POS_SCALE);
     engine.adl_coeff_long = I256::ZERO;
+    // v10.5: stored_pos_count > 0 to avoid step 4 early return
+    engine.stored_pos_count_long = 1;
 
     // liq_side = Short, opposing = Long
     // q_close = 1 POS_SCALE unit, D = 0
@@ -2460,11 +2457,12 @@ fn t10_37_accrue_mark_matches_eager() {
 /// Engine proof: for a single sub-step with delta_p=0 (same price), dt=1:
 ///   K_long decreases by A_long * delta_f
 ///   K_short increases by A_short * delta_f
-/// where delta_f = fund_px * r_last * dt / 10_000
+/// v10.5 payer-driven funding: when A_long == A_short, payer loss == receiver gain.
+/// When A_long != A_short, receiver gain <= payer loss (no-mint).
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn t10_38_accrue_funding_matches_eager() {
+fn t10_38_accrue_funding_payer_driven() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
@@ -2491,19 +2489,40 @@ fn t10_38_accrue_funding_matches_eager() {
     let k_long_after = engine.adl_coeff_long;
     let k_short_after = engine.adl_coeff_short;
 
-    // delta_f = fund_px * r_last * dt / 10_000 = 100 * rate * 1 / 10_000
-    let delta_f: i128 = (100i128 * (rate as i128) * 1) / 10_000;
+    // v10.5 payer-driven: funding_term_raw = 100 * |rate| * 1
+    let abs_rate = (rate as i128).unsigned_abs();
+    let funding_term_raw: u128 = 100 * abs_rate * 1;
 
-    // Longs pay: K_long -= A_long * delta_f
-    let fund_k = I256::from_i128((ADL_ONE as i128) * delta_f);
-    let expected_long = k_long_before.checked_sub(fund_k).unwrap();
-    assert!(k_long_after == expected_long,
-        "K_long must decrease by A_long * delta_f");
+    // delta_K_payer_abs = ceil(A_payer * funding_term_raw / 10_000)
+    let a = ADL_ONE as u128;
+    // Use U256 for the multiply
+    let delta_k_payer_abs = mul_div_ceil_u256(
+        U256::from_u128(a), U256::from_u128(funding_term_raw), U256::from_u128(10_000));
 
-    // Shorts receive: K_short += A_short * delta_f
-    let expected_short = k_short_before.checked_add(fund_k).unwrap();
-    assert!(k_short_after == expected_short,
-        "K_short must increase by A_short * delta_f");
+    // When A_long == A_short, receiver gain == payer loss
+    let delta_k_receiver_abs = mul_div_floor_u256(
+        delta_k_payer_abs, U256::from_u128(a), U256::from_u128(a));
+    assert!(delta_k_receiver_abs == delta_k_payer_abs,
+        "equal A implies symmetric funding");
+
+    // Verify actual K changes
+    if rate > 0 {
+        // longs pay, shorts receive
+        let payer_neg = try_negate_u256_to_i256(delta_k_payer_abs).unwrap();
+        let expected_long = k_long_before.checked_add(payer_neg).unwrap();
+        assert!(k_long_after == expected_long, "K_long payer decrease");
+        let recv = I256::from_raw_u256_pub(delta_k_receiver_abs);
+        let expected_short = k_short_before.checked_add(recv).unwrap();
+        assert!(k_short_after == expected_short, "K_short receiver increase");
+    } else {
+        // shorts pay, longs receive
+        let payer_neg = try_negate_u256_to_i256(delta_k_payer_abs).unwrap();
+        let expected_short = k_short_before.checked_add(payer_neg).unwrap();
+        assert!(k_short_after == expected_short, "K_short payer decrease");
+        let recv = I256::from_raw_u256_pub(delta_k_receiver_abs);
+        let expected_long = k_long_before.checked_add(recv).unwrap();
+        assert!(k_long_after == expected_long, "K_long receiver increase");
+    }
 }
 
 // ############################################################################
@@ -2837,11 +2856,13 @@ fn t11_46_enqueue_adl_k_add_overflow_still_routes_quantity() {
     engine.oi_eff_long_q = U256::from_u128(4 * POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(4 * POS_SCALE);
     engine.insurance_fund.balance = U128::new(10_000_000);
+    // v10.5: stored_pos_count > 0 to avoid step 4 early return
+    engine.stored_pos_count_long = 1;
 
     let a_before = engine.adl_mult_long;
 
-    // Small D that would produce a representable beta, but the delta_K = -beta
-    // addition to K_opp near MIN overflows. Need D such that beta_abs fits I256
+    // Small D that would produce a representable delta_K_abs, but
+    // K + delta_K overflows. Need D such that delta_K_abs fits I256
     // but K + delta_K overflows.
     let d = U256::from_u128(1_000_000);
     let q_close = U256::from_u128(2 * POS_SCALE);
@@ -2873,6 +2894,8 @@ fn t11_47_precision_exhaustion_terminal_drain() {
     engine.adl_coeff_long = I256::ZERO;
     engine.oi_eff_long_q = U256::from_u128(3 * POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(3 * POS_SCALE);
+    // v10.5: stored_pos_count > 0 to avoid step 4 early return
+    engine.stored_pos_count_long = 1;
 
     // q_close = POS_SCALE, so oi_post = 2*POS_SCALE
     // A_candidate = floor(1 * 2*POS_SCALE / 3*POS_SCALE) = floor(2/3) = 0
@@ -2907,6 +2930,8 @@ fn t11_48_bankruptcy_liquidation_routes_q_when_D_zero() {
     engine.adl_coeff_long = I256::from_i128(42);
     engine.oi_eff_long_q = U256::from_u128(4 * POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(4 * POS_SCALE);
+    // v10.5: stored_pos_count > 0 to avoid step 4 early return
+    engine.stored_pos_count_long = 1;
 
     let k_before = engine.adl_coeff_long;
     let a_before = engine.adl_mult_long;
@@ -2945,6 +2970,8 @@ fn t11_49_pure_pnl_bankruptcy_path() {
     engine.adl_coeff_long = I256::ZERO;
     engine.oi_eff_long_q = U256::from_u128(2 * POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(2 * POS_SCALE);
+    // v10.5: stored_pos_count > 0 to avoid step 4 early return
+    engine.stored_pos_count_long = 1;
 
     let a_before = engine.adl_mult_long;
     let k_before = engine.adl_coeff_long;
@@ -3224,6 +3251,8 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     engine.adl_coeff_long = I256::ZERO;
     engine.oi_eff_long_q = U256::from_u128(10 * POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(10 * POS_SCALE);
+    // v10.5: stored_pos_count > 0 to avoid step 4 early return
+    engine.stored_pos_count_long = 1;
 
     // ADL closes POS_SCALE on liq_side=Short.
     // opp = Long: OI_post = 10*POS_SCALE - POS_SCALE = 9*POS_SCALE
@@ -3244,14 +3273,15 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
         U256::from_u128(7),
     );
 
-    // Simulate user closing: subtract their effective from OI_eff
+    // Simulate user closing: subtract their effective from both sides' OI
+    // (a real trade reduces both sides equally)
     engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(effective).unwrap();
+    engine.oi_eff_short_q = engine.oi_eff_short_q.checked_sub(effective).unwrap();
 
     // The residual in OI_eff is the global A truncation dust.
-    // It equals: 9*POS_SCALE - floor(60*POS_SCALE / 7) = 9*POS_SCALE - 8*POS_SCALE - floor(4*POS_SCALE/7)
-    //          = POS_SCALE - floor(4*POS_SCALE/7) = ceil(3*POS_SCALE/7)
-    //          ≈ 0.429 * POS_SCALE ≈ 7.9e18 q-units
     assert!(!engine.oi_eff_long_q.is_zero(), "truncation dust must be nonzero");
+    // v10.5: OI_eff_long == OI_eff_short (invariant maintained)
+    assert!(engine.oi_eff_long_q == engine.oi_eff_short_q);
 
     // Simulate post-close state: no stored positions
     engine.stored_pos_count_long = 0;
@@ -3260,12 +3290,278 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     // on top of whatever enqueue_adl already contributed.
     engine.phantom_dust_bound_long_q = engine.phantom_dust_bound_long_q
         .checked_add(U256::from_u128(1)).unwrap();
-    engine.phantom_dust_bound_short_q = U256::ZERO;
-    engine.oi_eff_short_q = U256::ZERO;
+    // Short side also needs dust bound for bilateral-empty path
+    engine.phantom_dust_bound_short_q = engine.phantom_dust_bound_short_q
+        .checked_add(U256::from_u128(1)).unwrap();
 
     // The market MUST be able to reset. schedule_end_of_instruction_resets
     // should succeed so the market can transition to a fresh epoch.
-    // With the bug: returns Err(CorruptState) because OI_eff (≈0.429*POS_SCALE) > bound (1).
     let reset_result = engine.schedule_end_of_instruction_resets(&mut ctx);
     assert!(reset_result.is_ok(), "ADL truncation dust must not deadlock market reset");
+}
+
+// ############################################################################
+//
+// TIER 13: v10.5-SPECIFIC PROOFS
+//
+// ############################################################################
+
+// ============================================================================
+// T13.54: funding_no_mint — payer-driven rounding does not create value
+// ============================================================================
+
+/// Spec test #20: when A_long != A_short, payer-driven funding rounding
+/// MUST NOT mint positive aggregate claims. Receiver gain <= payer loss
+/// in A-weighted K-space.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t13_54_funding_no_mint_asymmetric_a() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
+
+    // Symbolic A values (different on each side)
+    let a_long: u8 = kani::any();
+    kani::assume(a_long >= 1);
+    let a_short: u8 = kani::any();
+    kani::assume(a_short >= 1);
+    engine.adl_mult_long = a_long as u128;
+    engine.adl_mult_short = a_short as u128;
+
+    engine.last_oracle_price = 100;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = 100;
+
+    let rate: i8 = kani::any();
+    kani::assume(rate != 0);
+    engine.funding_rate_bps_per_slot_last = rate as i64;
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    let result = engine.accrue_market_to(1, 100);
+    assert!(result.is_ok());
+
+    let k_long_after = engine.adl_coeff_long;
+    let k_short_after = engine.adl_coeff_short;
+
+    // Compute per-side changes
+    let dk_long = k_long_after.checked_sub(k_long_before).unwrap();
+    let dk_short = k_short_after.checked_sub(k_short_before).unwrap();
+
+    // Sum of K-space changes must be <= 0 (no minting)
+    // Payer loses more (or equal) than receiver gains
+    let total = dk_long.checked_add(dk_short).unwrap();
+    // total <= 0: the rounding destroyed value or was exact, never created it
+    assert!(!total.is_positive(),
+        "funding must not mint: sum of K changes must be <= 0");
+}
+
+// ============================================================================
+// T13.55: empty_opposing_side_deficit_fallback
+// ============================================================================
+
+/// Spec test #31: when stored_pos_count_opp == 0 and D > 0, enqueue_adl
+/// routes deficit through absorb_protocol_loss and does NOT modify K_opp.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t13_55_empty_opposing_side_deficit_fallback() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
+
+    engine.adl_mult_long = POS_SCALE;
+    engine.adl_coeff_long = I256::from_i128(12345);
+    engine.oi_eff_long_q = U256::from_u128(4 * POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(4 * POS_SCALE);
+    engine.insurance_fund.balance = U128::new(10_000_000);
+    // Crucially: no stored positions on opposing (long) side
+    engine.stored_pos_count_long = 0;
+
+    let k_before = engine.adl_coeff_long;
+    let ins_before = engine.insurance_fund.balance.get();
+
+    let d = U256::from_u128(5_000);
+    let q_close = U256::from_u128(POS_SCALE);
+
+    let result = engine.enqueue_adl(&mut ctx, Side::Short, q_close, d);
+    assert!(result.is_ok());
+
+    // K_opp must be UNCHANGED (deficit NOT written to K when no stored positions)
+    assert!(engine.adl_coeff_long == k_before,
+        "K must not change when stored_pos_count_opp == 0");
+
+    // Insurance must have absorbed the deficit
+    assert!(engine.insurance_fund.balance.get() < ins_before,
+        "insurance must absorb deficit");
+
+    // OI updated correctly
+    assert!(engine.oi_eff_long_q == U256::from_u128(3 * POS_SCALE));
+}
+
+// ============================================================================
+// T13.56: unilateral_empty_orphan_resolution
+// ============================================================================
+
+/// Spec test #32: when one side has stored_pos_count == 0 and its OI_eff
+/// is within that side's phantom-dust bound, schedule_end_of_instruction_resets
+/// schedules reset on BOTH sides (even if the opposite side has stored positions).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t13_56_unilateral_empty_orphan_resolution() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
+
+    // Long side: empty (no stored positions), but has orphan dust in OI
+    engine.stored_pos_count_long = 0;
+    engine.phantom_dust_bound_long_q = U256::from_u128(100);
+    engine.oi_eff_long_q = U256::from_u128(50); // within dust bound
+
+    // Short side: still has stored positions
+    engine.stored_pos_count_short = 2;
+    engine.oi_eff_short_q = U256::from_u128(50); // OI balanced
+
+    let result = engine.schedule_end_of_instruction_resets(&mut ctx);
+    assert!(result.is_ok());
+
+    // Both sides must get pending reset (unilateral-empty orphan resolution)
+    assert!(ctx.pending_reset_long, "long must get pending reset");
+    assert!(ctx.pending_reset_short, "short must get pending reset");
+
+    // OI zeroed on both sides
+    assert!(engine.oi_eff_long_q.is_zero(), "long OI must be zero");
+    assert!(engine.oi_eff_short_q.is_zero(), "short OI must be zero");
+}
+
+// ============================================================================
+// T13.57: unilateral_empty_corruption_guard
+// ============================================================================
+
+/// Spec test #33: when one side has stored_pos_count == 0 but
+/// OI_eff_long != OI_eff_short, unilateral dust clearance fails conservatively.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t13_57_unilateral_empty_corruption_guard() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
+
+    // Long side: empty, with dust
+    engine.stored_pos_count_long = 0;
+    engine.phantom_dust_bound_long_q = U256::from_u128(100);
+    engine.oi_eff_long_q = U256::from_u128(50);
+
+    // Short side: has stored positions, but OI is DIFFERENT (corrupted state)
+    engine.stored_pos_count_short = 2;
+    engine.oi_eff_short_q = U256::from_u128(999); // != OI_eff_long
+
+    let result = engine.schedule_end_of_instruction_resets(&mut ctx);
+    assert!(result == Err(RiskError::CorruptState),
+        "must fail conservatively when OI_eff_long != OI_eff_short");
+}
+
+// ============================================================================
+// T13.58: unilateral_empty_short_side
+// ============================================================================
+
+/// Symmetric counterpart: short side empty with dust, long side has positions.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t13_58_unilateral_empty_short_side() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
+
+    // Short side: empty, with dust
+    engine.stored_pos_count_short = 0;
+    engine.phantom_dust_bound_short_q = U256::from_u128(200);
+    engine.oi_eff_short_q = U256::from_u128(75);
+
+    // Long side: still has stored positions
+    engine.stored_pos_count_long = 3;
+    engine.oi_eff_long_q = U256::from_u128(75); // OI balanced
+
+    let result = engine.schedule_end_of_instruction_resets(&mut ctx);
+    assert!(result.is_ok());
+
+    // Both sides reset
+    assert!(ctx.pending_reset_long, "long must get pending reset");
+    assert!(ctx.pending_reset_short, "short must get pending reset");
+    assert!(engine.oi_eff_long_q.is_zero());
+    assert!(engine.oi_eff_short_q.is_zero());
+}
+
+// ============================================================================
+// T13.59: fused_delta_k_no_double_rounding
+// ============================================================================
+
+/// v10.5: the fused delta_K_abs = ceil(D * A * POS_SCALE / OI) produces a
+/// result <= the old two-step ceil(D*POS_SCALE/OI)*A. This means the new
+/// formula is tighter (less over-socialization).
+#[kani::proof]
+#[kani::unwind(1)]
+#[kani::solver(cadical)]
+fn t13_59_fused_delta_k_no_double_rounding() {
+    let d: u8 = kani::any();
+    kani::assume(d > 0);
+    let oi: u8 = kani::any();
+    kani::assume(oi > 0);
+    let a: u8 = kani::any();
+    kani::assume(a > 0);
+
+    // Old two-step: beta_abs = ceil(D*P/OI), delta_K = A * beta_abs
+    let beta_abs = ((d as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+    let old_delta_k = (a as u32) * beta_abs;
+
+    // New fused: delta_K_abs = ceil(D*A*P/OI)
+    let new_delta_k = ((d as u32) * (a as u32) * (S_POS_SCALE as u32) + (oi as u32) - 1) / (oi as u32);
+
+    // Fused is <= old (tighter, less over-socialization)
+    assert!(new_delta_k <= old_delta_k,
+        "fused formula must not exceed old two-step formula");
+
+    // Both are >= the exact value D*A*POS_SCALE/OI (both are ceilings)
+    let exact_times_oi = (d as u32) * (a as u32) * (S_POS_SCALE as u32);
+    assert!(new_delta_k * (oi as u32) >= exact_times_oi,
+        "fused ceiling must be >= exact value");
+}
+
+// ============================================================================
+// T13.60: conditional_dust_bound_only_on_truncation
+// ============================================================================
+
+/// v10.5: A-truncation dust is added to phantom_dust_bound ONLY when
+/// A_trunc_rem != 0 (actual truncation occurred).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn t13_60_conditional_dust_bound_only_on_truncation() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
+
+    // Set up: A_old = 4, OI = 4*POS_SCALE, q_close = 2*POS_SCALE
+    // OI_post = 2*POS_SCALE
+    // A_candidate = floor(4 * 2*POS_SCALE / 4*POS_SCALE) = floor(8/4) = 2
+    // A_trunc_rem = (4 * 2*POS_SCALE) mod (4*POS_SCALE) = 8*POS_SCALE mod 4*POS_SCALE = 0
+    // So NO dust should be added.
+    engine.adl_mult_long = 4;
+    engine.adl_coeff_long = I256::ZERO;
+    engine.oi_eff_long_q = U256::from_u128(4 * POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(4 * POS_SCALE);
+    engine.stored_pos_count_long = 1;
+
+    let dust_before = engine.phantom_dust_bound_long_q;
+
+    let result = engine.enqueue_adl(
+        &mut ctx, Side::Short, U256::from_u128(2 * POS_SCALE), U256::ZERO,
+    );
+    assert!(result.is_ok());
+    assert!(engine.adl_mult_long == 2, "A_new = floor(4*2/4) = 2");
+
+    // Dust bound must be UNCHANGED (no truncation occurred)
+    assert!(engine.phantom_dust_bound_long_q == dust_before,
+        "no dust added when A_trunc_rem == 0");
 }

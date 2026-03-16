@@ -1,7 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v10.0
+//! Formally Verified Risk Engine for Perpetual DEX — v10.5
 //!
-//! Implements the v10.0 spec: Lazy A/K ADL + Non-Compounding Quantity Basis
-//! + Exact Wide Arithmetic + Deferred Reset Finalization.
+//! Implements the v10.5 spec: Combined Single-Document Revision.
 //!
 //! This module implements a formally verified risk engine that guarantees:
 //! 1. Protected principal for flat accounts
@@ -67,7 +66,8 @@ pub use i128::{I128, U128};
 pub mod wide_math;
 use wide_math::{
     U256, I256,
-    mul_div_floor_u256, mul_div_ceil_u256,
+    mul_div_floor_u256, mul_div_floor_u256_with_rem,
+    mul_div_ceil_u256,
     wide_signed_mul_div_floor,
     saturating_mul_u256_u64,
     fee_debt_u128_checked,
@@ -867,6 +867,22 @@ impl RiskEngine {
         }
     }
 
+    /// Spec §4.6.1: increment phantom dust bound by amount_q (checked).
+    pub fn inc_phantom_dust_bound_by(&mut self, s: Side, amount_q: U256) {
+        match s {
+            Side::Long => {
+                self.phantom_dust_bound_long_q = self.phantom_dust_bound_long_q
+                    .checked_add(amount_q)
+                    .expect("phantom_dust_bound_long_q overflow");
+            }
+            Side::Short => {
+                self.phantom_dust_bound_short_q = self.phantom_dust_bound_short_q
+                    .checked_add(amount_q)
+                    .expect("phantom_dust_bound_short_q overflow");
+            }
+        }
+    }
+
     // ========================================================================
     // effective_pos_q (spec §5.2)
     // ========================================================================
@@ -1087,31 +1103,64 @@ impl RiskEngine {
                 }
             }
 
-            // Funding: ΔF = fund_px * r_last * dt / 10_000
+            // Funding: payer-driven rounding (spec v10.5 §5.4 step 5)
             if dt > 0 && funding_rate != 0 {
-                let delta_f: i128 = (fund_px as i128)
-                    .checked_mul(funding_rate as i128)
+                // funding_term_raw = fund_px * |r_last| * dt (unsigned)
+                let abs_rate = (funding_rate as i128).unsigned_abs();
+                let funding_term_raw: u128 = (fund_px as u128)
+                    .checked_mul(abs_rate)
                     .ok_or(RiskError::Overflow)?
-                    .checked_mul(dt as i128)
-                    .ok_or(RiskError::Overflow)?
-                    .checked_div(10_000)
+                    .checked_mul(dt as u128)
                     .ok_or(RiskError::Overflow)?;
 
-                if delta_f != 0 {
-                    let delta_f_i256 = I256::from_i128(delta_f);
-                    // Longs pay: K_long -= A_long * ΔF
-                    if long_live {
-                        let a_long_256 = U256::from_u128(self.adl_mult_long);
-                        let fund_k = checked_u256_mul_i256(a_long_256, delta_f_i256)?;
-                        self.adl_coeff_long = self.adl_coeff_long.checked_sub(fund_k)
+                if funding_term_raw > 0 {
+                    // r_last > 0 → longs pay, shorts receive
+                    // r_last < 0 → shorts pay, longs receive
+                    let (payer_live, receiver_live) = if funding_rate > 0 {
+                        (long_live, short_live)
+                    } else {
+                        (short_live, long_live)
+                    };
+                    let (a_payer, a_receiver) = if funding_rate > 0 {
+                        (self.adl_mult_long, self.adl_mult_short)
+                    } else {
+                        (self.adl_mult_short, self.adl_mult_long)
+                    };
+
+                    if payer_live {
+                        let a_p = U256::from_u128(a_payer);
+                        let ft = U256::from_u128(funding_term_raw);
+                        let ten_k = U256::from_u128(10_000);
+                        // delta_K_payer_abs = ceil(A_p * funding_term_raw / 10_000)
+                        let delta_k_payer_abs = mul_div_ceil_u256(a_p, ft, ten_k);
+                        // Apply payer loss
+                        let delta_k_payer_neg = try_negate_u256_to_i256(delta_k_payer_abs)
                             .ok_or(RiskError::Overflow)?;
-                    }
-                    // Shorts receive: K_short += A_short * ΔF
-                    if short_live {
-                        let a_short_256 = U256::from_u128(self.adl_mult_short);
-                        let fund_k = checked_u256_mul_i256(a_short_256, delta_f_i256)?;
-                        self.adl_coeff_short = self.adl_coeff_short.checked_add(fund_k)
-                            .ok_or(RiskError::Overflow)?;
+                        if funding_rate > 0 {
+                            self.adl_coeff_long = self.adl_coeff_long.checked_add(delta_k_payer_neg)
+                                .ok_or(RiskError::Overflow)?;
+                        } else {
+                            self.adl_coeff_short = self.adl_coeff_short.checked_add(delta_k_payer_neg)
+                                .ok_or(RiskError::Overflow)?;
+                        }
+
+                        // Derive receiver gain: floor(delta_K_payer_abs * A_r / A_p)
+                        if receiver_live {
+                            let a_r = U256::from_u128(a_receiver);
+                            let delta_k_receiver_abs = mul_div_floor_u256(delta_k_payer_abs, a_r, a_p);
+                            // Ensure fits as positive I256 (high bit clear)
+                            if delta_k_receiver_abs.hi() >= (1u128 << 127) {
+                                return Err(RiskError::Overflow);
+                            }
+                            let delta_k_receiver = I256::from_raw_u256_pub(delta_k_receiver_abs);
+                            if funding_rate > 0 {
+                                self.adl_coeff_short = self.adl_coeff_short.checked_add(delta_k_receiver)
+                                    .ok_or(RiskError::Overflow)?;
+                            } else {
+                                self.adl_coeff_long = self.adl_coeff_long.checked_add(delta_k_receiver)
+                                    .ok_or(RiskError::Overflow)?;
+                            }
+                        }
                     }
                 }
             }
@@ -1174,33 +1223,44 @@ impl RiskEngine {
             return Ok(());
         }
 
-        // Step 4: require q_close_q <= OI
+        // Step 4 (v10.5): if OI > 0 and stored_pos_count_opp == 0,
+        // route deficit through absorb and do NOT modify K_opp.
+        if self.get_stored_pos_count(opp) == 0 {
+            if q_close_q > oi {
+                return Err(RiskError::CorruptState);
+            }
+            let oi_post = oi.checked_sub(q_close_q).ok_or(RiskError::Overflow)?;
+            if !d.is_zero() {
+                self.absorb_protocol_loss(d);
+            }
+            self.set_oi_eff(opp, oi_post);
+            if oi_post.is_zero() {
+                set_pending_reset(ctx, opp);
+            }
+            return Ok(());
+        }
+
+        // Step 5: require q_close_q <= OI
         if q_close_q > oi {
             return Err(RiskError::CorruptState);
         }
 
         let a_old = self.get_a_side(opp);
+        let a_old_u256 = U256::from_u128(a_old);
         let oi_post = oi.checked_sub(q_close_q).ok_or(RiskError::Overflow)?;
 
-        // Step 5: handle D > 0 (quote deficit)
+        // Step 6: handle D > 0 (quote deficit)
+        // v10.5: fused delta_K_abs = ceil(D * A_old * POS_SCALE / OI)
         if !d.is_zero() {
-            // beta_abs = ceil(D * POS_SCALE / OI)
-            let beta_abs = mul_div_ceil_u256(d, pos_scale_u256(), oi);
-            // delta_K_exact = -(A_old * beta_abs) — check representability via magnitude
-            let a_old_u256 = U256::from_u128(a_old);
-            match a_old_u256.checked_mul(beta_abs) {
-                Some(product) => {
-                    match try_negate_u256_to_i256(product) {
-                        Some(delta_k) => {
-                            let k_opp = self.get_k_side(opp);
-                            match k_opp.checked_add(delta_k) {
-                                Some(new_k) => {
-                                    self.set_k_side(opp, new_k);
-                                }
-                                None => {
-                                    self.absorb_protocol_loss(d);
-                                }
-                            }
+            let a_ps = a_old_u256.checked_mul(pos_scale_u256())
+                .ok_or(RiskError::Overflow)?;
+            let delta_k_abs = mul_div_ceil_u256(d, a_ps, oi);
+            match try_negate_u256_to_i256(delta_k_abs) {
+                Some(delta_k) => {
+                    let k_opp = self.get_k_side(opp);
+                    match k_opp.checked_add(delta_k) {
+                        Some(new_k) => {
+                            self.set_k_side(opp, new_k);
                         }
                         None => {
                             self.absorb_protocol_loss(d);
@@ -1213,42 +1273,34 @@ impl RiskEngine {
             }
         }
 
-        // Step 6: if OI_post == 0
+        // Step 7: if OI_post == 0
         if oi_post.is_zero() {
             self.set_oi_eff(opp, U256::ZERO);
             set_pending_reset(ctx, opp);
             return Ok(());
         }
 
-        // Step 7-8: compute A_candidate = floor(A_old * OI_post / OI)
-        let a_candidate = mul_div_floor_u256(
-            U256::from_u128(a_old),
+        // Steps 8-9: compute A_candidate and A_trunc_rem
+        let (a_candidate, a_trunc_rem) = mul_div_floor_u256_with_rem(
+            a_old_u256,
             oi_post,
             oi,
         );
 
+        // Step 10: A_candidate > 0
         if !a_candidate.is_zero() {
             let a_new = u256_to_u128_sat(&a_candidate);
             self.set_a_side(opp, a_new);
             self.set_oi_eff(opp, oi_post);
-            // Step 7b: account for global A truncation dust.
-            // floor(A_old * OI_post / OI) loses up to ceil(OI / A_old) q-units
-            // of phantom OI that no individual user can ever close. Without
-            // tracking this, schedule_end_of_instruction_resets deadlocks when
-            // all positions close but OI_eff retains untracked dust.
-            let a_old_u256 = U256::from_u128(a_old);
-            let trunc_dust = ceil_div_positive_checked(oi, a_old_u256);
-            match opp {
-                Side::Long => {
-                    self.phantom_dust_bound_long_q = self.phantom_dust_bound_long_q
-                        .checked_add(trunc_dust)
-                        .unwrap_or(U256::MAX);
-                }
-                Side::Short => {
-                    self.phantom_dust_bound_short_q = self.phantom_dust_bound_short_q
-                        .checked_add(trunc_dust)
-                        .unwrap_or(U256::MAX);
-                }
+            // Only account for global A-truncation dust when actual truncation occurs
+            if !a_trunc_rem.is_zero() {
+                let n_opp = U256::from_u128(self.get_stored_pos_count(opp) as u128);
+                // global_a_dust_bound = N_opp + ceil((OI + N_opp) / A_old)
+                let oi_plus_n = oi.checked_add(n_opp).unwrap_or(U256::MAX);
+                let ceil_term = ceil_div_positive_checked(oi_plus_n, a_old_u256);
+                let global_a_dust_bound = n_opp.checked_add(ceil_term)
+                    .unwrap_or(U256::MAX);
+                self.inc_phantom_dust_bound_by(opp, global_a_dust_bound);
             }
             if a_new < MIN_A_SIDE {
                 self.set_side_mode(opp, SideMode::DrainOnly);
@@ -1256,7 +1308,7 @@ impl RiskEngine {
             return Ok(());
         }
 
-        // Step 9: precision exhaustion terminal drain
+        // Step 11: precision exhaustion terminal drain
         self.set_oi_eff(opp, U256::ZERO);
         self.set_oi_eff(liq_side, U256::ZERO);
         set_pending_reset(ctx, opp);
@@ -1327,33 +1379,69 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn schedule_end_of_instruction_resets(&mut self, ctx: &mut InstructionContext) -> Result<()> {
-        // Step 1: dust clearance (spec §5.7 / §12.5)
-        if self.stored_pos_count_long == 0 || self.stored_pos_count_short == 0 {
-            let mut clear_bound_q = U256::ZERO;
-            if self.stored_pos_count_long == 0 {
-                clear_bound_q = clear_bound_q.checked_add(self.phantom_dust_bound_long_q)
-                    .ok_or(RiskError::CorruptState)?;
+        // §5.7.A: Bilateral-empty dust clearance
+        if self.stored_pos_count_long == 0 && self.stored_pos_count_short == 0 {
+            let clear_bound_q = self.phantom_dust_bound_long_q
+                .checked_add(self.phantom_dust_bound_short_q)
+                .ok_or(RiskError::CorruptState)?;
+            let has_residual = !self.oi_eff_long_q.is_zero()
+                || !self.oi_eff_short_q.is_zero()
+                || !self.phantom_dust_bound_long_q.is_zero()
+                || !self.phantom_dust_bound_short_q.is_zero();
+            if has_residual {
+                if self.oi_eff_long_q != self.oi_eff_short_q {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.oi_eff_long_q <= clear_bound_q && self.oi_eff_short_q <= clear_bound_q {
+                    self.oi_eff_long_q = U256::ZERO;
+                    self.oi_eff_short_q = U256::ZERO;
+                    ctx.pending_reset_long = true;
+                    ctx.pending_reset_short = true;
+                } else {
+                    return Err(RiskError::CorruptState);
+                }
             }
-            if self.stored_pos_count_short == 0 {
-                clear_bound_q = clear_bound_q.checked_add(self.phantom_dust_bound_short_q)
-                    .ok_or(RiskError::CorruptState)?;
+        }
+        // §5.7.B: Unilateral-empty long (long empty, short has positions)
+        else if self.stored_pos_count_long == 0 && self.stored_pos_count_short > 0 {
+            let has_residual = !self.oi_eff_long_q.is_zero()
+                || !self.oi_eff_short_q.is_zero()
+                || !self.phantom_dust_bound_long_q.is_zero();
+            if has_residual {
+                if self.oi_eff_long_q != self.oi_eff_short_q {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.oi_eff_long_q <= self.phantom_dust_bound_long_q {
+                    self.oi_eff_long_q = U256::ZERO;
+                    self.oi_eff_short_q = U256::ZERO;
+                    ctx.pending_reset_long = true;
+                    ctx.pending_reset_short = true;
+                } else {
+                    return Err(RiskError::CorruptState);
+                }
             }
-            if clear_bound_q.is_zero()
-                && self.oi_eff_long_q.is_zero()
-                && self.oi_eff_short_q.is_zero()
-            {
-                // Trivial case: no dust accumulated, no OI — nothing to clear
-            } else if self.oi_eff_long_q <= clear_bound_q && self.oi_eff_short_q <= clear_bound_q {
-                self.oi_eff_long_q = U256::ZERO;
-                self.oi_eff_short_q = U256::ZERO;
-                ctx.pending_reset_long = true;
-                ctx.pending_reset_short = true;
-            } else {
-                return Err(RiskError::CorruptState);
+        }
+        // §5.7.C: Unilateral-empty short (short empty, long has positions)
+        else if self.stored_pos_count_short == 0 && self.stored_pos_count_long > 0 {
+            let has_residual = !self.oi_eff_long_q.is_zero()
+                || !self.oi_eff_short_q.is_zero()
+                || !self.phantom_dust_bound_short_q.is_zero();
+            if has_residual {
+                if self.oi_eff_long_q != self.oi_eff_short_q {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.oi_eff_short_q <= self.phantom_dust_bound_short_q {
+                    self.oi_eff_long_q = U256::ZERO;
+                    self.oi_eff_short_q = U256::ZERO;
+                    ctx.pending_reset_long = true;
+                    ctx.pending_reset_short = true;
+                } else {
+                    return Err(RiskError::CorruptState);
+                }
             }
         }
 
-        // Step 2-3: DrainOnly sides with zero OI
+        // §5.7.D: DrainOnly sides with zero OI
         if self.side_mode_long == SideMode::DrainOnly && self.oi_eff_long_q.is_zero() {
             ctx.pending_reset_long = true;
         }
@@ -2074,14 +2162,24 @@ impl RiskEngine {
         self.settle_losses(b as usize);
 
         // Step 12: restart-on-new-profit only for accounts whose AvailGross actually increased
+        // Per §6.5 step 2: if restart conversion increases C_i, sweep fee debt immediately
+        // before any subsequent margin assessment.
         {
             let new_avail_a = self.avail_gross(a as usize);
             if new_avail_a > old_avail_a {
+                let cap_before_a = self.accounts[a as usize].capital.get();
                 self.restart_on_new_profit(a as usize, old_warmable_a);
+                if self.accounts[a as usize].capital.get() > cap_before_a {
+                    self.fee_debt_sweep(a as usize);
+                }
             }
             let new_avail_b = self.avail_gross(b as usize);
             if new_avail_b > old_avail_b {
+                let cap_before_b = self.accounts[b as usize].capital.get();
                 self.restart_on_new_profit(b as usize, old_warmable_b);
+                if self.accounts[b as usize].capital.get() > cap_before_b {
+                    self.fee_debt_sweep(b as usize);
+                }
             }
         }
 

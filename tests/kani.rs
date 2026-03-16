@@ -1,4 +1,4 @@
-//! Formal verification with Kani — v10.0 Risk Engine
+//! Formal verification with Kani — v10.5 Risk Engine
 //!
 //! These proofs verify critical safety properties of the percolator risk engine.
 //! Run with: cargo kani --harness <name> (individual proofs)

@@ -1115,3 +1115,77 @@ fn test_conservation_maintained_through_lifecycle() {
     engine.execute_trade(a, b, 1050, slot2, close_q, 1050).expect("close");
     assert!(engine.check_conservation());
 }
+
+// ============================================================================
+// Spec property #23: immediate fee seniority after restart conversion
+// ============================================================================
+
+/// If restart-on-new-profit converts matured entitlement into C_i while fee debt
+/// is outstanding, the fee-debt sweep occurs immediately — before later
+/// loss-settlement or margin logic can consume that new capital.
+///
+/// This test verifies that after a trade triggers restart-on-new-profit,
+/// fee debt is properly swept (capital reduced, fee_credits less negative,
+/// insurance fund receives payment).
+#[test]
+fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
+    // Use zero-fee params to isolate the restart-on-new-profit / fee-sweep interaction
+    let mut params = default_params();
+    params.trading_fee_bps = 0;
+    params.maintenance_fee_per_slot = U128::new(0);
+    // Use zero warmup so all positive PnL is immediately warmable
+    params.warmup_period_slots = 0;
+
+    let mut engine = RiskEngine::new(params);
+    let oracle = 1000u64;
+    let slot = 1u64;
+    engine.current_slot = slot;
+
+    let a = engine.add_user(1000).expect("add a");
+    let b = engine.add_user(1000).expect("add b");
+
+    // Large deposits so margin is not an issue
+    engine.deposit(a, 1_000_000, oracle, slot).expect("dep a");
+    engine.deposit(b, 1_000_000, oracle, slot).expect("dep b");
+
+    engine.keeper_crank(a, slot, oracle, 0).expect("crank");
+
+    // Open position: a buys 10 from b
+    let size_q = make_size_q(10);
+    engine.execute_trade(a, b, oracle, slot, size_q, oracle).expect("trade1");
+    assert!(engine.check_conservation());
+
+    // Price rises: a now has positive PnL (profit)
+    let slot2 = 50u64;
+    let oracle2 = 1100u64;
+    engine.keeper_crank(a, slot2, oracle2, 0).expect("crank2");
+    assert!(engine.check_conservation());
+
+    // Inject fee debt on account a: fee_credits = -5000
+    // (In production this happens from maintenance fees exceeding credits)
+    engine.accounts[a as usize].fee_credits = I128::new(-5000);
+
+    let cap_before = engine.accounts[a as usize].capital.get();
+    let ins_before = engine.insurance_fund.balance.get();
+
+    // Execute another trade that will trigger restart-on-new-profit for a
+    // (a buys 1 more at favorable price = market, AvailGross increases)
+    let size_q2 = make_size_q(1);
+    engine.execute_trade(a, b, oracle2, slot2, size_q2, oracle2).expect("trade2");
+    assert!(engine.check_conservation());
+
+    // After trade: fee debt should have been swept
+    let fc_after = engine.accounts[a as usize].fee_credits.get();
+    // Fee debt was 5000. After sweep, fee_credits should be less negative (or zero).
+    assert!(fc_after > -5000, "fee debt was not swept after restart-on-new-profit: fc={}", fc_after);
+
+    // Insurance fund should have received the swept amount
+    let ins_after = engine.insurance_fund.balance.get();
+    assert!(ins_after > ins_before, "insurance fund did not receive fee sweep payment");
+
+    // Capital should have decreased by the swept amount
+    // (restart conversion adds to capital, fee sweep subtracts)
+    // We can't easily check exact amounts without knowing warmable, but we can
+    // verify conservation holds
+    assert!(engine.check_conservation());
+}

@@ -1245,7 +1245,6 @@ impl U512 {
 ///
 /// Computes floor(n / d) where d > 0. Uses truncation toward zero, then
 /// adjusts: if n < 0 and there is a non-zero remainder, subtract 1.
-/// MUST NOT negate n.
 pub fn floor_div_signed_conservative(n: I256, d: U256) -> I256 {
     assert!(!d.is_zero(), "floor_div_signed_conservative: zero denominator");
 
@@ -1267,7 +1266,7 @@ pub fn floor_div_signed_conservative(n: I256, d: U256) -> I256 {
         // n < 0. We need floor(n / d).
         // n = -|n|. trunc(n/d) = -(|n| / d). floor = trunc - (1 if |n| % d != 0).
         //
-        // But spec says MUST NOT negate n. So instead we work with the raw bits.
+        // Work with the raw bits to avoid I256::MIN negation issues.
         //
         // Two's complement: if n is negative, its unsigned representation is 2^256 - |n|.
         // We can compute |n| = ~n + 1 (bitwise not + 1).
@@ -1316,6 +1315,14 @@ pub fn mul_div_floor_u256(a: U256, b: U256, d: U256) -> U256 {
     let product = U512::mul_u256(a, b);
     let (q, _r) = product.div_rem_by_u256(d);
     q
+}
+
+/// Like mul_div_floor_u256 but also returns the remainder.
+/// Returns (floor(a * b / d), (a * b) mod d).
+pub fn mul_div_floor_u256_with_rem(a: U256, b: U256, d: U256) -> (U256, U256) {
+    assert!(!d.is_zero(), "mul_div_floor_u256_with_rem: zero denominator");
+    let product = U512::mul_u256(a, b);
+    product.div_rem_by_u256(d)
 }
 
 /// Spec section 4.6: exact wide product then ceiling divide.
