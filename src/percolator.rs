@@ -1853,22 +1853,10 @@ impl RiskEngine {
             .checked_sub(due_i128).ok_or(RiskError::Overflow)?;
         self.accounts[idx].fee_credits = I128::new(new_fc);
 
-        // Pay from capital if negative
-        if self.accounts[idx].fee_credits.is_negative() {
-            let owed_i128 = self.accounts[idx].fee_credits.get();
-            let owed = fee_debt_u128_checked(owed_i128);
-            let cap = self.accounts[idx].capital.get();
-            let pay = core::cmp::min(owed, cap);
-            if pay > 0 {
-                self.set_capital(idx, cap - pay);
-                self.insurance_fund.balance = self.insurance_fund.balance + pay;
-                self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + pay;
-                let pay_i128: i128 = pay.try_into().map_err(|_| RiskError::Overflow)?;
-                let new_credits = self.accounts[idx].fee_credits.get()
-                    .checked_add(pay_i128).ok_or(RiskError::Overflow)?;
-                self.accounts[idx].fee_credits = I128::new(new_credits);
-            }
-        }
+        // Do NOT sweep capital here — fee debt sweep belongs at Step 12
+        // (fee_debt_sweep), after settle_losses (Step 9) has been given first
+        // claim on principal. Eager sweep here would violate trading loss seniority
+        // and socialize fee debt through ADL.
         Ok(())
     }
 
@@ -2465,7 +2453,10 @@ impl RiskEngine {
         } else {
             0
         };
-        let liq_fee = core::cmp::min(liq_fee_raw, self.params.liquidation_fee_cap.get());
+        let liq_fee = core::cmp::min(
+            core::cmp::max(liq_fee_raw, self.params.min_liquidation_abs.get()),
+            self.params.liquidation_fee_cap.get(),
+        );
         self.charge_fee_safe(idx as usize, liq_fee)?;
 
         // Step 8: determine deficit D
@@ -2732,7 +2723,7 @@ impl RiskEngine {
             if account.pnl.is_positive() {
                 continue;
             }
-            if !account.fee_credits.is_zero() {
+            if account.fee_credits.get() > 0 {
                 continue;
             }
 
@@ -2741,6 +2732,11 @@ impl RiskEngine {
                 let loss = self.accounts[idx].pnl.abs_u256();
                 self.absorb_protocol_loss(loss);
                 self.set_pnl(idx, I256::ZERO);
+            }
+
+            // Write off negative fee_credits (uncollectible debt from dead account)
+            if self.accounts[idx].fee_credits.is_negative() {
+                self.accounts[idx].fee_credits = I128::new(0);
             }
 
             to_free[num_to_free] = idx as u16;
