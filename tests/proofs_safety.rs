@@ -966,3 +966,44 @@ fn proof_trading_loss_seniority() {
     assert!(!pnl_after.is_negative(),
         "trading loss must be fully settled before fee debt sweep");
 }
+
+// ############################################################################
+// fee_credits at i128::MIN boundary does NOT panic
+// ############################################################################
+
+/// Verify that fee_credits reaching i128::MIN through settle_maintenance_fee_internal
+/// is handled without panic. The spec §2.1 says i128::MIN is forbidden, but
+/// checked_sub allows it (i128::MIN is a valid i128). The engine must either
+/// reject it or handle it gracefully — either way, no panic.
+#[kani::proof]
+#[kani::unwind(1)]
+#[kani::solver(cadical)]
+fn proof_fee_credits_i128_min_boundary_no_panic() {
+    // Directly test the boundary: fee_credits near i128::MIN
+    // If fee_credits = -(i128::MAX) and due = 1, result = i128::MIN.
+    // checked_sub(-(i128::MAX), 1) = Some(i128::MIN), so it passes.
+    // Verify fee_debt_u128_checked handles this without panic.
+    let debt = fee_debt_u128_checked(i128::MIN);
+    assert!(debt == (1u128 << 127), "fee_debt of i128::MIN returns 2^127 via unsigned_abs");
+
+    // Verify the full touch_account_full pipeline handles i128::MIN fee_credits
+    // without panic. fee_debt_sweep (step 12) uses unsigned_abs + saturating_add.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    engine.deposit(a, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.last_market_slot = DEFAULT_SLOT;
+
+    // Force fee_credits to i128::MIN (spec-forbidden but testing robustness)
+    engine.accounts[a as usize].fee_credits = I128::new(i128::MIN);
+    engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
+
+    // touch_account_full runs fee_debt_sweep at step 12 — must not panic
+    let result = engine.touch_account_full(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+    // Either succeeds or returns Err — but must not panic
+    if result.is_ok() {
+        // Capital should have been consumed by fee debt sweep
+        assert!(engine.accounts[a as usize].capital.get() == 0,
+            "capital should be consumed by fee debt sweep");
+    }
+}

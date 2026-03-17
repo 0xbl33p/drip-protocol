@@ -1851,6 +1851,9 @@ impl RiskEngine {
         let due_i128: i128 = due.try_into().map_err(|_| RiskError::Overflow)?;
         let new_fc = self.accounts[idx].fee_credits.get()
             .checked_sub(due_i128).ok_or(RiskError::Overflow)?;
+        if new_fc == i128::MIN {
+            return Err(RiskError::Overflow);
+        }
         self.accounts[idx].fee_credits = I128::new(new_fc);
 
         // Do NOT sweep capital here — fee debt sweep belongs at Step 12
