@@ -608,9 +608,9 @@ fn t13_54_funding_no_mint_asymmetric_a() {
     engine.oi_eff_long_q = U256::from_u128(POS_SCALE);
     engine.oi_eff_short_q = U256::from_u128(POS_SCALE);
 
-    let a_long: u8 = kani::any();
+    let a_long: u16 = kani::any();
     kani::assume(a_long >= 1);
-    let a_short: u8 = kani::any();
+    let a_short: u16 = kani::any();
     kani::assume(a_short >= 1);
     engine.adl_mult_long = a_long as u128;
     engine.adl_mult_short = a_short as u128;
@@ -635,6 +635,8 @@ fn t13_54_funding_no_mint_asymmetric_a() {
     let dk_long = k_long_after.checked_sub(k_long_before).unwrap();
     let dk_short = k_short_after.checked_sub(k_short_before).unwrap();
 
+    // Cross-multiply to check no-mint: dk_long * A_short + dk_short * A_long <= 0
+    // K deltas are bounded by A_side * price * dt which fits i128 for u16 A values.
     let dk_long_i128 = dk_long.try_into_i128().unwrap();
     let dk_short_i128 = dk_short.try_into_i128().unwrap();
     let term_long = dk_long_i128.checked_mul(a_short as i128).unwrap();
@@ -759,33 +761,29 @@ fn proof_withdraw_simulation_preserves_residual() {
     engine.last_crank_slot = 1;
     engine.funding_price_sample_last = 100;
 
-    // Trade so a has a position (needed for margin check path)
+    // Trade so a has a position (exercises the margin-check + haircut path)
     let size_q = I256::from_u128(POS_SCALE);
     engine.execute_trade(a, b, 100, 1, size_q, 100).unwrap();
 
-    // Record haircut before withdraw attempt
+    // Record haircut before actual withdraw
     let (h_num_before, h_den_before) = engine.haircut_ratio();
+    let conservation_before = engine.check_conservation();
+    assert!(conservation_before, "conservation must hold before withdraw");
 
-    // Simulate what the FIXED withdraw does: adjust both capital AND vault
-    let withdraw_amount: u128 = 1_000;
-    let old_cap = engine.accounts[a as usize].capital.get();
-    let old_vault = engine.vault;
-    let new_cap = old_cap - withdraw_amount;
-    engine.set_capital(a as usize, new_cap);
-    engine.vault = U128::new(engine.vault.get() - withdraw_amount);
+    // Call the real engine.withdraw() — this exercises the actual code path
+    // including the simulate-then-check-margin-then-revert-then-apply logic
+    let result = engine.withdraw(a, 1_000, 100, 1);
+    assert!(result.is_ok(), "withdraw of 1000 from 10M capital must succeed");
 
-    let (h_num_sim, h_den_sim) = engine.haircut_ratio();
+    let (h_num_after, h_den_after) = engine.haircut_ratio();
+    assert!(engine.check_conservation(), "conservation must hold after withdraw");
 
-    // Revert
-    engine.set_capital(a as usize, old_cap);
-    engine.vault = old_vault;
-
-    // Cross-multiply to compare fractions: h_num_sim/h_den_sim <= h_num_before/h_den_before
-    let lhs = h_num_sim.checked_mul(h_den_before);
-    let rhs = h_num_before.checked_mul(h_den_sim);
+    // h must not increase: cross-multiply h_after/1 <= h_before/1
+    let lhs = h_num_after.checked_mul(h_den_before);
+    let rhs = h_num_before.checked_mul(h_den_after);
     if let (Some(l), Some(r)) = (lhs, rhs) {
         assert!(l <= r,
-            "haircut must not increase during withdraw simulation — Residual inflation detected");
+            "haircut must not increase after withdraw — Residual inflation detected");
     }
 }
 
@@ -849,22 +847,36 @@ fn proof_gc_dust_preserves_fee_credits() {
     let a = engine.add_user(0).unwrap();
     engine.deposit(a, 10_000, 100, 0).unwrap();
 
-    // Simulate: account has 0 capital, 0 position, but positive fee_credits
+    // Account has 0 capital, 0 position, but positive fee_credits (prepaid)
     engine.set_capital(a as usize, 0);
-    engine.accounts[a as usize].fee_credits = I128::new(5_000); // prepaid credits
+    engine.accounts[a as usize].fee_credits = I128::new(5_000);
     engine.accounts[a as usize].position_basis_q = I256::ZERO;
     engine.accounts[a as usize].reserved_pnl = U256::ZERO;
     engine.set_pnl(a as usize, I256::ZERO);
 
-    let was_used_before = engine.is_used(a as usize);
-    assert!(was_used_before, "account must exist before GC");
-
-    // Run GC
+    assert!(engine.is_used(a as usize));
     engine.garbage_collect_dust();
 
-    // Account must NOT have been freed — it has prepaid fee_credits
+    // Positive fee_credits: account must be PRESERVED (prepaid credits)
     assert!(engine.is_used(a as usize),
-        "GC must not delete account with non-zero fee_credits");
+        "GC must not delete account with positive fee_credits");
     assert!(engine.accounts[a as usize].fee_credits.get() == 5_000,
         "fee_credits must be preserved");
+
+    // Now test negative fee_credits (debt): account SHOULD be collected
+    // and the uncollectible debt written off
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(b, 10_000, 100, 0).unwrap();
+    engine.set_capital(b as usize, 0);
+    engine.accounts[b as usize].fee_credits = I128::new(-3_000); // debt
+    engine.accounts[b as usize].position_basis_q = I256::ZERO;
+    engine.accounts[b as usize].reserved_pnl = U256::ZERO;
+    engine.set_pnl(b as usize, I256::ZERO);
+
+    assert!(engine.is_used(b as usize));
+    engine.garbage_collect_dust();
+
+    // Negative fee_credits (debt) on dead account: must be collected and debt written off
+    assert!(!engine.is_used(b as usize),
+        "GC must collect dead account with negative fee_credits (uncollectible debt)");
 }

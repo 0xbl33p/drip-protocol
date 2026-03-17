@@ -1102,16 +1102,20 @@ fn proof_fee_shortfall_deducted_from_pnl() {
 
     match result2 {
         Ok(()) => {
-            // Trade succeeded — fee shortfall was deducted from PnL
-            // PnL must have decreased (fee came out of it since capital == 0)
+            // Trade succeeded — since capital was 0 before the close,
+            // the trading fee shortfall MUST have been deducted from PnL (spec §8.1 step 5).
             let pnl_after = engine.accounts[a as usize].pnl;
-            assert!(pnl_after < pnl_before || engine.accounts[a as usize].capital.get() > 0,
-                "fee must have been paid from PnL or converted profit");
+            let cap_after = engine.accounts[a as usize].capital.get();
+            // Capital was 0, so fee_paid = min(fee, 0) = 0.
+            // Entire fee was shortfall → set_pnl(payer, PNL - fee_shortfall).
+            // PnL must have decreased.
+            assert!(pnl_after < pnl_before,
+                "with zero capital, fee shortfall must reduce PnL: before={:?}, after={:?}",
+                pnl_before, pnl_after);
         }
         Err(_) => {
-            // If the trade was rejected, it must NOT be because of fee shortfall alone
-            // (the spec says shortfall should deduct from PnL, not revert)
-            // This path is acceptable if rejected for other reasons (margin, etc.)
+            // Trade rejected for margin or other reasons — acceptable.
+            // The spec allows rejection if the result would violate margin requirements.
         }
     }
 }
@@ -1130,23 +1134,66 @@ fn proof_organic_close_bankruptcy_guard() {
 
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
-    engine.deposit(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Small capital for a so price crash makes them insolvent
+    engine.deposit(a, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit(b, 10_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Open a position: a goes long
+    // Open a leveraged long position for a (near max leverage)
+    // 10k capital, 10% IM → max notional ~100k → ~100 units at price 1000
+    let size = I256::from_u128(90 * POS_SCALE);
+    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE);
+    assert!(result.is_ok());
+
+    // Crash oracle to make a deeply underwater through normal market mechanics.
+    // a is long 90 units: PnL = 90 * (crash_price - 1000).
+    // At crash_price = 800: PnL = 90 * (-200) = -18000. Capital ~10k. Insolvent.
+    let crash_price = 800u64;
+    let crash_slot = DEFAULT_SLOT + 1;
+    engine.last_crank_slot = crash_slot;
+
+    // Try organic close at crash price — a is insolvent, close to flat would
+    // leave uncovered negative PnL
+    let neg_size = size.checked_neg().unwrap();
+    let result2 = engine.execute_trade(a, b, crash_price, crash_slot, neg_size, crash_price);
+
+    // Must be rejected — the organic close would leave a flat with negative PnL
+    // (loss exceeds capital, so after settle_losses there's still uncovered deficit)
+    assert!(result2.is_err(),
+        "organic close that leaves uncovered negative PnL must be rejected");
+}
+
+// ############################################################################
+// SPEC PROPERTY #24: solvent flat-close succeeds
+// ############################################################################
+
+/// A solvent trader who closes to flat and can pay losses from principal
+/// must NOT be rejected due to an unperformed settlement step.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn proof_solvent_flat_close_succeeds() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Open a small position
     let size = I256::from_u128(POS_SCALE);
     let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE);
     assert!(result.is_ok());
 
-    // Give a a large negative PnL (more than capital can cover)
-    engine.set_pnl(a as usize, I256::from_i128(-200_000));
+    // Price drops modestly — a has losses but plenty of capital to cover
+    let new_price = 900u64;
+    let slot2 = DEFAULT_SLOT + 1;
+    engine.last_crank_slot = slot2;
 
-    // Try to close to flat — should be rejected because after settle_losses,
-    // a would be flat with negative PnL (uncovered obligation)
+    // Close to flat: a sells their long position
     let neg_size = size.checked_neg().unwrap();
-    let result2 = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, neg_size, DEFAULT_ORACLE);
+    let result2 = engine.execute_trade(a, b, new_price, slot2, neg_size, new_price);
 
-    // Must be rejected — the organic close would leave a flat with negative PnL
-    assert!(result2.is_err(),
-        "organic close that leaves uncovered negative PnL must be rejected");
+    // Solvent close to flat must succeed — losses are coverable from capital
+    assert!(result2.is_ok(),
+        "solvent trader closing to flat must not be rejected");
+    assert!(engine.check_conservation(), "conservation must hold after flat close");
 }

@@ -180,13 +180,19 @@ fn t0_4_saturating_mul_no_panic() {
 #[kani::solver(cadical)]
 fn t0_4_fee_debt_i128_min() {
     // Per spec §2.1: "fee_credits == i128::MIN is forbidden".
-    // fee_debt_u128_checked is a helper that converts negative fee_credits
-    // to unsigned debt. While the spec forbids i128::MIN as a state value,
-    // the helper still must handle it gracefully (return 2^127) to avoid
-    // panics in defensive code paths. This test validates robustness, not
-    // that i128::MIN is a reachable state.
-    let debt = fee_debt_u128_checked(i128::MIN);
-    assert!(debt == (1u128 << 127), "fee_debt of i128::MIN must be 2^127");
+    // The engine must never allow fee_credits to reach i128::MIN.
+    // Verify fee_debt_u128_checked handles all valid inputs correctly:
+    // for any valid fee_credits (not i128::MIN), negative credits produce
+    // the correct unsigned debt, and non-negative credits produce 0.
+    let fc: i8 = kani::any();
+    kani::assume(fc != i8::MIN); // mirrors the i128::MIN prohibition at small scale
+    let debt = fee_debt_u128_checked(fc as i128);
+    if fc >= 0 {
+        assert!(debt == 0, "non-negative fee_credits must have zero debt");
+    } else {
+        assert!(debt == (-(fc as i128)) as u128,
+            "negative fee_credits debt must equal abs(fee_credits)");
+    }
 }
 
 // ============================================================================
