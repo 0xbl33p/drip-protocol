@@ -344,37 +344,33 @@ fn t4_17_enqueue_adl_preserves_oi_balance_qty_only() {
     assert!(eff_q2 <= q2 as u16);
 }
 
+/// Precision exhaustion: when A_candidate floors to 0 despite OI_post > 0,
+/// engine must zero BOTH sides' OI and set both pending_reset.
+/// Uses actual engine enqueue_adl with symbolic A_mult close to exhaustion.
 #[kani::proof]
-#[kani::unwind(1)]
+#[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn t4_18_precision_exhaustion_both_sides_reset() {
-    let a_old: u16 = kani::any();
-    kani::assume(a_old > 0);
-    let oi: u8 = kani::any();
-    kani::assume(oi >= 2);
-    let q_close: u8 = kani::any();
-    kani::assume(q_close > 0 && q_close < oi);
-    let oi_post = oi - q_close;
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
 
-    let a_candidate = ((a_old as u32) * (oi_post as u32)) / (oi as u32);
+    // A_mult = 2, OI = 3*PS. Closing 2*PS leaves OI_post = 1*PS.
+    // A_candidate = floor(2 * 1 / 3) = 0 → precision exhaustion.
+    engine.adl_mult_long = 2;
+    engine.adl_coeff_long = I256::ZERO;
+    engine.oi_eff_long_q = U256::from_u128(3 * POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(3 * POS_SCALE);
+    engine.stored_pos_count_long = 1;
 
-    kani::assume(a_candidate == 0);
-    assert!(oi_post > 0);
+    let q_close = U256::from_u128(2 * POS_SCALE);
+    let result = engine.enqueue_adl(&mut ctx, Side::Short, q_close, U256::ZERO);
+    assert!(result.is_ok());
 
-    let mut oi_eff_opp: u16 = oi_post as u16;
-    let mut oi_eff_liq: u16 = kani::any();
-    let mut pending_reset_opp = false;
-    let mut pending_reset_liq = false;
-
-    oi_eff_opp = 0;
-    oi_eff_liq = 0;
-    pending_reset_opp = true;
-    pending_reset_liq = true;
-
-    assert!(oi_eff_opp == 0);
-    assert!(oi_eff_liq == 0);
-    assert!(pending_reset_opp);
-    assert!(pending_reset_liq);
+    // Both sides' OI must be zeroed (precision exhaustion terminal drain)
+    assert!(engine.oi_eff_long_q.is_zero(), "opposing OI must be zeroed");
+    assert!(engine.oi_eff_short_q.is_zero(), "liquidated OI must be zeroed");
+    assert!(ctx.pending_reset_long, "opposing side must be pending reset");
+    assert!(ctx.pending_reset_short, "liquidated side must be pending reset");
 }
 
 #[kani::proof]
@@ -445,46 +441,74 @@ fn t4_21_precision_exhaustion_zeroes_both_sides() {
     assert!(ctx.pending_reset_short);
 }
 
+/// K-space overflow routes deficit to absorb_protocol_loss, preserving K.
+/// Uses actual engine enqueue_adl with K near I256::MIN to trigger overflow.
+/// No unwind annotation — cadical SAT solver handles the U512 division loop.
 #[kani::proof]
-#[kani::unwind(1)]
 #[kani::solver(cadical)]
 fn t4_22_k_overflow_routes_to_absorb() {
-    let oi: u8 = kani::any();
-    kani::assume(oi >= 2);
-    let q_close: u8 = kani::any();
-    kani::assume(q_close > 0 && q_close < oi);
-    let d: u8 = kani::any();
-    kani::assume(d > 0);
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
 
-    let a_old = S_ADL_ONE;
-    let oi_post = oi - q_close;
+    // Set K near I256::MIN so delta_K addition underflows
+    engine.adl_coeff_long = I256::MIN.checked_add(I256::from_i128(1)).unwrap();
+    engine.adl_mult_long = POS_SCALE; // Use POS_SCALE (not ADL_ONE) to keep computation manageable
+    engine.oi_eff_long_q = U256::from_u128(4 * POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(4 * POS_SCALE);
+    engine.stored_pos_count_long = 1;
+    engine.insurance_fund.balance = U128::new(10_000_000);
 
-    let k_opp: i8 = -127;
-    let k_after = k_opp;
+    let k_before = engine.adl_coeff_long;
+    let ins_before = engine.insurance_fund.balance.get();
 
-    let a_new = a_after_adl(a_old, oi_post as u16, oi as u16);
-    assert!(a_new < a_old as u16, "A must shrink even on K overflow");
-    assert!(k_after == k_opp, "K must be unchanged on overflow (routed to absorb)");
+    // ADL with deficit — delta_K will be large negative, K_opp + delta_K underflows
+    let q_close = U256::from_u128(POS_SCALE);
+    let d = U256::from_u128(1_000_000);
+
+    let result = engine.enqueue_adl(&mut ctx, Side::Short, q_close, d);
+    assert!(result.is_ok());
+
+    // K must be unchanged (overflow routed to absorb)
+    assert!(engine.adl_coeff_long == k_before,
+        "K must be unchanged when overflow routes to absorb");
+    // Insurance must have decreased (absorb_protocol_loss was called)
+    assert!(engine.insurance_fund.balance.get() < ins_before,
+        "insurance must decrease when absorbing overflow deficit");
+    // A must still shrink (quantity routing is independent of K overflow)
+    assert!(engine.adl_mult_long < POS_SCALE, "A must shrink even on K overflow");
 }
 
+/// D=0 ADL: K must be unchanged, A must decrease, OI updated.
+/// Uses actual engine enqueue_adl with zero deficit.
+/// No unwind — A computation uses U512 internally.
 #[kani::proof]
-#[kani::unwind(1)]
 #[kani::solver(cadical)]
 fn t4_23_d_zero_routes_quantity_only() {
-    let oi: u8 = kani::any();
-    kani::assume(oi >= 2);
-    let q_close: u8 = kani::any();
-    kani::assume(q_close > 0 && q_close < oi);
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut ctx = InstructionContext::new();
 
-    let a_old = S_ADL_ONE;
-    let k_before: i32 = kani::any::<i8>() as i32;
-    let oi_post = oi - q_close;
+    let k_init: i8 = kani::any();
+    engine.adl_coeff_long = I256::from_i128(k_init as i128);
+    engine.adl_mult_long = ADL_ONE;
+    engine.oi_eff_long_q = U256::from_u128(10 * POS_SCALE);
+    engine.oi_eff_short_q = U256::from_u128(10 * POS_SCALE);
+    engine.stored_pos_count_long = 1;
 
-    let k_after = k_before;
+    let k_before = engine.adl_coeff_long;
+    let a_before = engine.adl_mult_long;
 
-    let a_new = a_after_adl(a_old, oi_post as u16, oi as u16);
-    assert!(a_new < a_old as u16, "A must strictly decrease");
-    assert!(k_after == k_before, "K must be unchanged when D == 0");
+    // D=0 quantity-only ADL
+    let q_close = U256::from_u128(POS_SCALE);
+    let result = engine.enqueue_adl(&mut ctx, Side::Short, q_close, U256::ZERO);
+    assert!(result.is_ok());
+
+    // K must be unchanged when D == 0
+    assert!(engine.adl_coeff_long == k_before, "K must be unchanged when D == 0");
+    // A must decrease
+    assert!(engine.adl_mult_long < a_before, "A must decrease after quantity ADL");
+    // OI must decrease by q_close on both sides
+    assert!(engine.oi_eff_long_q == U256::from_u128(9 * POS_SCALE));
+    assert!(engine.oi_eff_short_q == U256::from_u128(9 * POS_SCALE));
 }
 
 // ############################################################################
@@ -662,11 +686,13 @@ fn proof_junior_profit_backing() {
     let residual = vault - c_tot - ins;
     // With no trades, vault = dep_a + dep_b = c_tot, insurance = 0
     // So residual = 0, pnl_pos_tot = pnl_val > 0
-    // This means haircut ratio kicks in: h_num <= h_den ensures effective PnL <= residual
+    // haircut_ratio: h_num = min(Residual, pnl_pos_tot), h_den = pnl_pos_tot
+    // effective_ppt = floor(pnl_pos_tot * h_num / h_den) ≤ Residual
     let (h_num, h_den) = engine.haircut_ratio();
     let effective_ppt = mul_div_floor_u256(engine.pnl_pos_tot, h_num, h_den);
-    assert!(effective_ppt.try_into_u128().unwrap() <= residual + ppt,
-        "haircutted PnL must be backed");
+    // Spec §3.5: Σ PNL_eff_pos_i ≤ Residual (the core solvency invariant)
+    assert!(effective_ppt.try_into_u128().unwrap() <= residual,
+        "haircutted PnL must be backed by residual alone");
 }
 
 // ############################################################################
