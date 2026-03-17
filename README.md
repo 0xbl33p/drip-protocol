@@ -2,7 +2,7 @@
 
 **EDUCATIONAL RESEARCH PROJECT — NOT PRODUCTION READY. NOT AUDITED. Do NOT use with real funds.**
 
-A predictable alternative to ADL.
+A predictable alternative to ADL queues.
 
 If you want the `xy = k` of perpetual futures risk engines -- something you can reason about, audit, and run without human intervention -- the cleanest move is simple: stop treating profit like money. Treat it like what it really is in a stressed exchange: a junior claim on a shared balance sheet.
 
@@ -52,7 +52,7 @@ Flat accounts are always protected — `h` only gates profit extraction, never t
 
 When a leveraged account goes bankrupt, two things need to happen: remove the position quantity from open interest, and distribute any uncovered deficit across the opposing side.
 
-Traditional ADL picks specific counterparties and force-closes them. Percolator replaces this with two global coefficients per side:
+Traditional ADL queues pick specific counterparties and force-close them. Percolator replaces the queue with two global coefficients per side:
 
 - **A** scales everyone's effective position equally.
 - **K** accumulates all PnL events (mark, funding, deficit socialization) into one index.
