@@ -823,13 +823,18 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let mut ctx = InstructionContext::new();
 
-    // Create one long account with known position, one short counterpart.
+    // Three accounts: one long (a), one short counterpart (b), and a
+    // "liquidated" short (liq) whose effective position equals q_close.
+    // Without liq, the ADL's short-side OI decrement has no matching
+    // account removal and OI_short underflows when b is closed.
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
+    let liq = engine.add_user(0).unwrap();
     engine.deposit(a, 10_000_000, 100, 0).unwrap();
     engine.deposit(b, 10_000_000, 100, 0).unwrap();
+    engine.deposit(liq, 10_000_000, 100, 0).unwrap();
 
-    // Set up: one long position at A=7, one short position for OI balance.
+    // Set up: one long position at A=7, two short positions for OI balance.
     engine.adl_mult_long = 7;
     engine.adl_mult_short = ADL_ONE;
     engine.adl_coeff_long = 0i128;
@@ -841,16 +846,26 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     engine.accounts[a as usize].adl_k_snap = 0i128;
     engine.accounts[a as usize].adl_epoch_snap = 0;
 
-    // Account b: short 10*POS_SCALE at a_basis=ADL_ONE
-    engine.accounts[b as usize].position_basis_q = -((10 * POS_SCALE) as i128);
+    // Account b: short 9*POS_SCALE (remaining short OI after liquidation)
+    engine.accounts[b as usize].position_basis_q = -((9 * POS_SCALE) as i128);
     engine.accounts[b as usize].adl_a_basis = ADL_ONE;
     engine.accounts[b as usize].adl_k_snap = 0i128;
     engine.accounts[b as usize].adl_epoch_snap = 0;
 
+    // Account liq: short 1*POS_SCALE (the liquidated short whose close triggers ADL)
+    engine.accounts[liq as usize].position_basis_q = -((POS_SCALE) as i128);
+    engine.accounts[liq as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[liq as usize].adl_k_snap = 0i128;
+    engine.accounts[liq as usize].adl_epoch_snap = 0;
+
     engine.stored_pos_count_long = 1;
-    engine.stored_pos_count_short = 1;
+    engine.stored_pos_count_short = 2;
     engine.oi_eff_long_q = 10 * POS_SCALE;
     engine.oi_eff_short_q = 10 * POS_SCALE;
+
+    // Remove the liquidated short's position (simulating close before ADL enqueue)
+    engine.attach_effective_position(liq as usize, 0i128);
+    engine.oi_eff_short_q -= POS_SCALE;
 
     // ADL: close 1*POS_SCALE from short side → shrinks A_long
     let result = engine.enqueue_adl(
@@ -863,21 +878,17 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
     // Now settle account a through the engine to get actual effective position + dust
     let settle_result = engine.settle_side_effects(a as usize);
     assert!(settle_result.is_ok());
-
-    // Get a's actual effective position after settlement
     let eff_a = engine.effective_pos_q(a as usize);
     let abs_eff_a = eff_a.unsigned_abs();
-
-    // Attach the effective position (zeroing it) to close a's long
     engine.attach_effective_position(a as usize, 0i128);
 
-    // Similarly settle and close b's short
+    // Settle and close b's short
     let settle_b = engine.settle_side_effects(b as usize);
     assert!(settle_b.is_ok());
     let eff_b = engine.effective_pos_q(b as usize);
     engine.attach_effective_position(b as usize, 0i128);
 
-    // Update OI through actual decrements
+    // Update OI with actual effective positions
     engine.oi_eff_long_q = engine.oi_eff_long_q.checked_sub(abs_eff_a).unwrap_or(0);
     engine.oi_eff_short_q = engine.oi_eff_short_q.checked_sub(eff_b.unsigned_abs()).unwrap_or(0);
 
@@ -1023,15 +1034,20 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let mut ctx = InstructionContext::new();
 
-    // Create two long accounts and two short counterparts for OI balance.
+    // Five accounts: two long (a,b), two short counterparts (c,d), and a
+    // "liquidated" short (liq) whose effective position equals q_close (3*POS_SCALE).
+    // Without liq, the ADL's short-side OI decrement has no matching
+    // account removal and OI_short underflows when c+d are closed.
     let a_idx = engine.add_user(0).unwrap();
     let b_idx = engine.add_user(0).unwrap();
     let c_idx = engine.add_user(0).unwrap();
     let d_idx = engine.add_user(0).unwrap();
+    let liq_idx = engine.add_user(0).unwrap();
     engine.deposit(a_idx, 10_000_000, 100, 0).unwrap();
     engine.deposit(b_idx, 10_000_000, 100, 0).unwrap();
     engine.deposit(c_idx, 10_000_000, 100, 0).unwrap();
     engine.deposit(d_idx, 10_000_000, 100, 0).unwrap();
+    engine.deposit(liq_idx, 10_000_000, 100, 0).unwrap();
 
     engine.adl_mult_long = 13;
     engine.adl_mult_short = ADL_ONE;
@@ -1051,21 +1067,32 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     engine.accounts[b_idx as usize].adl_k_snap = 0i128;
     engine.accounts[b_idx as usize].adl_epoch_snap = 0;
 
-    // Accounts c,d: short 6*POS_SCALE each for OI balance
-    engine.accounts[c_idx as usize].position_basis_q = -((6 * POS_SCALE) as i128);
+    // Accounts c,d: short 4.5*POS_SCALE each (9*POS_SCALE total remaining short)
+    let short_each = (9 * POS_SCALE) / 2;
+    engine.accounts[c_idx as usize].position_basis_q = -(short_each as i128);
     engine.accounts[c_idx as usize].adl_a_basis = ADL_ONE;
     engine.accounts[c_idx as usize].adl_k_snap = 0i128;
     engine.accounts[c_idx as usize].adl_epoch_snap = 0;
 
-    engine.accounts[d_idx as usize].position_basis_q = -((6 * POS_SCALE) as i128);
+    engine.accounts[d_idx as usize].position_basis_q = -(short_each as i128);
     engine.accounts[d_idx as usize].adl_a_basis = ADL_ONE;
     engine.accounts[d_idx as usize].adl_k_snap = 0i128;
     engine.accounts[d_idx as usize].adl_epoch_snap = 0;
 
+    // Account liq: short 3*POS_SCALE (the liquidated short whose close triggers ADL)
+    engine.accounts[liq_idx as usize].position_basis_q = -((3 * POS_SCALE) as i128);
+    engine.accounts[liq_idx as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[liq_idx as usize].adl_k_snap = 0i128;
+    engine.accounts[liq_idx as usize].adl_epoch_snap = 0;
+
     engine.stored_pos_count_long = 2;
-    engine.stored_pos_count_short = 2;
+    engine.stored_pos_count_short = 3;
     engine.oi_eff_long_q = 12 * POS_SCALE;
-    engine.oi_eff_short_q = 12 * POS_SCALE;
+    engine.oi_eff_short_q = 2 * short_each + 3 * POS_SCALE;
+
+    // Remove the liquidated short's position (simulating close before ADL enqueue)
+    engine.attach_effective_position(liq_idx as usize, 0i128);
+    engine.oi_eff_short_q -= 3 * POS_SCALE;
 
     // ADL: close 3*POS_SCALE from short side → shrinks A_long
     let result = engine.enqueue_adl(
@@ -1075,7 +1102,7 @@ fn t14_65_dust_bound_end_to_end_clearance() {
     assert!(engine.adl_mult_long == 9);
     assert!(engine.phantom_dust_bound_long_q != 0);
 
-    // Settle all four accounts through the engine's actual settle path
+    // Settle all remaining accounts through the engine's actual settle path
     let sa = engine.settle_side_effects(a_idx as usize);
     assert!(sa.is_ok());
     let sb = engine.settle_side_effects(b_idx as usize);

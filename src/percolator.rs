@@ -557,6 +557,8 @@ impl RiskEngine {
         self.next_free[idx as usize] = self.free_head;
         self.free_head = idx;
         self.num_used_accounts = self.num_used_accounts.saturating_sub(1);
+        // Decrement materialized_account_count (spec §2.1.2)
+        self.materialized_account_count = self.materialized_account_count.saturating_sub(1);
     }
 
     // ========================================================================
@@ -993,19 +995,16 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Step 1: set current_slot = now_slot (spec §5.4)
-        self.current_slot = now_slot;
+        // Step 4: snapshot OI at start (fixed for all sub-steps per spec §5.4)
+        let long_live = self.oi_eff_long_q != 0;
+        let short_live = self.oi_eff_short_q != 0;
 
         let total_dt = now_slot.saturating_sub(self.last_market_slot);
         if total_dt == 0 && self.last_oracle_price == oracle_price {
-            // No time elapsed and price unchanged — skip (spec §5.4 step 2)
-            self.funding_price_sample_last = oracle_price;
+            // Step 5: no change — set current_slot and return (spec §5.4)
+            self.current_slot = now_slot;
             return Ok(());
         }
-
-        // Read OI at start (fixed for all sub-steps per spec)
-        let long_live = self.oi_eff_long_q != 0;
-        let short_live = self.oi_eff_short_q != 0;
 
         // Mark-once rule (spec §1.5 item 21): apply mark exactly once from P_last to oracle_price
         let current_price = if self.last_oracle_price == 0 { oracle_price } else { self.last_oracle_price };
@@ -1026,6 +1025,7 @@ impl RiskEngine {
 
         // If no time elapsed, mark was applied above — just update stored prices and return
         if total_dt == 0 {
+            self.current_slot = now_slot;
             self.last_oracle_price = oracle_price;
             self.funding_price_sample_last = oracle_price;
             return Ok(());
@@ -1102,7 +1102,7 @@ impl RiskEngine {
 
         }
 
-        // Synchronize slots and prices (spec §5.4 step 7)
+        // Synchronize slots and prices (spec §5.4 step 9)
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
@@ -1706,16 +1706,21 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn touch_account_full(&mut self, idx: usize, oracle_price: u64, now_slot: u64) -> Result<()> {
-        // Time monotonicity (spec §10.1 steps 1-2)
+        // Preconditions (spec §10.1)
         if now_slot < self.current_slot {
             return Err(RiskError::Overflow);
         }
         if now_slot < self.last_market_slot {
             return Err(RiskError::Overflow);
         }
+        if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
+            return Err(RiskError::Overflow);
+        }
+
+        // Step 1: current_slot = now_slot (spec §10.1)
         self.current_slot = now_slot;
 
-        // Step 2
+        // Step 2: accrue_market_to
         self.accrue_market_to(now_slot, oracle_price)?;
 
         // Step 3-4: capture old_avail and old_warmable before settle
@@ -1730,19 +1735,17 @@ impl RiskEngine {
         if new_avail > old_avail {
             let cap_before = self.accounts[idx].capital.get();
             self.restart_on_new_profit(idx, old_warmable);
-            // Fee-debt seniority: if restart conversion increased capital,
-            // sweep fee debt immediately before any later capital-consuming logic.
             let cap_after = self.accounts[idx].capital.get();
             if cap_after > cap_before {
                 self.fee_debt_sweep(idx);
             }
         }
 
-        // Step 8: maintenance fees
-        self.settle_maintenance_fee_internal(idx, now_slot)?;
-
-        // Step 9: settle losses from principal
+        // Step 8: settle losses from principal (spec §10.1)
         self.settle_losses(idx);
+
+        // Step 9: maintenance fees (spec §10.1, §8.2)
+        self.settle_maintenance_fee_internal(idx, now_slot)?;
 
         // Step 10: resolve flat negative
         self.resolve_flat_negative(idx);
@@ -1970,8 +1973,6 @@ impl RiskEngine {
         oracle_price: u64,
         now_slot: u64,
     ) -> Result<()> {
-        self.current_slot = now_slot;
-
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -2070,8 +2071,6 @@ impl RiskEngine {
         size_q: i128,
         exec_price: u64,
     ) -> Result<()> {
-        self.current_slot = now_slot;
-
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -2421,12 +2420,10 @@ impl RiskEngine {
     fn liquidate_at_oracle_internal(
         &mut self,
         idx: u16,
-        now_slot: u64,
+        _now_slot: u64,
         oracle_price: u64,
         ctx: &mut InstructionContext,
     ) -> Result<bool> {
-        self.current_slot = now_slot;
-
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Ok(false);
         }
@@ -2436,7 +2433,7 @@ impl RiskEngine {
         }
 
         // No touch_account_full here — spec §9.4 requires caller to have
-        // already called it. Calling it again would be redundant and waste CU.
+        // already called it.
 
         // Check position exists
         let old_eff = self.effective_pos_q(idx as usize);
@@ -2514,12 +2511,10 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        self.current_slot = now_slot;
-
         // Step 1: initialize instruction context (spec §10.6)
         let mut ctx = InstructionContext::new();
 
-        // Accrue market state using stored rate (anti-retroactivity)
+        // Step 2: accrue market state using stored rate (anti-retroactivity)
         self.accrue_market_to(now_slot, oracle_price)?;
 
         // Validate and set new rate for next interval.
@@ -2535,7 +2530,10 @@ impl RiskEngine {
             self.last_crank_slot = now_slot;
         }
 
-        // Caller maintenance settle with 50% discount
+        // Caller maintenance settle with 50% discount.
+        // Apply the discount (advance last_fee_slot) BEFORE touch so that
+        // touch_account_full's step 9 charges only the reduced interval.
+        // This satisfies current-state gating because touch runs immediately after.
         let (slots_forgiven, caller_settle_ok) = if (caller_idx as usize) < MAX_ACCOUNTS
             && self.is_used(caller_idx as usize)
         {
@@ -2545,13 +2543,14 @@ impl RiskEngine {
             if forgive > 0 && dt > 0 {
                 self.accounts[caller_idx as usize].last_fee_slot = last_fee.saturating_add(forgive);
             }
-            self.settle_maintenance_fee_internal(caller_idx as usize, now_slot)?;
+            // Current-state gating (spec §10.6): touch after discount applied
+            self.touch_account_full(caller_idx as usize, oracle_price, now_slot)?;
             (forgive, true)
         } else {
             (0, true)
         };
 
-        // Process up to ACCOUNTS_PER_CRANK accounts
+        // Step 3: process up to ACCOUNTS_PER_CRANK accounts
         let mut num_liquidations: u32 = 0;
         let num_liq_errors: u16 = 0;
         let mut sweep_complete = false;
@@ -2577,11 +2576,10 @@ impl RiskEngine {
             if is_occupied {
                 accounts_processed += 1;
 
-                // Touch account — propagate errors to trigger transaction rollback
-                // rather than committing half-mutated state.
+                // Touch account — current-state gating (spec §10.6)
                 self.touch_account_full(idx, oracle_price, now_slot)?;
 
-                // Liquidation — uses internal routine sharing crank's ctx.
+                // Liquidation — only after touch (current-state gating).
                 // Errors must propagate: liquidate_at_oracle_internal mutates
                 // state before downstream calls, so swallowing an error would
                 // commit corrupted state (broken OI invariant).
@@ -2622,9 +2620,13 @@ impl RiskEngine {
 
         let num_gc_closed = self.garbage_collect_dust();
 
-        // Steps 3-4: end-of-instruction resets (spec §10.6)
+        // Steps 4-5: end-of-instruction resets (spec §10.6)
         self.schedule_end_of_instruction_resets(&mut ctx)?;
         self.finalize_end_of_instruction_resets(&ctx);
+
+        // Step 7: assert OI balance (spec §10.6)
+        assert!(self.oi_eff_long_q == self.oi_eff_short_q,
+            "OI_eff_long != OI_eff_short after keeper_crank");
 
         Ok(CrankOutcome {
             advanced,
@@ -2645,8 +2647,6 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn close_account(&mut self, idx: u16, now_slot: u64, oracle_price: u64) -> Result<u128> {
-        self.current_slot = now_slot;
-
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }

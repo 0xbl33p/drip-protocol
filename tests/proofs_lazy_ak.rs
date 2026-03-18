@@ -503,8 +503,9 @@ fn t2_14_compose_mark_adl_mark() {
     let q_eff_new = lazy_eff_q(basis_q, a_new, a0);
     kani::assume(q_eff_new > 0);
 
-    // Mark 2: PnL on the reduced effective position
-    let eager_mark2 = (q_eff_new as i32) * (dp2 as i32);
+    // Mark 2: PnL on the reduced effective position (convert q-units to base units)
+    let q_eff_base = (q_eff_new / S_POS_SCALE) as i32;
+    let eager_mark2 = q_eff_base * (dp2 as i32);
     let eager_total = eager_mark1 + eager_mark2;
 
     // Lazy sequence: K accumulates both marks, but the ADL changes A mid-stream
