@@ -21,6 +21,7 @@ fn default_params() -> RiskParams {
         liquidation_fee_cap: U128::new(100_000),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(0),
+        min_initial_deposit: U128::ZERO,
     }
 }
 
@@ -39,7 +40,7 @@ fn pos_q(qty: i64) -> i128 {
 /// Helper: crank to make trades/withdrawals work
 #[cfg(feature = "test")]
 fn crank(engine: &mut RiskEngine, slot: u64, oracle_price: u64) {
-    let _ = engine.keeper_crank(0, slot, oracle_price, 0);
+    let _ = engine.keeper_crank(slot, oracle_price, &[], 64);
 }
 
 // ============================================================================
@@ -103,19 +104,13 @@ fn test_e2e_complete_user_journey() {
 
     // === Phase 3: PNL Warmup ===
 
-    // Alice's profit needs to warm up
-    let _warmable_initial = engine.warmable_gross(alice as usize);
-
     // Advance some slots
     engine.advance_slot(50);
 
-    // Warmable should increase over time (or at least not decrease)
-    // (Note: warmable depends on slope being set, which happens during touch)
+    // Touch to settle and convert warmup
     let slot = engine.current_slot;
     engine.touch_account_full(alice as usize, new_price, slot).unwrap();
-    let _warmable_after = engine.warmable_gross(alice as usize);
 
-    // After touching (which settles and converts), warmable may reset
     // The key invariant is conservation
     assert!(engine.check_conservation(), "Conservation after warmup");
 
@@ -181,9 +176,9 @@ fn test_e2e_funding_complete_cycle() {
     // Advance time and accrue funding with a positive rate (longs pay shorts)
     engine.advance_slot(20);
 
-    // Set funding rate for next interval using keeper_crank
+    // Run keeper_crank to advance
     let slot = engine.current_slot;
-    let _ = engine.keeper_crank(alice, slot, oracle_price, 50); // 50 bps/slot
+    let _ = engine.keeper_crank(slot, oracle_price, &[], 64);
 
     // Advance more time for funding to accrue
     engine.advance_slot(20);

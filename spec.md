@@ -1,33 +1,28 @@
-# Risk Engine Spec (Source of Truth) — v11.12
+# Risk Engine Spec (Source of Truth) — v11.21
 
-**Combined Single-Document Native 128-bit Revision (Keeper-Current-State / Fee-Sweep-Seniority / Maintenance-Fee-Neutrality Edition)**
+**Combined Single-Document Native 128-bit Revision  
+(Off-Chain Shortlist Keeper / Flat-Only Auto-Conversion / Full-Local-PnL Maintenance Edition)**
 
 **Design:** Protected Principal + Junior Profit Claims + Lazy A/K Side Indices (Native 128-bit Base-10 Scaling)  
 **Status:** implementation source-of-truth (normative language: MUST / MUST NOT / SHOULD / MAY)  
 **Scope:** perpetual DEX risk engine for a single quote-token vault.  
-**Goal:** preserve oracle-manipulation resistance, conservation, bounded insolvency handling, and liveness while supporting lazy ADL across the opposing open-interest side without global scans, without canonical-order dependencies, and without sequential prefix requirements for user settlement.
+**Goal:** preserve conservation, bounded insolvency handling, oracle-manipulation resistance, and liveness while supporting lazy ADL across the opposing open-interest side without global scans, canonical-order dependencies, or sequential prefix requirements for user settlement.
 
-This is a single combined spec. It supersedes prior delta-style revisions by restating the full current design in one document, explicitly scaled for native 128-bit high-throughput VM execution.
+This is a single combined spec. It supersedes prior delta-style revisions by restating the full current design in one document and replacing the earlier integrated on-chain barrier-scan keeper mode with a minimal on-chain exact-revalidation crank that assumes candidate discovery is performed off chain by permissionless keepers.
 
-## Change summary from v11.11
+## Change summary from v11.20
 
-This revision fixes the remaining real non-minor issues from the latest consistency pass and tightens the normative body around keeper behavior, fee-debt sweep ordering, and optional maintenance-fee designs.
+This revision performs another full consistency pass on the latest document, verifies the previously reported exact-drain ADL reset bug is fixed, and patches the remaining real non-minor issue found in the current design.
 
-1. **Keeper account actions are now explicitly current-state gated.** `keeper_crank` may not perform liquidation decisions, standalone warmup conversion, or standalone fee-debt extraction on an account unless that account has already been brought to current state with `touch_account_full(i, oracle_price, now_slot)` in the same instruction (or the action is explicitly defined safe on a stored-flat account).
+1. **The post-withdraw live-balance dust floor is now universal.** A withdrawal MUST leave post-withdraw capital either exactly `0` or at least `MIN_INITIAL_DEPOSIT`, regardless of whether the account currently has an open position. This closes the micro-position flash-withdraw capacity-pinning loop in which an attacker could temporarily hold dust OI to bypass the old flat-only dust rule and then return to a flat unreclaimable `C_i = 1` account.
 
-2. **The generic fee-debt sweep rule is now consistent with loss seniority.** §7.5 now states that fee debt must be swept as soon as newly available capital is no longer senior-encumbered by already-realized trading losses on the same local state. This preserves the intended `deposit` / trade / liquidation ordering while still forbidding cross-instruction deferral.
+2. **Open-position matured-profit access is now explicit rather than impossible.** A new top-level `convert_released_pnl(i, x_req, oracle_price, now_slot)` instruction lets an account with an open position voluntarily convert some or all matured released profit into protected principal on current state, then immediately sweep fee debt. This removes the major functional lockout where open-position users could not access matured profits without fully closing the position, while preserving the safety of flat-only automatic conversion on ordinary passive touches.
 
-3. **Optional recurring maintenance fees are now protocol-neutral by construction.** The spec now forbids realizing maintenance fees by mutating `K_side`, `PNL_i`, or `PNL_pos_tot`, and requires any position-dependent recurring fee design to realize only into `I` and/or `fee_credits_i` through a dedicated lazy fee accumulator or a formally equivalent method.
+3. **Risk-reducing trade policy is clarified as fee-inclusive by design, and deployments get an explicit configuration recommendation.** The strict raw-buffer comparison in §10.5 still intentionally uses the actual post-fee state. This is not a correctness bug. To keep the exemption practically usable, deployments that value voluntary de-risking SHOULD configure `trading_fee_bps` materially below `maintenance_bps`.
 
-4. **Maintenance-fee realization is now explicitly bounded.** If a recurring maintenance-fee realization would exceed `MAX_PROTOCOL_FEE_ABS` or the permitted one-step `fee_credits_i` write range, the implementation must split the interval or realization into bounded internal chunks rather than overflow or fail unpredictably.
+4. **All v11.20 fixes are preserved.** Profit conversion still uses `consume_released_pnl`, automatic conversion remains flat-only on ordinary touches, maintenance equity still uses full local touched `PNL_i`, the exact-drain `enqueue_adl` reset fix remains in force, flat withdrawals still cannot leave unreclaimable dust, and funding-rate recomputation still clamps rather than reverting.
 
-5. **Keeper pseudocode and required tests are now aligned with the normative body.** The new text explicitly covers keeper current-state gating and maintenance-fee neutrality / boundedness in both the normative sections and the minimum test suite.
-6. **Trusted time / oracle provenance is now explicit.** `now_slot` is now normatively defined as a trusted runtime slot and `oracle_price` as a validated configured-oracle read; production user entrypoints MUST NOT accept arbitrary caller-supplied substitutes.
-
-7. **Auto-materialization is no longer universal.** Missing accounts are no longer created by `settle_account`, `withdraw`, `execute_trade`, `liquidate`, or `keeper_crank`. Only an explicit account-creation path or a positive `deposit` MAY materialize a missing account.
-
-8. **Finite account-cap liveness is now preserved.** Because `MAX_MATERIALIZED_ACCOUNTS` is finite, the spec now requires permissionless empty-account reclamation (or equivalent slot reuse) so zero-state accounts cannot permanently exhaust capacity.
-
+---
 
 ## 0. Security goals (normative)
 
@@ -37,15 +32,15 @@ The engine MUST provide the following properties.
 
 2. **Explicit open-position ADL eligibility:** Accounts with open positions MAY be subject to deterministic protocol ADL if they are on the eligible opposing side of a bankrupt liquidation. ADL MUST operate through explicit protocol state, not hidden execution.
 
-3. **Oracle manipulation safety (within warmup window `T`):** Profits created by short-lived oracle distortion MUST NOT be withdrawable as principal immediately; they are time-gated by warmup and economically capped by system backing.
+3. **Oracle manipulation safety:** Profits created by short-lived oracle distortion MUST NOT immediately dilute the live haircut denominator, immediately become withdrawable principal, or immediately satisfy initial-margin / withdrawal checks. Fresh positive PnL MUST first enter reserved warmup state and only become matured according to §6. On the touched generating account, positive local PnL MAY support only that account's own maintenance equity. If `T == 0`, this time-gate is intentionally disabled.
 
-4. **Profit-first haircuts:** When the system is undercollateralized, haircuts MUST apply to junior profit claims before any protected principal of flat accounts is impacted.
+4. **Profit-first haircuts:** When the system is undercollateralized, haircuts MUST apply to junior matured profit claims before any protected principal of flat accounts is impacted.
 
 5. **Conservation:** The engine MUST NOT create withdrawable claims exceeding vault tokens, except for explicitly bounded rounding slack.
 
-6. **Liveness:** The engine MUST NOT require `OI == 0`, manual admin recovery, a global scan, or reconciliation of an unrelated prefix of accounts before a user can safely settle, withdraw, trade, or liquidate.
+6. **Liveness:** The engine MUST NOT require `OI == 0`, manual admin recovery, a global scan, or reconciliation of an unrelated prefix of accounts before a user can safely settle, deposit, withdraw, trade, or liquidate.
 
-7. **No zombie poisoning:** Non-interacting accounts MUST NOT indefinitely pin `PNL_pos_tot` and collapse the haircut ratio for all users; touched accounts MUST make warmup progress.
+7. **No zombie poisoning:** Non-interacting accounts MUST NOT indefinitely pin the matured-profit haircut denominator with fresh, unwarmed PnL. Touched accounts MUST make warmup progress.
 
 8. **Funding / mark / ADL exactness under laziness:** Any economic quantity whose correct value depends on the position held over an interval MUST be represented through the A/K side-index mechanism or a formally equivalent event-segmented method. Integer rounding MUST NOT mint positive aggregate claims.
 
@@ -59,817 +54,690 @@ The engine MUST provide the following properties.
 
 13. **Synthetic liquidation price integrity:** A synthetic liquidation close MUST execute at the current oracle mark with zero execution-price slippage. Any liquidation penalty MUST be represented only by explicit fee state.
 
-14. **Loss seniority over explicit fees:** When a trade or non-bankruptcy liquidation realizes losses for an account, those losses are senior to explicit protocol fees. The protocol MUST NOT extract a fee from capital that is economically owed first to a winning counterparty.
+14. **Loss seniority over protocol fees:** When a trade, deposit, or non-bankruptcy liquidation realizes trading losses for an account, those losses are senior to protocol fee collection from that same local capital state.
 
-15. **Instruction-final funding anti-retroactivity:** If an instruction mutates any funding-rate input, the stored next-interval funding rate `r_last` MUST correspond to the instruction's final post-reset state, not any intermediate state.
+15. **Instruction-final funding anti-retroactivity:** If an instruction mutates any funding-rate input, the stored next-interval `r_last` MUST correspond to the instruction's final post-reset state, not any intermediate state.
 
 16. **Deterministic overflow handling:** Any arithmetic condition that is not proven unreachable by the spec's numeric bounds MUST have a deterministic fail-safe or bounded fallback path. Silent wrap, unchecked panic, or undefined truncation are forbidden.
 
+17. **Finite-capacity liveness:** Because account capacity is finite, the engine MUST provide permissionless dead-account reclamation or equivalent slot reuse so abandoned empty accounts cannot permanently exhaust capacity.
+
+18. **Permissionless off-chain keeper compatibility:** Candidate discovery MAY be performed entirely off chain. The engine MUST expose exact current-state shortlist processing and targeted per-account settle / liquidate / reclaim paths so any permissionless keeper can make liquidation and reset progress without any required on-chain phase-1 scan or trusted off-chain classification.
+
 **Atomic execution model (normative):** Every top-level external instruction defined in §10 MUST be atomic. If any required precondition, checked-arithmetic guard, or conservative-failure condition fails, the instruction MUST roll back all state mutations performed since that instruction began.
+
+---
 
 ## 1. Types, units, scaling, and arithmetic requirements
 
 ### 1.1 Amounts
 
-- `u128` unsigned amounts are denominated in quote-token atomic units, positive PnL aggregates, OI, fixed-point position magnitudes, and bounded fee amounts.
-
+- `u128` unsigned amounts are denominated in quote-token atomic units, positive-PnL aggregates, OI, fixed-point position magnitudes, and bounded fee amounts.
 - `i128` signed amounts represent realized PnL, K-space liabilities, and fee-credit balances.
-
+- `wide_signed` in formula definitions means any transient exact signed intermediate domain wider than `i128` (for example `i256`) or an equivalent exact comparison-preserving construction.
 - All persistent state MUST fit natively into 128-bit boundaries. Emulated wide multi-limb integers (for example `u256` / `i256`) are permitted only within transient intermediate math steps.
 
 ### 1.2 Prices and internal positions
 
 - `POS_SCALE = 1_000_000` (6 decimal places of position precision).
-
 - `price: u64` is quote-token atomic units per `1` base. There is no separate `PRICE_SCALE`.
-
 - All external price inputs, including `oracle_price`, `exec_price`, and any stored funding price sample, MUST satisfy `0 < price <= MAX_ORACLE_PRICE`.
-
 - Internally the engine stores position bases as signed fixed-point base quantities:
-
   - `basis_pos_q_i: i128`, with units `(base * POS_SCALE)`.
-
-- The displayed base quantity is `basis_pos_q_i / POS_SCALE` only when the account is attached to the current side state. During same-epoch lazy settlement, the economically relevant quantity is the derived helper `effective_pos_q(i)`.
-
 - Effective notional at oracle is:
-
-  - `notional_i = mul_div_floor_u128(abs(effective_pos_q(i)), price, POS_SCALE)`.
-
+  - `Notional_i = mul_div_floor_u128(abs(effective_pos_q(i)), oracle_price, POS_SCALE)`.
 - Trade fees MUST use executed trade size, not account notional:
-
-  - `trade_notional = mul_div_floor_u128(abs(size_q), exec_price, POS_SCALE)`.
-
-- Any `execute_trade` instruction MUST enforce both `size_q <= MAX_TRADE_SIZE_Q` and `trade_notional <= MAX_ACCOUNT_NOTIONAL` before any signed cast or slippage multiplication that depends on `size_q`.
+  - `trade_notional = mul_div_floor_u128(size_q, exec_price, POS_SCALE)`.
 
 ### 1.3 A/K scale
 
 - `ADL_ONE = 1_000_000` (6 decimal places of fractional decay accuracy).
-
 - `A_side` is dimensionless and scaled by `ADL_ONE`.
-
 - `K_side` has units `(ADL scale) * (quote atomic units per 1 base)`.
 
 ### 1.4 Concrete normative bounds
 
 The following bounds are normative and MUST be enforced.
 
-- `V <= MAX_VAULT_TVL = 10_000_000_000_000_000`
-
-- `0 < price <= MAX_ORACLE_PRICE = 1_000_000_000_000`
-
-- `MAX_ORACLE_STALENESS_SLOTS` MUST be a finite implementation-configured bound on acceptable age of any oracle sample used as `oracle_price`
-
-- `abs(basis_pos_q_i) <= MAX_POSITION_ABS_Q = 100_000_000_000_000`
-
-- `abs(effective_pos_q(i)) <= MAX_POSITION_ABS_Q`
-
-- `MAX_ACCOUNT_NOTIONAL = 100_000_000_000_000_000_000`; thus `trade_notional` and `Notional_i` MUST remain `<= MAX_ACCOUNT_NOTIONAL`
-
-- `MAX_TRADE_SIZE_Q = 200_000_000_000_000`; every `execute_trade` input MUST satisfy `0 < size_q <= MAX_TRADE_SIZE_Q`
-
-- `|funding_rate_bps_per_slot_last| <= MAX_ABS_FUNDING_BPS_PER_SLOT = 10_000`
-
-- `MAX_FUNDING_DT = 65_535`
-
+- `MAX_VAULT_TVL = 10_000_000_000_000_000`
+- `MAX_ORACLE_PRICE = 1_000_000_000_000`
+- `MAX_POSITION_ABS_Q = 100_000_000_000_000`
+- `MAX_TRADE_SIZE_Q = MAX_POSITION_ABS_Q`
 - `MAX_OI_SIDE_Q = 100_000_000_000_000`
-
-- `MAX_ACTIVE_POSITIONS_PER_SIDE` MUST be a finite implementation-enforced bound on concurrently stored nonzero positions per side, and MUST satisfy `MAX_ACTIVE_POSITIONS_PER_SIDE <= MAX_MATERIALIZED_ACCOUNTS`.
-
+- `MAX_ACCOUNT_NOTIONAL = 100_000_000_000_000_000_000`
+- `MAX_PROTOCOL_FEE_ABS = 100_000_000_000_000_000_000`
+- configured `MIN_INITIAL_DEPOSIT` MUST satisfy `0 < MIN_INITIAL_DEPOSIT <= MAX_VAULT_TVL`
+- deployment configuration of `MIN_INITIAL_DEPOSIT` MUST be economically non-trivial for the quote token and MUST NOT be set below the deployment's tolerated live-balance dust threshold
+- `MAX_ABS_FUNDING_BPS_PER_SLOT = 10_000`
+- `|r_last| <= MAX_ABS_FUNDING_BPS_PER_SLOT`
+- `MAX_TRADING_FEE_BPS = 10_000`
+- `MAX_INITIAL_BPS = 10_000`
+- `MAX_MAINTENANCE_BPS = 10_000`
+- `MAX_LIQUIDATION_FEE_BPS = 10_000`
+- configured margin parameters MUST satisfy `0 <= maintenance_bps <= initial_bps <= MAX_INITIAL_BPS`
+- `MAX_FUNDING_DT = 65_535`
 - `MAX_MATERIALIZED_ACCOUNTS = 1_000_000`
-
-- `0 <= trading_fee_bps <= MAX_TRADING_FEE_BPS = 10_000`
-
-- `0 <= maintenance_bps <= initial_bps <= MAX_MARGIN_BPS = 10_000`
-
-- `0 <= liquidation_fee_bps <= MAX_LIQUIDATION_FEE_BPS = 10_000`
-
-- `0 <= min_liquidation_abs <= liquidation_fee_cap <= MAX_PROTOCOL_FEE_ABS = MAX_ACCOUNT_NOTIONAL`
-
-- `0 <= I_floor <= MAX_VAULT_TVL`
-
+- `MAX_ACTIVE_POSITIONS_PER_SIDE` MUST be finite and MUST NOT exceed `MAX_MATERIALIZED_ACCOUNTS`
 - `MAX_ACCOUNT_POSITIVE_PNL = 100_000_000_000_000_000_000_000_000_000_000`
-
 - `MAX_PNL_POS_TOT = MAX_MATERIALIZED_ACCOUNTS * MAX_ACCOUNT_POSITIVE_PNL = 100_000_000_000_000_000_000_000_000_000_000_000_000`
-
-- `MIN_A_SIDE = 1_000` (side truncates into `DrainOnly` at 0.1% survival fraction).
-
+- `MIN_A_SIDE = 1_000`
+- `0 <= I_floor <= MAX_VAULT_TVL`
+- `0 <= min_liquidation_abs <= liquidation_fee_cap <= MAX_PROTOCOL_FEE_ABS`
 - `A_side > 0` whenever `OI_eff_side > 0` and the side is still representable.
 
-The following interpretation is normative for dust accounting.
+The following interpretation is normative for dust accounting:
 
 - `stored_pos_count_side` MAY be used as a q-unit conservative term in phantom-dust accounting because each live stored position can contribute at most one additional q-unit from threshold crossing when a global `A_side` truncation occurs.
 
-### 1.4.1 Time monotonicity and account freshness invariants
+### 1.5 Trusted time / oracle requirements
 
-- Any top-level instruction or helper call that accepts `now_slot` MUST require both `now_slot >= current_slot` and `now_slot >= slot_last` before state mutation.
+- `now_slot` in all top-level instructions MUST come from trusted runtime slot metadata or a formally equivalent trusted source. Production entrypoints MUST NOT accept an arbitrary user-specified substitute.
+- `oracle_price` MUST come from a validated configured oracle feed. Stale, invalid, or out-of-range oracle reads MUST fail conservatively before state mutation.
+- Any helper or instruction that accepts `now_slot` MUST require `now_slot >= current_slot`.
+- Any call to `accrue_market_to(now_slot, oracle_price)` MUST require `now_slot >= slot_last`.
+- `current_slot` and `slot_last` MUST be monotonically nondecreasing.
 
-- Timed helpers MUST NOT rewind `current_slot`. If `accrue_market_to(now_slot, ...)` succeeds, it MUST leave `current_slot = now_slot`.
-
-- Any account materialized inside an instruction that accepts `now_slot` MUST use `slot_anchor = now_slot` for both `w_start_i` and `last_fee_slot_i`.
-
-- A newly materialized account MUST NOT inherit a stale global slot anchor and MUST NOT initialize `last_fee_slot_i = 0`.
-
-- A newly materialized or re-zeroed account MUST have `a_basis_i = ADL_ONE`. The engine MUST NOT leave `a_basis_i = 0`.
-
-### 1.4.2 Trusted time and oracle input provenance
-
-- `now_slot` in every timed instruction is a logical parameter representing the current trusted chain / runtime slot. Production implementations MUST obtain it from trusted runtime metadata; caller-supplied, order-supplied, or otherwise user-controlled `now_slot` values are forbidden.
-
-- `oracle_price`, `init_oracle_price`, and any funding price sample basis used by the engine MUST come from the market's configured validated oracle pipeline. User-provided replacement prices are forbidden.
-
-- The implementation MUST define and enforce oracle validity checks before using `oracle_price`. At minimum, an oracle sample MUST be rejected if it is stale beyond `MAX_ORACLE_STALENESS_SLOTS` or marked invalid by the configured oracle source.
-
-- The external-operation signatures in §10 name `now_slot` and `oracle_price` as logical inputs for specification clarity only; in production they are trusted runtime / oracle reads, not arbitrary user arguments.
-
-### 1.5 Arithmetic requirements
+### 1.6 Arithmetic requirements
 
 The engine MUST satisfy all of the following.
 
-1. All products involving `A_side`, `K_side`, `k_snap_i`, `basis_pos_q_i`, `effective_pos_q(i)`, `price`, funding deltas, mark deltas, fee quantities, or ADL deltas MUST use checked arithmetic unless the spec explicitly requires exact wide intermediate arithmetic instead.
-
+1. All products involving `A_side`, `K_side`, `k_snap_i`, `basis_pos_q_i`, `effective_pos_q(i)`, `price`, funding deltas, or ADL deltas MUST use checked arithmetic.
 2. `dt` inside `accrue_market_to` MUST be split into internal sub-steps with `dt <= MAX_FUNDING_DT`.
-
-3. The conservation check `V >= C_tot + I` and any `Residual` computation MUST use checked `u128` addition for `C_tot + I`. Overflow is invariant violation.
-
+3. The conservation check `V >= C_tot + I` and any Residual computation MUST use checked `u128` addition for `C_tot + I`. Overflow is an invariant violation.
 4. Signed division with positive denominator MUST use the exact helper in §4.8.
-
 5. Positive ceiling division MUST use the exact helper in §4.8.
-
 6. Warmup-cap computation `w_slope_i * elapsed` MUST use `saturating_mul_u128_u64` or a formally equivalent min-preserving construction.
-
 7. Every decrement of `stored_pos_count_*`, `stale_account_count_*`, or `phantom_dust_bound_*_q` MUST use checked subtraction. Underflow indicates corruption and MUST fail conservatively.
-
-8. Every increment of `stored_pos_count_*`, `phantom_dust_bound_*_q`, or `materialized_account_count` MUST use checked addition. Overflow indicates corrupted capacity accounting and MUST fail conservatively.
-
-9. In `accrue_market_to`, the funding contribution MUST delay division by `10_000` until after multiplication by `A_side`, and the receiver-side funding gain MUST be derived from the payer-side loss so rounding cannot mint positive aggregate claims.
-
-10. `K_side` is cumulative across epochs. Implementations MUST use checked arithmetic and revert on persistent-state `i128` overflow.
-
-11. The calculation of same-epoch or epoch-mismatch `pnl_delta` MUST evaluate the signed K-difference in an exact wide intermediate before multiplication and division. It MUST NOT perform unchecked `i128` subtraction first.
-
-12. Every call site that computes `new_PNL = PNL_i + delta` or `new_fee_credits = fee_credits_i + delta` MUST use checked `i128` addition or subtraction before writing state.
-
-13. Haircut paths `floor(PNL_pos_i * h_num / h_den)` and `floor(x * h_num / h_den)` MUST use exact wide multiply-divide floor because the intermediate product can exceed `u128::MAX` even though the final quotient is bounded.
-
-14. The ADL quote-deficit path MUST compute the exact required K-index delta with a helper that performs exact wide `ceil(D * A_old * POS_SCALE / OI)` arithmetic and returns either an exact value or an `OverI128Magnitude` result. It MUST NOT use a helper bounded by `u128::MAX` for this step.
-
-15. If an ADL K-index delta computation is not representable as an `i128` magnitude, or if the final signed addition `K_opp + delta_K_exact` would overflow `i128`, the engine MUST route the quote deficit through `absorb_protocol_loss(D)` and continue the quantity-socialization path without modifying `K_opp`.
-
-16. `PNL_i` and `fee_credits_i` MUST be maintained in the closed interval `[i128::MIN + 1, i128::MAX]`. Any operation that would set either value to exactly `i128::MIN` is non-compliant and MUST fail conservatively.
-
+8. Every increment of `stored_pos_count_*`, `phantom_dust_bound_*_q`, `C_tot`, `PNL_pos_tot`, or `PNL_matured_pos_tot` MUST use checked addition and MUST enforce the relevant configured bound.
+9. In `accrue_market_to`, funding MUST be derived from the payer side first so that rounding cannot mint positive aggregate claims.
+10. `K_side` is cumulative across epochs. Under the 128-bit limits here, K-side overflow is practically impossible within realistic lifetimes, but implementations MUST still use checked arithmetic and revert on `i128` overflow.
+11. Same-epoch or epoch-mismatch `pnl_delta` MUST evaluate the signed numerator `(abs(basis_pos) * K_diff)` in an exact wide intermediate before division by `(a_basis * POS_SCALE)` and MUST use `wide_signed_mul_div_floor_from_k_pair` from §4.8.
+12. Any exact helper of the form `floor(a * b / d)` or `ceil(a * b / d)` required by this spec MUST return the exact quotient even when the exact product `a * b` exceeds native `u128`, provided the exact final quotient fits in the destination type.
+13. Haircut paths `floor(released_pos_i * h_num / h_den)` and `floor(x * h_num / h_den)` MUST use the exact multiply-divide helpers of §4.8. The final quotient MUST fit in `u128`; the intermediate product need not.
+14. The ADL quote-deficit path MUST compute `delta_K_abs = ceil(D_rem * A_old * POS_SCALE / OI)` using exact wide arithmetic. If the exact quotient is not representable as an `i128` magnitude, the engine MUST route `D_rem` through `record_uninsured_protocol_loss` while still continuing quantity socialization.
+15. If a K-space K-index delta is representable as a magnitude but the signed addition `K_opp + delta_K_exact` overflows `i128`, the engine MUST route `D_rem` through `record_uninsured_protocol_loss` while still continuing quantity socialization.
+16. `PNL_i` MUST be maintained in the closed interval `[i128::MIN + 1, i128::MAX]`, and `fee_credits_i` MUST be maintained in `[i128::MIN + 1, 0]`. Any operation that would set either value to exactly `i128::MIN` is non-compliant and MUST fail conservatively.
 17. Global A-truncation dust added in `enqueue_adl` MUST be accounted using checked arithmetic and the exact conservative bound from §5.6.
+18. `trade_notional <= MAX_ACCOUNT_NOTIONAL` MUST be enforced before charging trade fees.
+19. Any out-of-bound external price input, any invalid oracle read, or any non-monotonic slot input MUST fail conservatively before state mutation.
 
-18. `set_pnl` MUST enforce both per-account positive-PnL bound and aggregate positive-PnL bound before mutation.
+### 1.7 Reference 128-bit boundary proof
 
-19. `materialized_account_count` MUST be bounded so that `MAX_MATERIALIZED_ACCOUNTS * MAX_ACCOUNT_POSITIVE_PNL <= MAX_PNL_POS_TOT <= u128::MAX`.
+By clamping constants to base-10 metrics, on-chain persistent state fits natively in 128-bit registers without truncation.
 
-20. Explicit protocol-fee helpers MUST bound each charged `fee` by `MAX_PROTOCOL_FEE_ABS` and MUST NOT write any unpaid fee amount into `PNL_i`.
+- Effective-position numerator: `MAX_POSITION_ABS_Q * ADL_ONE = 10^14 * 10^6 = 10^20`
+- Notional / trade-notional numerator: `MAX_POSITION_ABS_Q * MAX_ORACLE_PRICE = 10^14 * 10^12 = 10^26`
+- Trade slippage numerator: `MAX_TRADE_SIZE_Q * MAX_ORACLE_PRICE = 10^26`, which fits inside signed 128-bit
+- Mark term max step: `ADL_ONE * MAX_ORACLE_PRICE = 10^18`
+- Funding payer max step: `ADL_ONE * (MAX_ORACLE_PRICE * MAX_ABS_FUNDING_BPS_PER_SLOT * MAX_FUNDING_DT / 10_000) ≈ 6.55 × 10^22`
+- Funding receiver numerator: `6.55 × 10^22 * ADL_ONE ≈ 6.55 × 10^28`
+- `A_old * OI_post`: `10^6 * 10^14 = 10^20`
+- `PNL_pos_tot` hard cap: `10^38 < u128::MAX ≈ 3.4 × 10^38`
+- `K_side` overflow under max-step accumulation requires on the order of `10^12` years
+- The three always-wide paths remain:
+  1. exact `pnl_delta`
+  2. exact haircut multiply-divides
+  3. exact ADL `delta_K_abs`
 
-21. `accrue_market_to` MUST apply mark-to-market exactly once per invocation from the pre-invocation `P_last` to the final `oracle_price`. Funding is the only component that may be sub-stepped.
-
-22. Any operation that changes funding-rate inputs MUST recompute and store `r_last` exactly once after the instruction's final post-reset state is known. Mid-instruction recomputation is forbidden.
-
-23. `accrue_market_to` MUST apply funding only when the invocation snapshot has live effective OI on both sides. If either snapped side OI is zero, the funding adjustment for that invocation is exactly zero.
-
-24. Any recurring maintenance-fee realization MUST be bounded or internally chunked so that:
-   - every explicit fee amount passed to `charge_fee_to_insurance` is `<= MAX_PROTOCOL_FEE_ABS`,
-   - every incremental `fee_credits_i` write uses checked `i128` arithmetic and cannot produce `i128::MIN`,
-   - and no maintenance-fee realization path mutates `K_side`, `PNL_i`, or `PNL_pos_tot`.
-
-### 1.5.1 Reference 128-bit boundary proof
-
-By clamping constants to base-10 metrics, on-chain state fits natively in 128-bit registers without persistent-state truncation.
-
-- **Same-epoch quantity numerator:** `MAX_POSITION_ABS_Q * ADL_ONE = 10^14 * 10^6 = 10^20` (fits natively in `u128`).
-
-- **Max account-notional numerator:** `MAX_POSITION_ABS_Q * MAX_ORACLE_PRICE = 10^14 * 10^12 = 10^26` (fits natively in `u128` / `i128`).
-
-- **Max trade-notional numerator under explicit trade-size bound:** `MAX_TRADE_SIZE_Q * MAX_ORACLE_PRICE = 2 × 10^14 * 10^12 = 2 × 10^26` (fits natively in `u128` / `i128`), while `trade_notional` itself remains bounded by the separate required check `trade_notional <= MAX_ACCOUNT_NOTIONAL`.
-
-- **Trade-slippage numerator:** `MAX_TRADE_SIZE_Q * MAX_ORACLE_PRICE = 2 × 10^14 * 10^12 = 2 × 10^26` (fits natively in `i128`), with final realized slippage bounded by `2 × 10^20` before the separate `trade_notional <= MAX_ACCOUNT_NOTIONAL` gate.
-
-- **Mark K-step:** `ADL_ONE * MAX_ORACLE_PRICE = 10^6 * 10^12 = 10^18` (fits natively in `i128`).
-
-- **Funding raw term per bounded sub-step:** `MAX_ORACLE_PRICE * MAX_ABS_FUNDING_BPS_PER_SLOT * MAX_FUNDING_DT = 10^12 * 10^4 * 65535 ≈ 6.5535 × 10^20` (fits natively in `u128`).
-
-- **Funding payer K-step:** `ADL_ONE * funding_term_raw / 10_000 ≈ 6.5535 × 10^22` (fits natively in `u128`).
-
-- **Funding receiver numerator:** `delta_K_payer_abs * ADL_ONE ≈ 6.5535 × 10^28` (fits natively in `u128`).
-
-- **Fee numerators:** `MAX_ACCOUNT_NOTIONAL * 10_000 = 10^20 * 10^4 = 10^24` (fits natively in `u128`).
-
-- **A-side quantity-socialization product:** `ADL_ONE * MAX_OI_SIDE_Q = 10^6 * 10^14 = 10^20` (fits natively in `u128`).
-
-- **K lifetime headroom:** even at extreme sustained boundaries, persistent-state `K_side` remains far below `i128::MAX` over any realistic system lifetime; checked arithmetic remains mandatory.
-
-- **Wide transient paths only:** exact transient wide math is required only for:
-  1. `pnl_delta` (because the exact signed K-difference and resulting numerator can exceed 128 bits before division),
-  2. exact haircut multiply-divides,
-  3. exact ADL `delta_K_abs` representability fallback.
-
-- **Aggregate positive-PnL storage:** by construction, `materialized_account_count <= 10^6`, `PNL_i^+ <= 10^32`, so `PNL_pos_tot <= 10^38 < u128::MAX` and `PNL_pos_tot` cannot overflow if account materialization and `set_pnl` bounds are enforced.
-- **Per-account positive-PnL headroom:** even at the extreme receiver-side funding bound of roughly `6.5535 × 10^24` quote atoms per bounded funding sub-step on the maximum position, reaching `MAX_ACCOUNT_POSITIVE_PNL = 10^32` requires roughly `1.5 × 10^7` maxed sub-steps (about `3 × 10^4` years at one-second slots). The per-account cap therefore exists to make aggregate storage exact, not to constrain any realistic operational horizon.
-
+---
 
 ## 2. State model
 
 ### 2.1 Account state
 
-For each account `i`, the engine stores at least:
+For each materialized account `i`, the engine stores at least:
 
 - `C_i: u128` — protected principal.
-
 - `PNL_i: i128` — realized PnL claim.
-
-- `R_i: u128` — reserved positive PnL, with `0 <= R_i <= max(PNL_i, 0)`.
-
-- `basis_pos_q_i: i128` — signed fixed-point base basis at the last explicit position mutation or forced zeroing. This is not necessarily the current effective quantity.
-
+- `R_i: u128` — reserved positive PnL that has not yet matured through warmup, with `0 <= R_i <= max(PNL_i, 0)`.
+- `basis_pos_q_i: i128` — signed fixed-point base basis at the last explicit position mutation or forced zeroing.
 - `a_basis_i: u128` — side multiplier in effect when `basis_pos_q_i` was last explicitly attached.
-
-- `k_snap_i: i128` — last realized `K_side` snapshot relevant to the current stored basis.
-
-- `epoch_snap_i: u64` — side epoch in which the stored basis is defined.
-
+- `k_snap_i: i128` — last realized `K_side` snapshot.
+- `epoch_snap_i: u64` — side epoch in which the basis is defined.
 - `fee_credits_i: i128`.
-
 - `last_fee_slot_i: u64`.
-
 - `w_start_i: u64`.
-
 - `w_slope_i: u128`.
 
-Fee-credit bound and exact debt definition:
+Derived local quantities on a touched state:
+
+- `ReleasedPos_i = max(PNL_i, 0) - R_i`
+- `FeeDebt_i = fee_debt_u128_checked(fee_credits_i)`
+
+Fee-credit bounds:
 
 - `fee_credits_i` MUST be initialized to `0`.
-
-- The engine MUST maintain `-(i128::MAX) <= fee_credits_i <= i128::MAX` at all times. `fee_credits_i == i128::MIN` is forbidden.
-
-- `FeeDebt_i = fee_debt_u128_checked(fee_credits_i)`.
-
-- Any operation that would decrement `fee_credits_i` to exactly `i128::MIN` or below MUST fail conservatively.
-
-### 2.1.1 Canonical zero-position defaults and account initialization
-
-The engine MUST define a canonical zero-position account state.
-
-For an account in canonical zero-position state:
-
-- `basis_pos_q_i = 0`
-
-- `a_basis_i = ADL_ONE`
-
-- `k_snap_i = 0`
-
-- `fee_credits_i` is unchanged unless the caller explicitly changes it
-
-- `epoch_snap_i` is a caller-supplied zero-position epoch anchor
-
-A helper that resets an account to zero position in a known side epoch `e` MUST set:
-
-- `basis_pos_q_i = 0`
-
-- `a_basis_i = ADL_ONE`
-
-- `k_snap_i = 0`
-
-- `epoch_snap_i = e`
-
-When a new account is materialized, the canonical materialization helper MUST take a `slot_anchor: u64` and MUST initialize at minimum:
-
-- `C_i = 0`, `PNL_i = 0`, `R_i = 0`, `basis_pos_q_i = 0`, `fee_credits_i = 0`
-
-- `a_basis_i = ADL_ONE`
-
-- `k_snap_i = 0`
-
-- `epoch_snap_i = 0`
-
-- `w_start_i = slot_anchor`
-
-- `w_slope_i = 0`
-
-- `last_fee_slot_i = slot_anchor`
-
-The materialization helper MUST require `slot_anchor >= current_slot` and `slot_anchor >= slot_last`, and a timed top-level instruction MUST pass its own `now_slot` as `slot_anchor`.
-
-A newly materialized account MUST be inserted only through a helper that increments `materialized_account_count` in checked arithmetic and enforces `materialized_account_count <= MAX_MATERIALIZED_ACCOUNTS`.
-
-### 2.1.2 Empty-account reclamation and materialized-account-cap liveness
-
-Because `MAX_MATERIALIZED_ACCOUNTS` is finite and is used in exact aggregate-bounding arguments, the engine MUST support reclaiming capacity from truly empty accounts.
-
-The engine MUST provide either physical deletion, logical de-materialization, or equivalent slot reuse that decrements `materialized_account_count` in checked arithmetic.
-
-An empty-account reclamation helper MAY succeed only if all of the following hold:
-
-- `C_i == 0`
-
-- `PNL_i == 0`
-
-- `R_i == 0`
-
-- `basis_pos_q_i == 0`
-
-- `fee_credits_i == 0`
-
-- the account has no remaining aggregate responsibilities beyond canonical zero-position state
-
-On success, the account becomes missing / reusable and `materialized_account_count` decreases by exactly `1`.
-
-Reclamation of a qualifying empty account MUST be permissionless or otherwise MUST NOT require cooperation from the account owner.
-
-A zero-state account MUST NOT permanently pin system capacity.
+- The engine MUST maintain `-(i128::MAX) <= fee_credits_i <= 0` at all times. `fee_credits_i == i128::MIN` is forbidden.
 
 ### 2.2 Global engine state
 
 The engine stores at least:
 
 - `V: u128`
-
 - `I: u128`
-
 - `I_floor: u128`
-
 - `current_slot: u64`
-
 - `P_last: u64`
-
 - `slot_last: u64`
-
 - `r_last: i64`
-
 - `fund_px_last: u64`
-
 - `A_long: u128`
-
 - `A_short: u128`
-
 - `K_long: i128`
-
 - `K_short: i128`
-
 - `epoch_long: u64`
-
 - `epoch_short: u64`
-
 - `K_epoch_start_long: i128`
-
 - `K_epoch_start_short: i128`
-
 - `OI_eff_long: u128`
-
 - `OI_eff_short: u128`
-
 - `mode_long ∈ {Normal, DrainOnly, ResetPending}`
-
 - `mode_short ∈ {Normal, DrainOnly, ResetPending}`
-
 - `stored_pos_count_long: u64`
-
 - `stored_pos_count_short: u64`
-
 - `stale_account_count_long: u64`
-
 - `stale_account_count_short: u64`
-
 - `phantom_dust_bound_long_q: u128`
-
 - `phantom_dust_bound_short_q: u128`
-
 - `C_tot: u128 = Σ C_i`
-
 - `PNL_pos_tot: u128 = Σ max(PNL_i, 0)`
+- `PNL_matured_pos_tot: u128 = Σ(max(PNL_i, 0) - R_i)`
 
-- `materialized_account_count: u64`
+The engine MUST also store, or deterministically derive from immutable configuration, at least:
 
-### 2.3 Initial state
+- `T = warmup_period_slots`
+- `trading_fee_bps`
+- `maintenance_bps`
+- `initial_bps`
+- `liquidation_fee_bps`
+- `liquidation_fee_cap`
+- `min_liquidation_abs`
+- `MIN_INITIAL_DEPOSIT`
+- any configured parameters used by `recompute_r_last_from_final_state()`
+- any configured parameters used by the optional recurring maintenance-fee model
 
-Market initialization MUST take, at minimum, `init_slot`, `init_oracle_price`, and a configured `I_floor`.
+Global invariants:
+
+- `PNL_matured_pos_tot <= PNL_pos_tot <= MAX_PNL_POS_TOT`
+- `C_tot <= V <= MAX_VAULT_TVL`
+- `I <= V`
+- `|r_last| <= MAX_ABS_FUNDING_BPS_PER_SLOT`
+
+### 2.3 Materialized-account capacity
+
+The engine MUST track the number of currently materialized account slots. That count MUST NOT exceed `MAX_MATERIALIZED_ACCOUNTS`.
+
+A missing account is one whose slot is not currently materialized. Missing accounts MUST NOT be auto-materialized by `settle_account`, `withdraw`, `execute_trade`, `liquidate`, or `keeper_crank`.
+
+Only the following path MAY materialize a missing account in this specification:
+
+- a `deposit(i, amount, now_slot)` with `amount >= MIN_INITIAL_DEPOSIT`
+
+Any implementation-defined alternative creation path is non-compliant unless it enforces an economically equivalent anti-spam threshold and preserves all account-initialization invariants of §2.5.
+
+### 2.4 Canonical zero-position defaults
+
+The canonical zero-position account defaults are:
+
+- `basis_pos_q_i = 0`
+- `a_basis_i = ADL_ONE`
+- `k_snap_i = 0`
+- `epoch_snap_i = 0`
+
+These defaults are valid because all helpers that use side-attached snapshots MUST first require `basis_pos_q_i != 0`.
+
+### 2.5 Account materialization
+
+`materialize_account(i, slot_anchor)` MAY succeed only if the account is currently missing and materialized-account capacity remains below `MAX_MATERIALIZED_ACCOUNTS`.
+
+On success, it MUST increment the materialized-account count and set:
+
+- `C_i = 0`
+- `PNL_i = 0`
+- `R_i = 0`
+- canonical zero-position defaults from §2.4
+- `fee_credits_i = 0`
+- `w_start_i = slot_anchor`
+- `w_slope_i = 0`
+- `last_fee_slot_i = slot_anchor`
+
+### 2.6 Permissionless empty-account reclamation
+
+The engine MUST provide a permissionless reclamation path `reclaim_empty_account(i)`.
+
+It MAY succeed only if all of the following hold:
+
+- account `i` is materialized
+- `C_i == 0`
+- `PNL_i == 0`
+- `R_i == 0`
+- `basis_pos_q_i == 0`
+- `fee_credits_i <= 0`
+
+On success, it MUST:
+
+- forgive any negative `fee_credits_i` by setting `fee_credits_i = 0`
+- reset all local fields to canonical zero / anchored defaults
+- mark the slot missing / reusable
+- decrement the materialized-account count
+
+A reclaimed empty account MUST contribute nothing to `C_tot`, `PNL_pos_tot`, `PNL_matured_pos_tot`, side counts, stale counts, or OI.
+
+### 2.7 Initial market state
+
+Market initialization MUST take, at minimum, `init_slot`, `init_oracle_price`, and configured fee / margin / insurance / materialization parameters.
 
 At market initialization, the engine MUST set:
 
 - `V = 0`
-
 - `I = 0`
-
 - `I_floor = configured I_floor`
-
 - `C_tot = 0`
-
 - `PNL_pos_tot = 0`
-
-- `materialized_account_count = 0`
-
+- `PNL_matured_pos_tot = 0`
 - `current_slot = init_slot`
-
 - `slot_last = init_slot`
-
 - `P_last = init_oracle_price`
-
 - `fund_px_last = init_oracle_price`
-
-- `r_last = initial_funding_rate`, where `initial_funding_rate` is computed from the just-initialized state; if the funding formula depends on skew or live OI, this MUST be `0` for an empty market
-
+- `r_last = 0` if the funding formula depends on live OI or skew and the market starts empty
 - `A_long = ADL_ONE`, `A_short = ADL_ONE`
-
 - `K_long = 0`, `K_short = 0`
-
 - `epoch_long = 0`, `epoch_short = 0`
-
 - `K_epoch_start_long = 0`, `K_epoch_start_short = 0`
-
 - `OI_eff_long = 0`, `OI_eff_short = 0`
-
 - `mode_long = Normal`, `mode_short = Normal`
-
 - `stored_pos_count_long = 0`, `stored_pos_count_short = 0`
-
 - `stale_account_count_long = 0`, `stale_account_count_short = 0`
-
 - `phantom_dust_bound_long_q = 0`, `phantom_dust_bound_short_q = 0`
 
-### 2.4 Side modes
+### 2.8 Side modes and reset lifecycle
 
 A side may be in one of three modes:
 
-- `Normal`: ordinary operation.
+- `Normal`: ordinary operation
+- `DrainOnly`: the side is live but has decayed below the safe precision threshold; OI on that side may decrease but MUST NOT increase
+- `ResetPending`: the side has been fully drained and its prior epoch is awaiting stale-account reconciliation; no operation may increase OI on that side
 
-- `DrainOnly`: the side is live but has decayed below the safe precision threshold; OI on that side may decrease but MUST NOT increase.
+`begin_full_drain_reset(side)` MAY succeed only if `OI_eff_side == 0`. It MUST:
 
-- `ResetPending`: the side has been fully drained and its prior epoch is awaiting stale-account reconciliation. During `ResetPending`, no operation may increase OI on that side.
-
-### 2.5 `begin_full_drain_reset(side)`
-
-The engine MUST provide a helper that begins a full-drain epoch rollover for one side. It MUST:
-
-1. require `OI_eff_side == 0`
-
-2. set `K_epoch_start_side = K_side`
-
-3. increment `epoch_side` by exactly `1` using checked `u64` arithmetic
-
-4. set `A_side = ADL_ONE`
-
-5. set `stale_account_count_side = stored_pos_count_side`
-
-6. set `phantom_dust_bound_side_q = 0`
-
-7. set `mode_side = ResetPending`
-
-### 2.6 `MIN_A_SIDE` is a live-side trigger, not a snapshot invariant
-
-`MIN_A_SIDE` applies only to the current live `A_side` and triggers `DrainOnly`. It is not a lower bound on historical `a_basis_i`.
-
-### 2.7 `finalize_side_reset(side)`
+1. set `K_epoch_start_side = K_side`
+2. increment `epoch_side` by exactly `1`
+3. set `A_side = ADL_ONE`
+4. set `stale_account_count_side = stored_pos_count_side`
+5. set `phantom_dust_bound_side_q = 0`
+6. set `mode_side = ResetPending`
 
 `finalize_side_reset(side)` MAY succeed only if all of the following hold:
 
-1. `mode_side == ResetPending`
+- `mode_side == ResetPending`
+- `OI_eff_side == 0`
+- `stale_account_count_side == 0`
+- `stored_pos_count_side == 0`
 
-2. `OI_eff_side == 0`
+On success, it MUST set `mode_side = Normal`.
 
-3. `stale_account_count_side == 0`
+`maybe_finalize_ready_reset_sides_before_oi_increase()` MUST check each side independently and, if the `finalize_side_reset(side)` preconditions already hold, immediately finalize that side. It MUST NOT begin a new reset or mutate OI.
 
-4. `stored_pos_count_side == 0`
+---
 
-On success, the engine MUST set `mode_side = Normal`.
+## 3. Solvency, matured-profit haircut, and live equity
 
-### 2.8 `maybe_finalize_ready_reset_sides_before_oi_increase()`
-
-The engine MUST provide a helper that checks each side independently and, if all `finalize_side_reset(side)` preconditions already hold, immediately invokes `finalize_side_reset(side)`.
-
-This helper MUST NOT begin a new reset, mutate `A_side`, `K_side`, `epoch_side`, `OI_eff_side`, or any account state. It may only transition an already-eligible clean-empty side from `ResetPending` to `Normal`.
-
-## 3. Junior-profit solvency via the global haircut ratio
-
-### 3.1 Residual backing available to junior profits
+### 3.1 Residual backing available to matured junior profits
 
 Define:
 
 - `senior_sum = checked_add_u128(C_tot, I)`
-
 - `Residual = max(0, V - senior_sum)`
-
-`Residual` is the only backing for positive realized PnL that has not been converted into principal.
 
 Invariant: the engine MUST maintain `V >= senior_sum` at all times.
 
-### 3.2 Haircut ratio `h`
+### 3.2 Matured positive-PnL aggregate
+
+Define:
+
+- `ReleasedPos_i = max(PNL_i, 0) - R_i`
+- `PNL_matured_pos_tot = Σ ReleasedPos_i`
+
+Fresh positive PnL that has not yet warmed up MUST contribute to `R_i` first and therefore MUST NOT immediately increase `PNL_matured_pos_tot`.
+
+### 3.3 Global haircut ratio `h`
 
 Let:
 
-- if `PNL_pos_tot == 0`, define `h = 1`
-
+- if `PNL_matured_pos_tot == 0`, define `h = 1`
 - else:
+  - `h_num = min(Residual, PNL_matured_pos_tot)`
+  - `h_den = PNL_matured_pos_tot`
 
-  - `h_num = min(Residual, PNL_pos_tot)`
+For account `i` on a touched state:
 
-  - `h_den = PNL_pos_tot`
+- if `PNL_matured_pos_tot == 0`, `PNL_eff_matured_i = ReleasedPos_i`
+- else `PNL_eff_matured_i = mul_div_floor_u128(ReleasedPos_i, h_num, h_den)`
 
-### 3.3 Effective positive PnL and net equity on current state
+Because each account is floored independently:
 
-For account `i`:
+- `Σ PNL_eff_matured_i <= h_num <= Residual`
 
-- `PNL_pos_i = max(PNL_i, 0)`
+### 3.4 Live equity used by margin and liquidation
 
-- if `PNL_pos_tot == 0`, then `PNL_eff_pos_i = PNL_pos_i`
+For account `i` on a touched state, first define the exact signed quantity used for initial-margin, withdrawal, and principal-conversion style checks in a transient widened signed domain:
 
-- else `PNL_eff_pos_i = wide_mul_div_floor_u128(PNL_pos_i, h_num, h_den)`
+- `Eq_init_base_i = (C_i as wide_signed) + min(PNL_i, 0) + (PNL_eff_matured_i as wide_signed)`
 
-Define current-state equity:
+Then define:
 
-- `Eq_real_raw_i = checked_add_i128(C_i as i128, min(PNL_i, 0))`
+- `Eq_init_raw_i = Eq_init_base_i - (FeeDebt_i as wide_signed)`
+- `Eq_init_net_i = max(0, Eq_init_raw_i)`
+- `Eq_maint_raw_i = (C_i as wide_signed) + (PNL_i as wide_signed) - (FeeDebt_i as wide_signed)`
+- `Eq_net_i = max(0, Eq_maint_raw_i)`
 
-- `Eq_real_raw_i = checked_add_i128(Eq_real_raw_i, PNL_eff_pos_i as i128)`
+Interpretation:
 
-- `Eq_real_i = max(0, Eq_real_raw_i)`
+- `Eq_init_net_i` is the equity available for initial-margin and withdrawal-style checks. Fresh reserved PnL in `R_i` does **not** count here, and matured junior profit counts only through the global haircut of §3.3.
+- `Eq_net_i` / `Eq_maint_raw_i` are the quantities used for maintenance-margin and liquidation checks. On a touched generating account, full local mark-to-market `PNL_i` counts here, whether currently released or still reserved.
+- The global haircut remains a claim-conversion / initial-margin / withdrawal construct. It MUST NOT directly reduce another account's maintenance equity, and pure warmup release on unchanged `C_i`, `PNL_i`, and `fee_credits_i` MUST NOT by itself reduce `Eq_maint_raw_i`.
+- strict risk-reducing buffer comparisons MUST use `Eq_maint_raw_i` (not `Eq_net_i`) so negative raw equity cannot be hidden by the outer `max(0, ·)` floor.
 
-- `Eq_net_raw_i = checked_sub_i128(Eq_real_i, FeeDebt_i as i128)`
+The signed quantities `Eq_init_base_i`, `Eq_init_raw_i`, and `Eq_maint_raw_i` MUST be computed in a transient widened signed type or an equivalent exact checked construction that preserves full mathematical ordering.
 
-- `Eq_net_i = max(0, Eq_net_raw_i)`
+- Positive overflow of these exact widened intermediates is unreachable under the configured bounds and MUST fail conservatively if encountered.
+- An implementation MAY project an exact negative value below `i128::MIN + 1` to `i128::MIN + 1` only for one-sided health checks that compare against `0` or another nonnegative threshold after the exact sign is already known.
+- Such projection MUST NOT be used in any strict before/after raw maintenance-buffer comparison, including §10.5 step 29. Those comparisons MUST use the exact widened signed values without saturation or clamping.
 
-All margin checks MUST use `Eq_net_i` on the **current touched state**.
+### 3.5 Conservatism under pending A/K side effects and warmup
 
-### 3.4 Conservatism under pending A/K side effects
+Because live haircut uses only matured positive PnL:
 
-The engine computes `h` only over stored realized state. Therefore:
+- pending positive mark / funding / ADL effects MUST NOT become initial-margin or withdrawal collateral until they are touched, reserved, and later warmed up according to §6
+- on the touched generating account, local maintenance checks MAY use full local `PNL_i`, but only matured released positive PnL enters the global haircut denominator and only matured released positive PnL may be converted into principal via §7.4
+- reserved fresh positive PnL MUST NOT enter another account's equity, the global haircut denominator, or any principal-conversion path before warmup release
+- pending lazy ADL obligations MUST NOT be counted as backing in `Residual`
 
-- pending positive mark / funding / ADL effects MUST NOT be withdrawable until touch,
-
-- pending negative mark / funding / ADL effects MAY temporarily make `C_tot` / `PNL_pos_tot` conservative relative to a fully-cranked state,
-
-- pending lazy ADL obligations MUST NOT be counted as backing in `Residual`.
-
-### 3.5 Rounding and conservation
-
-Because each `PNL_eff_pos_i` is floored independently:
-
-- `Σ PNL_eff_pos_i <= h_num <= Residual`.
+---
 
 ## 4. Canonical helpers
 
-### 4.1 `checked_add_u128(a, b)`, `checked_add_u64(a, b)`, `checked_mul_u128(a, b)`
+### 4.1 Checked scalar helpers
 
-These helpers MUST either return the exact native result or signal overflow.
+`checked_add_u128`, `checked_sub_u128`, `checked_add_i128`, `checked_sub_i128`, `checked_mul_u128`, `checked_mul_i128`, `checked_cast_i128`, and any equivalent low-level helper MUST either return the exact value or fail conservatively on overflow / underflow.
 
-- `checked_add_u128(a, b)` returns the exact `u128` sum or fails.
+`checked_cast_i128(x)` means an exact cast from a bounded nonnegative integer to `i128`, or conservative failure if the cast would not fit.
 
-- `checked_add_u64(a, b)` returns the exact `u64` sum or fails.
+### 4.2 `set_capital(i, new_C)`
 
-- `checked_mul_u128(a, b)` returns the exact `u128` product or fails.
+When changing `C_i` from `old_C` to `new_C`, the engine MUST update `C_tot` by the signed delta in checked arithmetic and then set `C_i = new_C`.
 
-### 4.2 `checked_add_i128(a, b)`, `checked_sub_i128(a, b)`, `checked_neg_i128(x)`
+### 4.3 `set_reserved_pnl(i, new_R)`
 
-These helpers MUST return the exact signed result if it lies in `[i128::MIN + 1, i128::MAX]`; otherwise they MUST fail conservatively.
+Preconditions:
 
-`checked_neg_i128(i128::MIN)` is forbidden.
+- `new_R <= max(PNL_i, 0)`
 
-### 4.3 `set_capital(i, new_C)`
+Effects:
 
-When changing `C_i` from `old_C` to `new_C`, the engine MUST update `C_tot` by the signed delta in a checked manner and then set `C_i = new_C`.
+1. `old_pos = max(PNL_i, 0) as u128`
+2. `old_rel = old_pos - R_i`
+3. `new_rel = old_pos - new_R`
+4. update `PNL_matured_pos_tot` by the exact delta from `old_rel` to `new_rel` using checked arithmetic
+5. require resulting `PNL_matured_pos_tot <= PNL_pos_tot`
+6. set `R_i = new_R`
 
 ### 4.4 `set_pnl(i, new_PNL)`
 
 When changing `PNL_i` from `old` to `new`, the engine MUST:
 
 1. require `new != i128::MIN`
+2. let `old_pos = max(old, 0) as u128`
+3. let `old_R = R_i`
+4. let `old_rel = old_pos - old_R`
+5. let `new_pos = max(new, 0) as u128`
+6. require `new_pos <= MAX_ACCOUNT_POSITIVE_PNL`
+7. if `new_pos > old_pos`:
+   - `reserve_add = new_pos - old_pos`
+   - `new_R = checked_add_u128(old_R, reserve_add)`
+   - require `new_R <= new_pos`
+8. else:
+   - `pos_loss = old_pos - new_pos`
+   - `new_R = old_R.saturating_sub(pos_loss)`
+   - require `new_R <= new_pos`
+9. let `new_rel = new_pos - new_R`
+10. update `PNL_pos_tot` by the exact delta from `old_pos` to `new_pos` using checked arithmetic
+11. require resulting `PNL_pos_tot <= MAX_PNL_POS_TOT`
+12. update `PNL_matured_pos_tot` by the exact delta from `old_rel` to `new_rel` using checked arithmetic
+13. require resulting `PNL_matured_pos_tot <= PNL_pos_tot`
+14. set `PNL_i = new`
+15. set `R_i = new_R`
 
-2. if `new > 0`, require `(new as u128) <= MAX_ACCOUNT_POSITIVE_PNL`
+**Caller obligation:** if `new_R > old_R`, the caller MUST invoke `restart_warmup_after_reserve_increase(i)` before returning from the routine that caused the positive-PnL increase.
 
-3. let `old_pos = max(old, 0) as u128`
+### 4.4.1 `consume_released_pnl(i, x)`
 
-4. let `new_pos = max(new, 0) as u128`
+This helper removes only matured released positive PnL and MUST leave `R_i` unchanged.
 
-5. if `new_pos > old_pos`, compute `candidate = checked_add_u128(PNL_pos_tot, new_pos - old_pos)` and require `candidate <= MAX_PNL_POS_TOT`
+Preconditions:
 
-6. else compute `candidate = PNL_pos_tot - (old_pos - new_pos)` using checked subtraction
+- `x > 0`
+- `x <= ReleasedPos_i`
 
-7. set `PNL_pos_tot = candidate`
+Effects:
 
-8. set `PNL_i = new`
+1. `old_pos = max(PNL_i, 0) as u128`
+2. `old_R = R_i`
+3. `old_rel = old_pos - old_R`
+4. `new_pos = old_pos - x`
+5. `new_rel = old_rel - x`
+6. require `new_pos >= old_R`
+7. update `PNL_pos_tot` by the exact delta from `old_pos` to `new_pos` using checked arithmetic
+8. update `PNL_matured_pos_tot` by the exact delta from `old_rel` to `new_rel` using checked arithmetic
+9. `PNL_i = checked_sub_i128(PNL_i, checked_cast_i128(x))`
+10. require resulting `PNL_matured_pos_tot <= PNL_pos_tot`
+11. leave `R_i` unchanged
 
-9. clamp `R_i := min(R_i, new_pos)`
-
-All code paths that modify PnL MUST call `set_pnl`.
+This helper MUST be used for profit conversion. `set_pnl(i, PNL_i - x)` is non-compliant for that purpose because generic reserve-first loss ordering is intentionally reserved for market losses and other true PnL decreases, not for removing already-matured released profit.
 
 ### 4.5 `set_position_basis_q(i, new_basis_pos_q)`
 
-When changing stored `basis_pos_q_i` from `old` to `new`, the engine MUST update `stored_pos_count_long` and `stored_pos_count_short` exactly once using the sign flags of `old` and `new`, then write `basis_pos_q_i = new_basis_pos_q`.
+When changing stored `basis_pos_q_i` from `old` to `new`, the engine MUST update `stored_pos_count_long` and `stored_pos_count_short` exactly once using the sign flags of `old` and `new`, then write `basis_pos_q_i = new`.
 
 For a single logical position change, `set_position_basis_q` MUST be called exactly once with the final target. Passing through an intermediate zero value is not permitted.
-
-If the call would increase a side's stored nonzero-position count above `MAX_ACTIVE_POSITIONS_PER_SIDE`, the helper MUST fail conservatively before mutation.
 
 ### 4.6 `attach_effective_position(i, new_eff_pos_q)`
 
 This helper MUST convert a current effective quantity into a new position basis at the current side state.
 
-Preconditions:
-
-- `abs(new_eff_pos_q) <= MAX_POSITION_ABS_Q`
-
-- the caller has already enforced any side-mode gating and OI-cap checks required for the intended top-level operation
-
 If the account currently has a nonzero same-epoch basis and this helper is about to discard that basis (by writing either `0` or a different nonzero basis), then the engine MUST first account for any orphaned unresolved same-epoch quantity remainder:
 
 - let `s = side(basis_pos_q_i)`
-
-- if `epoch_snap_i == epoch_s`, compute `rem = (abs(basis_pos_q_i) * A_s) mod a_basis_i` in exact `u128` arithmetic
-
+- if `epoch_snap_i == epoch_s`, compute `rem = (abs(basis_pos_q_i) * A_s) mod a_basis_i` in exact arithmetic
 - if `rem != 0`, invoke `inc_phantom_dust_bound(s)`
-
-A caller MUST NOT use `attach_effective_position` as a no-op refresh. If `new_eff_pos_q` equals the account's current `effective_pos_q(i)` with the same sign, the helper SHOULD preserve the existing basis and snapshots rather than discard and recreate them.
 
 If `new_eff_pos_q == 0`, it MUST:
 
 - `set_position_basis_q(i, 0)`
-
-- reset the account to canonical zero-position defaults anchored to the current epoch of the side that was just discarded, if any; otherwise anchor to `0`
+- reset snapshots to canonical zero-position defaults
 
 If `new_eff_pos_q != 0`, it MUST:
 
+- require `abs(new_eff_pos_q) <= MAX_POSITION_ABS_Q`
 - `set_position_basis_q(i, new_eff_pos_q)`
-
 - `a_basis_i = A_side(new_eff_pos_q)`
-
 - `k_snap_i = K_side(new_eff_pos_q)`
-
 - `epoch_snap_i = epoch_side(new_eff_pos_q)`
 
 ### 4.7 Phantom-dust helpers
 
-`inc_phantom_dust_bound(side)` MUST increment `phantom_dust_bound_side_q` by exactly `1` q-unit using checked addition.
+- `inc_phantom_dust_bound(side)` increments `phantom_dust_bound_side_q` by exactly `1` q-unit using checked addition.
+- `inc_phantom_dust_bound_by(side, amount_q)` increments `phantom_dust_bound_side_q` by exactly `amount_q` q-units using checked addition.
 
-`inc_phantom_dust_bound_by(side, amount_q)` MUST increment `phantom_dust_bound_side_q` by exactly `amount_q` q-units using checked addition.
-
-### 4.8 Exact helper definitions (normative)
+### 4.8 Exact math helpers (normative)
 
 The engine MUST use the following exact helpers.
 
 **Signed conservative floor division**
 
-```text
-floor_div_signed_conservative(n, d):
-    require d > 0
-    q = trunc_toward_zero(n / d)
-    r = n % d
-    if n < 0 and r != 0:
-        return q - 1
-    else:
-        return q
-```
+`floor_div_signed_conservative(n, d)`:
+
+- require `d > 0`
+- `q = trunc_toward_zero(n / d)`
+- `r = n % d`
+- if `n < 0` and `r != 0`, return `q - 1`
+- else return `q`
 
 **Positive checked ceiling division**
 
-```text
-ceil_div_positive_checked(n, d):
-    require d > 0
-    q = n / d
-    r = n % d
-    if r != 0:
-        return q + 1
-    else:
-        return q
-```
+`ceil_div_positive_checked(n, d)`:
 
-**Exact native multiply-divide floor for nonnegative inputs**
+- require `d > 0`
+- `q = n / d`
+- `r = n % d`
+- if `r != 0`, return checked(`q + 1`)
+- else return `q`
 
-```text
-mul_div_floor_u128(a, b, d):
-    require d > 0
-    compute exact native product p = a * b   // overflowing u128::MAX is forbidden
-    return floor(p / d)
-```
+**Exact multiply-divide floor for nonnegative inputs**
 
-**Exact native multiply-divide ceil for nonnegative inputs**
+`mul_div_floor_u128(a, b, d)`:
 
-```text
-mul_div_ceil_u128(a, b, d):
-    require d > 0
-    compute exact native product p = a * b   // overflowing u128::MAX is forbidden
-    return ceil(p / d)
-```
+- require `d > 0`
+- compute the exact quotient `q = floor(a * b / d)`
+- this MUST be exact even if the exact product `a * b` exceeds native `u128`
+- require `q <= u128::MAX`
+- return `q`
 
-**Exact wide multiply-divide floor for nonnegative inputs**
+**Exact multiply-divide ceil for nonnegative inputs**
 
-```text
-wide_mul_div_floor_u128(a, b, d):
-    require d > 0
-    compute exact wide product p = a * b
-    return floor(p / d)
-```
+`mul_div_ceil_u128(a, b, d)`:
 
-**Exact wide signed multiply-divide floor from K-pair (for `pnl_delta` only)**
+- require `d > 0`
+- compute the exact quotient `q = ceil(a * b / d)`
+- this MUST be exact even if the exact product `a * b` exceeds native `u128`
+- require `q <= u128::MAX`
+- return `q`
 
-```text
-wide_signed_mul_div_floor_from_k_pair(abs_basis_u128, k_now_i128, k_then_i128, den_u128):
-    require den_u128 > 0
-    d = (wide signed)k_now_i128 - (wide signed)k_then_i128
-    p = abs_basis_u128 * abs(d)    // exact wide product
-    q = floor(p / den_u128)
-    r = p mod den_u128
-    if d < 0:
-        mag = q + 1 if r != 0 else q
-        require mag <= i128::MAX
-        return -(mag as i128)
-    else:
-        require q <= i128::MAX
-        return q as i128
-```
+**Exact wide signed multiply-divide floor from K snapshots**
 
-**Exact wide ADL quotient helper with representability fallback**
+`wide_signed_mul_div_floor_from_k_pair(abs_basis_u128, k_then_i128, k_now_i128, den_u128)`:
 
-```text
-wide_mul_div_ceil_u128_or_over_i128max(a, b, d):
-    require d > 0
-    q = ceil((wide)a * (wide)b / d)
-    if q > i128::MAX:
-        return OverI128Magnitude
-    else:
-        return Value(q as u128)
-```
+- require `den_u128 > 0`
+- compute the exact signed wide difference `k_diff = k_now_i128 - k_then_i128` in a transient wide signed type
+- compute the exact wide magnitude `p = abs_basis_u128 * abs(k_diff)`
+- let `q = floor(p / den_u128)`
+- let `r = p mod den_u128`
+- if `k_diff >= 0`, return `q` as positive `i128` (require representable)
+- if `k_diff < 0`, return `-q` if `r == 0`, else return `-(q + 1)` to preserve mathematical floor semantics (require representable)
 
 **Checked fee-debt conversion**
 
-```text
-fee_debt_u128_checked(fee_credits):
-    require fee_credits != i128::MIN
-    if fee_credits >= 0:
-        return 0
-    else:
-        return (-fee_credits) as u128
-```
+`fee_debt_u128_checked(fee_credits)`:
 
-**Saturating warmup-cap multiply**
+- require `fee_credits != i128::MIN`
+- if `fee_credits >= 0`, return `0`
+- else return `(-fee_credits) as u128`
 
-```text
-saturating_mul_u128_u64(a, b):
-    if a == 0 or b == 0:
-        return 0
-    if a > u128::MAX / (b as u128):
-        return u128::MAX
-    else:
-        return a * (b as u128)
-```
+**Saturating warmup multiply**
 
-### 4.9 `absorb_protocol_loss(loss)`
+`saturating_mul_u128_u64(a, b)`:
 
-This helper is the normative accounting path for uncovered losses that are no longer attached to an open position.
+- if `a == 0` or `b == 0`, return `0`
+- if `a > u128::MAX / (b as u128)`, return `u128::MAX`
+- else return `a * (b as u128)`
 
-Precondition: `loss > 0`.
+**Wide ADL quotient helper**
 
-Given `loss` as a `u128` quote amount:
+`wide_mul_div_ceil_u128_or_over_i128max(a, b, d)`:
 
-1. `available_I = I.saturating_sub(I_floor)`
+- require `d > 0`
+- compute the exact quotient `q = ceil(a * b / d)` in a transient wide type
+- if `q > i128::MAX as u128`, return the tagged result `OverI128Magnitude`
+- else return `Ok(q as u128)`
 
-2. `pay_I = min(loss, available_I)`
+### 4.9 Warmup helpers
 
-3. `I := I - pay_I`
+`restart_warmup_after_reserve_increase(i)` MUST:
 
-4. `loss_rem := loss - pay_I`
+1. if `T == 0`:
+   - `set_reserved_pnl(i, 0)`
+   - `w_slope_i = 0`
+   - `w_start_i = current_slot`
+   - return
+2. if `R_i == 0`:
+   - `w_slope_i = 0`
+   - `w_start_i = current_slot`
+   - return
+3. set `w_slope_i = max(1, floor(R_i / T))`
+4. set `w_start_i = current_slot`
 
-5. if `loss_rem > 0`, no additional decrement to `V` occurs. The uncovered loss is represented by junior undercollateralization through `h`.
+`advance_profit_warmup(i)` MUST:
 
-### 4.10 `charge_fee_to_insurance(i, fee)`
+1. if `R_i == 0`:
+   - `w_slope_i = 0`
+   - `w_start_i = current_slot`
+   - return
+2. if `T == 0`:
+   - `set_reserved_pnl(i, 0)`
+   - `w_slope_i = 0`
+   - `w_start_i = current_slot`
+   - return
+3. `elapsed = current_slot - w_start_i`
+4. `release = min(R_i, saturating_mul_u128_u64(w_slope_i, elapsed))`
+5. if `release > 0`, `set_reserved_pnl(i, R_i - release)`
+6. if `R_i == 0`, set `w_slope_i = 0`
+7. set `w_start_i = current_slot`
 
-This helper is the only normative path for charging explicit protocol fees such as trading fees or liquidation fees.
+### 4.10 `charge_fee_to_insurance(i, fee_abs)`
 
 Preconditions:
 
-- `fee <= MAX_PROTOCOL_FEE_ABS`
+- `fee_abs <= MAX_PROTOCOL_FEE_ABS`
 
-- the caller has already computed `fee` according to the relevant fee rule
+Effects:
 
-The helper MUST:
+1. `fee_paid = min(fee_abs, C_i)`
+2. if `fee_paid > 0`:
+   - `set_capital(i, C_i - fee_paid)`
+   - `I = checked_add_u128(I, fee_paid)`
+3. `fee_shortfall = fee_abs - fee_paid`
+4. if `fee_shortfall > 0`:
+   - `fee_credits_i = checked_sub_i128(fee_credits_i, fee_shortfall as i128)`
 
-1. `fee_paid = min(fee, C_i)`
+This helper MUST NOT mutate `PNL_i`, `PNL_pos_tot`, `PNL_matured_pos_tot`, or any `K_side`.
 
-2. `set_capital(i, C_i - fee_paid)`
+### 4.11 Insurance-loss helpers
 
-3. `I = checked_add_u128(I, fee_paid)`
+`use_insurance_buffer(loss_abs)`:
 
-4. `fee_shortfall = fee - fee_paid`
+1. precondition: `loss_abs > 0`
+2. `available_I = I.saturating_sub(I_floor)`
+3. `pay_I = min(loss_abs, available_I)`
+4. `I = I - pay_I`
+5. return `loss_abs - pay_I`
 
-5. if `fee_shortfall > 0`, compute `new_fee_credits = checked_sub_i128(fee_credits_i, fee_shortfall as i128)` and set `fee_credits_i = new_fee_credits`
+`record_uninsured_protocol_loss(loss_abs)`:
 
-Unpaid explicit fees are account-local fee debt. They MUST NOT be written into `PNL_i`, MUST NOT change `PNL_pos_tot`, and MUST NOT be included in bankruptcy deficit `D`.
+- precondition: `loss_abs > 0`
+- no additional decrement to `V` or `I` occurs
+- the uncovered loss remains represented as junior undercollateralization through `Residual` and `h`
 
-### 4.11 `recompute_next_funding_rate_from_final_state(oracle_price)`
+`absorb_protocol_loss(loss_abs)`:
 
-If the funding-rate formula depends on mutable engine state (for example skew, OI, utilization, side modes, oracle-related funding inputs, or explicit funding-configuration state), then after the instruction's final post-reset state is known the engine MUST recompute and store the next-interval `r_last` exactly once.
+1. precondition: `loss_abs > 0`
+2. `loss_rem = use_insurance_buffer(loss_abs)`
+3. if `loss_rem > 0`, `record_uninsured_protocol_loss(loss_rem)`
 
-Funding-rate inputs MAY depend on market exposure, side modes, oracle-related funding inputs, and explicit funding-configuration state. They MUST NOT depend directly on `current_slot`, wall-clock time, passive passage of time, vault-only capital bookkeeping such as `V`, `C_tot`, `I`, account principal deposits / withdrawals, or account-local fee debt.
+### 4.12 Funding-rate recomputation helper
 
-This helper MUST:
+The engine MUST define a pure helper:
 
-1. use the final post-reset state of the current top-level instruction
+- `recompute_r_last_from_final_state()`
 
-2. use the just-settled current `oracle_price` or the implementation's defined current funding price sample basis
+It MUST read only the final post-reset state of the current instruction and MUST store the resulting rate for the *next* interval only. Funding-rate inputs MAY depend on live OI, skew, modes, and configured parameters. They MUST NOT depend directly on passive wall-clock passage outside `accrue_market_to`.
 
-3. write the resulting next-interval rate into `r_last`
+The helper MUST derive the unclamped mathematical funding rate in a transient widened signed type or an equivalent exact checked construction, then deterministically store:
 
-4. never retroactively reprice slots already accrued by `accrue_market_to`
+- `r_last = clamp(r_unclamped, -MAX_ABS_FUNDING_BPS_PER_SLOT, +MAX_ABS_FUNDING_BPS_PER_SLOT)`
+
+The stored result MUST therefore always satisfy `|r_last| <= MAX_ABS_FUNDING_BPS_PER_SLOT`. An out-of-range unclamped formula result MUST NOT by itself cause the top-level instruction to revert.
+
+---
 
 ## 5. Unified A/K side-index mechanics
 
@@ -878,86 +746,60 @@ This helper MUST:
 For one side of the book, a single eager global event on absolute fixed-point position `q_q >= 0` and realized PnL `p` has the form:
 
 - `q_q' = α q_q`
-
 - `p' = p + β * q_q / POS_SCALE`
 
 where:
 
-- `α ∈ [0, 1]` is the surviving-position fraction,
-
-- `β` is quote PnL per unit pre-event base position.
+- `α ∈ [0, 1]` is the surviving-position fraction
+- `β` is quote PnL per unit pre-event base position
 
 The cumulative side indices compose as:
 
 - `A_new = A_old * α`
-
 - `K_new = K_old + A_old * β`
 
 ### 5.2 `effective_pos_q(i)`
 
-For an account `i` on side `s` with nonzero basis:
+For an account `i` with nonzero basis:
 
+- let `s = side(basis_pos_q_i)`
 - if `epoch_snap_i != epoch_s`, then `effective_pos_q(i) = 0` for current-market risk purposes until the account is touched and zeroed
-
-- else `effective_abs_pos_q(i) = floor(abs(basis_pos_q_i) * A_s / a_basis_i)`
-
+- else `effective_abs_pos_q(i) = mul_div_floor_u128(abs(basis_pos_q_i) as u128, A_s, a_basis_i)`
 - `effective_pos_q(i) = sign(basis_pos_q_i) * effective_abs_pos_q(i)`
+
+If `basis_pos_q_i == 0`, define `effective_pos_q(i) = 0`.
 
 ### 5.3 `settle_side_effects(i)`
 
 When touching account `i`:
 
-1. If `basis_pos_q_i == 0`, return immediately.
-
-2. Let `s = side(basis_pos_q_i)`.
-
-3. If `epoch_snap_i == epoch_s` (same epoch):
-
-   - compute `q_eff_new = floor(abs(basis_pos_q_i) * A_s / a_basis_i)` using checked arithmetic
-
-   - compute `den = a_basis_i * POS_SCALE` using checked `u128` arithmetic
-
-   - compute `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i), K_s, k_snap_i, den)`
-
-   - compute `new_PNL = checked_add_i128(PNL_i, pnl_delta)`
-
-   - `set_pnl(i, new_PNL)`
-
+1. if `basis_pos_q_i == 0`, return immediately
+2. let `s = side(basis_pos_q_i)`
+3. let `den = checked_mul_u128(a_basis_i, POS_SCALE)`
+4. if `epoch_snap_i == epoch_s` (same epoch):
+   - `q_eff_new = mul_div_floor_u128(abs(basis_pos_q_i) as u128, A_s, a_basis_i)`
+   - record `old_R = R_i`
+   - `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_s, den)`
+   - `set_pnl(i, checked_add_i128(PNL_i, pnl_delta))`
+   - if `R_i > old_R`, invoke `restart_warmup_after_reserve_increase(i)`
    - if `q_eff_new == 0`:
-
      - `inc_phantom_dust_bound(s)`
-
      - `set_position_basis_q(i, 0)`
-
-     - reset the account to canonical zero-position defaults anchored to `epoch_s`
-
+     - reset snapshots to canonical zero-position defaults
    - else:
-
-     - do not change `basis_pos_q_i` or `a_basis_i`
-
+     - leave `basis_pos_q_i` and `a_basis_i` unchanged
      - set `k_snap_i = K_s`
-
      - set `epoch_snap_i = epoch_s`
-
-4. Else (epoch mismatch):
-
+5. else (epoch mismatch):
    - require `mode_s == ResetPending`
-
-   - require `checked_add_u64(epoch_snap_i, 1) == epoch_s`
-
-   - compute `den = a_basis_i * POS_SCALE` using checked `u128` arithmetic
-
-   - compute `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i), K_epoch_start_s, k_snap_i, den)`
-
-   - compute `new_PNL = checked_add_i128(PNL_i, pnl_delta)`
-
-   - `set_pnl(i, new_PNL)`
-
+   - require `epoch_snap_i + 1 == epoch_s`
+   - record `old_R = R_i`
+   - `pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s, den)`
+   - `set_pnl(i, checked_add_i128(PNL_i, pnl_delta))`
+   - if `R_i > old_R`, invoke `restart_warmup_after_reserve_increase(i)`
    - `set_position_basis_q(i, 0)`
-
    - decrement `stale_account_count_s` using checked subtraction
-
-   - reset the account to canonical zero-position defaults anchored to `epoch_s`
+   - reset snapshots to canonical zero-position defaults
 
 ### 5.4 `accrue_market_to(now_slot, oracle_price)`
 
@@ -965,582 +807,421 @@ Before any operation that depends on current market state, the engine MUST call 
 
 This helper MUST:
 
-1. require `now_slot >= current_slot`
-
-2. require `now_slot >= slot_last`
-
-3. require `0 < oracle_price <= MAX_ORACLE_PRICE`
-
-4. snapshot `OI_eff_long` and `OI_eff_short` at the start of the invocation; those OI values are fixed for all funding sub-steps in this invocation
-
-5. if `now_slot == slot_last` and `oracle_price == P_last`:
-   - set `current_slot = now_slot`
-   - return
-
-6. apply mark-to-market **exactly once** from the pre-invocation `P_last` to the final `oracle_price`:
-   - let `delta_p = (oracle_price as i128) - (P_last as i128)`
-   - if `delta_p != 0`:
-     - if snapped `OI_eff_long > 0`, add `A_long * delta_p` to `K_long` using checked `i128` arithmetic
-     - if snapped `OI_eff_short > 0`, add `-(A_short * delta_p)` to `K_short` using checked `i128` arithmetic
-
-7. let `dt_rem = now_slot - slot_last`
-
-8. while `dt_rem > 0`:
-   - let `dt = min(dt_rem, MAX_FUNDING_DT)`
-   - if `r_last != 0` **and** snapped `OI_eff_long > 0` **and** snapped `OI_eff_short > 0`:
-     - `funding_term_raw = fund_px_last * abs(r_last) * dt`, computed natively in checked arithmetic
-     - if `r_last > 0`, longs are payer and shorts are receiver
-     - if `r_last < 0`, shorts are payer and longs are receiver
-     - let `A_p = A_side(payer)` and `A_r = A_side(receiver)`
-     - compute payer K-space loss first:
-       - `delta_K_payer_abs = mul_div_ceil_u128(A_p, funding_term_raw, 10_000)`
-     - derive receiver K-space gain from the payer loss:
-       - `delta_K_receiver_abs = mul_div_floor_u128(delta_K_payer_abs, A_r, A_p)`
-     - apply with checked persistent-state `i128` arithmetic:
-       - `K_payer -= delta_K_payer_abs`
-       - `K_receiver += delta_K_receiver_abs`
-   - `dt_rem -= dt`
-
-9. update `slot_last = now_slot`, `P_last = oracle_price`, `fund_px_last = oracle_price`, and `current_slot = now_slot`
-
-Normative clarification:
-
-- Step 6 is one-shot mark application for the whole invocation.
-
-- Step 8 is the only sub-stepped component.
-
-- If either snapped side OI is zero, funding is skipped for the entire invocation.
-
-- An implementation MUST NOT re-apply the same `delta_p` once per funding sub-step.
+1. require trusted `now_slot >= slot_last`
+2. require validated `0 < oracle_price <= MAX_ORACLE_PRICE`
+3. snapshot `OI_long_0 = OI_eff_long` and `OI_short_0 = OI_eff_short`
+4. compute signed one-shot `ΔP = (oracle_price as i128) - (P_last as i128)`
+5. apply mark-to-market exactly once using the snapped side state:
+   - if `OI_long_0 > 0`, `K_long = checked_add_i128(K_long, (A_long * ΔP))`
+   - if `OI_short_0 > 0`, `K_short = checked_sub_i128(K_short, (A_short * ΔP))`
+6. if `now_slot > slot_last`, apply funding over the interval in bounded internal steps with `dt <= MAX_FUNDING_DT`
+7. funding MUST be skipped unless both snapped sides have live effective OI:
+   - if `OI_long_0 == 0` or `OI_short_0 == 0`, no funding adjustment is applied for this invocation
+8. for each funding sub-step when both sides are live and `r_last != 0`:
+   - `funding_term_raw = checked_mul_u128(fund_px_last, abs(r_last) as u128)` and then multiply by `dt_step`
+   - if `r_last > 0`, longs are payer and shorts are receiver
+   - if `r_last < 0`, shorts are payer and longs are receiver
+   - let `A_p = A_side(payer)` and `A_r = A_side(receiver)`
+   - `delta_K_payer_abs = mul_div_ceil_u128(A_p, funding_term_raw, 10_000)`
+   - `delta_K_receiver_abs = mul_div_floor_u128(delta_K_payer_abs, A_r, A_p)`
+   - payer update: subtract `delta_K_payer_abs`
+   - receiver update: add `delta_K_receiver_abs`
+9. update `slot_last = now_slot`
+10. update `P_last = oracle_price`
+11. update `fund_px_last = oracle_price`
 
 ### 5.5 Funding anti-retroactivity
 
-In this source-of-truth spec, funding-rate inputs MAY depend on market state such as OI, skew, side modes, oracle-related funding inputs, and explicit funding-configuration state. They MUST NOT depend directly on `current_slot`, wall-clock time, passive passage of time, vault-only capital bookkeeping such as `V`, `C_tot`, `I`, account principal deposits / withdrawals, or account-local fee debt.
+If any top-level instruction can change funding-rate inputs, that instruction MUST:
 
-Before any operation that can change funding-rate inputs, the engine MUST:
-
-1. call `accrue_market_to(now_slot, oracle_price)` using the currently stored `r_last`
-
-2. apply the instruction's state changes
-
-3. perform end-of-instruction reset scheduling / finalization if required
-
-4. if funding-rate inputs changed, call `recompute_next_funding_rate_from_final_state(oracle_price)` exactly once using the instruction's final post-reset state
-
-No top-level instruction may recompute `r_last` at an intermediate point and then overwrite or retain that mid-instruction value after final resets.
-
-This requirement applies equally to instructions whose only funding-input mutation arises from end-of-instruction reset scheduling or finalization.
+1. call `accrue_market_to(now_slot, oracle_price)` under the currently stored `r_last`
+2. perform its local state changes
+3. run end-of-instruction reset handling if applicable
+4. recompute and store the next `r_last` exactly once from the final post-reset state only
 
 ### 5.6 `enqueue_adl(ctx, liq_side, q_close_q, D)`
 
-Suppose a bankrupt or non-bankruptcy synthetic liquidation from side `liq_side` removes `q_close_q >= 0` fixed-point base quantity from that side, and may additionally route uncovered deficit `D >= 0` as a `u128` quote amount.
+Suppose a bankrupt liquidation from side `liq_side` leaves an uncovered deficit `D >= 0` after the liquidated account's principal and realized PnL have been exhausted. `q_close_q` is the fixed-point base quantity removed from the liquidated side and MAY be zero.
 
-For non-bankruptcy quantity socialization, `D = 0`.
+Let `opp = opposite(liq_side)`.
 
-For bankruptcy quantity socialization, `D` is the uncovered negative realized PnL remaining after the liquidated account's principal has been exhausted.
+This helper MUST perform the following in order:
 
-Preconditions:
-
-- `opp = opposite(liq_side)`
-
-- `ctx` is the current top-level instruction's reset-scheduling context
-
-The engine MUST perform the following in order:
-
-1. If `q_close_q > 0`, decrease the liquidated side OI:
-   - `OI_eff_liq_side := OI_eff_liq_side - q_close_q` using checked subtraction.
-
-2. Read `OI = OI_eff_opp` at this moment.
-
-3. If `OI == 0`:
-   - if `D > 0`, invoke `absorb_protocol_loss(D)`
+1. if `q_close_q > 0`, decrement `OI_eff_liq_side` by `q_close_q` using checked subtraction
+2. if `D > 0`, set `D_rem = use_insurance_buffer(D)`; else define `D_rem = 0`
+3. read `OI = OI_eff_opp`
+4. if `OI == 0`:
+   - if `D_rem > 0`, `record_uninsured_protocol_loss(D_rem)`
+   - if `OI_eff_liq_side == 0`, set both `ctx.pending_reset_liq_side = true` and `ctx.pending_reset_opp = true`
    - return
-
-4. If `OI > 0` and `stored_pos_count_opp == 0`:
+5. if `OI > 0` and `stored_pos_count_opp == 0`:
    - require `q_close_q <= OI`
    - let `OI_post = OI - q_close_q`
-   - if `D > 0`, invoke `absorb_protocol_loss(D)` and do not modify `K_opp`
-   - set `OI_eff_opp := OI_post`
+   - if `D_rem > 0`, `record_uninsured_protocol_loss(D_rem)`
+   - set `OI_eff_opp = OI_post`
    - if `OI_post == 0`:
      - set `ctx.pending_reset_opp = true`
-     - set `ctx.pending_reset_liq_side = true`
+     - if `OI_eff_liq_side == 0`, set `ctx.pending_reset_liq_side = true`
    - return
-
-5. Else (`OI > 0` and `stored_pos_count_opp > 0`):
+6. otherwise (`OI > 0` and `stored_pos_count_opp > 0`):
    - require `q_close_q <= OI`
-   - let `A_old = A_opp`
-   - let `OI_post = OI - q_close_q`
-
-6. If `D > 0`:
+   - `A_old = A_opp`
+   - `OI_post = OI - q_close_q`
+7. if `D_rem > 0`:
    - let `adl_scale = checked_mul_u128(A_old, POS_SCALE)`
-   - compute `delta_K_abs_result = wide_mul_div_ceil_u128_or_over_i128max(D, adl_scale, OI)`
-   - if `delta_K_abs_result == OverI128Magnitude`, invoke `absorb_protocol_loss(D)` and do not modify `K_opp`
-   - else let `delta_K_abs = value(delta_K_abs_result)`, `delta_K_exact = -(delta_K_abs as i128)`, and test whether `K_opp + delta_K_exact` fits in `i128`
-   - if it fits, apply `K_opp := K_opp + delta_K_exact`
-   - if it does not fit, invoke `absorb_protocol_loss(D)` instead and do not modify `K_opp`
-
-7. If `OI_post == 0`:
-   - set `OI_eff_opp := 0`
+   - compute `delta_K_abs_result = wide_mul_div_ceil_u128_or_over_i128max(D_rem, adl_scale, OI)`
+   - if `delta_K_abs_result == OverI128Magnitude`, `record_uninsured_protocol_loss(D_rem)`
+   - else:
+     - `delta_K_abs = unwrap(delta_K_abs_result)`
+     - `delta_K_exact = -(delta_K_abs as i128)`
+     - if `checked_add_i128(K_opp, delta_K_exact)` fails, `record_uninsured_protocol_loss(D_rem)`
+     - else `K_opp = K_opp + delta_K_exact`
+8. if `OI_post == 0`:
+   - set `OI_eff_opp = 0`
    - set `ctx.pending_reset_opp = true`
-   - set `ctx.pending_reset_liq_side = true`
+   - if `OI_eff_liq_side == 0`, set `ctx.pending_reset_liq_side = true`
    - return
-
-8. Compute the product natively:
-   - `A_prod_exact = A_old * OI_post`
-
-9. Compute natively:
-   - `A_candidate = floor(A_prod_exact / OI)`
-   - `A_trunc_rem = A_prod_exact mod OI`
-
-10. If `A_candidate > 0`:
-    - set `A_opp := A_candidate`
-    - set `OI_eff_opp := OI_post`
-    - only if `A_trunc_rem != 0`, account for global A-truncation dust:
-      - let `N_opp = stored_pos_count_opp as u128`
-      - let `global_a_dust_bound = checked_add_u128(N_opp, ceil_div_positive_checked(checked_add_u128(OI, N_opp), A_old))`
-      - apply `inc_phantom_dust_bound_by(opp, global_a_dust_bound)`
-    - if `A_opp < MIN_A_SIDE`, set `mode_opp = DrainOnly`
-    - return
-
-11. If `A_candidate == 0` while `OI_post > 0`, the side has exhausted representable quantity precision. The engine MUST enter a precision-exhaustion terminal drain:
-    - set `OI_eff_opp := 0`
-    - set `OI_eff_liq_side := 0`
-    - set `ctx.pending_reset_opp = true`
-    - set `ctx.pending_reset_liq_side = true`
+9. compute `A_prod_exact = checked_mul_u128(A_old, OI_post)`
+10. `A_candidate = floor(A_prod_exact / OI)`
+11. `A_trunc_rem = A_prod_exact mod OI`
+12. if `A_candidate > 0`:
+   - set `A_opp = A_candidate`
+   - set `OI_eff_opp = OI_post`
+   - if `A_trunc_rem != 0`:
+     - `N_opp = stored_pos_count_opp as u128`
+     - `global_a_dust_bound = checked_add_u128(N_opp, ceil_div_positive_checked(checked_add_u128(OI, N_opp), A_old))`
+     - `inc_phantom_dust_bound_by(opp, global_a_dust_bound)`
+   - if `A_opp < MIN_A_SIDE`, set `mode_opp = DrainOnly`
+   - return
+13. if `A_candidate == 0` while `OI_post > 0`, enter the precision-exhaustion terminal drain:
+   - set `OI_eff_opp = 0`
+   - set `OI_eff_liq_side = 0`
+   - set both pending-reset flags true
 
 Normative intent:
 
+- Real bankruptcy losses MUST first consume the Insurance Fund down to `I_floor`.
+- Only the remaining `D_rem` MAY be socialized through `K_opp` or left as junior undercollateralization.
 - Quantity socialization MUST never assert-fail due to `A_side` rounding to zero.
-
-- Global A-truncation dust MUST be bounded in `phantom_dust_bound_opp_q` when and only when actual truncation occurs.
-
+- If `enqueue_adl` drives a side's authoritative `OI_eff_side` to `0`, that side MUST enter the reset lifecycle before any further live-OI-dependent processing, even when the liquidated side remains live.
 - Real quote deficits MUST NOT be written into `K_opp` when there are no opposing stored positions left to realize that K change.
 
-- When an ADL event drains effective OI to zero on both sides, both sides MUST enter the reset lifecycle.
+### 5.7 End-of-instruction reset handling
 
-### 5.7 `schedule_end_of_instruction_resets(ctx)`
+The engine MUST provide both:
 
-This helper MUST be called exactly once, after all explicit position mutations and snapshot attachments in each top-level external instruction.
+- `schedule_end_of_instruction_resets(ctx)`
+- `finalize_end_of_instruction_resets(ctx)`
 
-It MUST perform the following in order.
+`schedule_end_of_instruction_resets(ctx)` MUST be called exactly once at the end of each top-level instruction that can touch accounts, mutate side state, or liquidate.
 
-#### 5.7.A Bilateral-empty dust clearance
+It MUST perform the following in order:
 
-If:
+1. **Bilateral-empty dust clearance**
+   - if `stored_pos_count_long == 0` and `stored_pos_count_short == 0`:
+     - `clear_bound_q = checked_add_u128(phantom_dust_bound_long_q, phantom_dust_bound_short_q)`
+     - `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0) or (phantom_dust_bound_short_q > 0)`
+     - if `has_residual_clear_work`:
+       - require `OI_eff_long == OI_eff_short`
+       - if `OI_eff_long <= clear_bound_q` and `OI_eff_short <= clear_bound_q`:
+         - set `OI_eff_long = 0`
+         - set `OI_eff_short = 0`
+         - set both pending-reset flags true
+       - else fail conservatively
+2. **Unilateral-empty dust clearance (long empty)**
+   - else if `stored_pos_count_long == 0` and `stored_pos_count_short > 0`:
+     - `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0)`
+     - if `has_residual_clear_work`:
+       - require `OI_eff_long == OI_eff_short`
+       - if `OI_eff_long <= phantom_dust_bound_long_q`:
+         - set `OI_eff_long = 0`
+         - set `OI_eff_short = 0`
+         - set both pending-reset flags true
+       - else fail conservatively
+3. **Unilateral-empty dust clearance (short empty)**
+   - else if `stored_pos_count_short == 0` and `stored_pos_count_long > 0`:
+     - `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_short_q > 0)`
+     - if `has_residual_clear_work`:
+       - require `OI_eff_long == OI_eff_short`
+       - if `OI_eff_short <= phantom_dust_bound_short_q`:
+         - set `OI_eff_long = 0`
+         - set `OI_eff_short = 0`
+         - set both pending-reset flags true
+       - else fail conservatively
+4. **DrainOnly zero-OI reset scheduling**
+   - if `mode_long == DrainOnly and OI_eff_long == 0`, set `ctx.pending_reset_long = true`
+   - if `mode_short == DrainOnly and OI_eff_short == 0`, set `ctx.pending_reset_short = true`
 
-- `stored_pos_count_long == 0`, and
+`finalize_end_of_instruction_resets(ctx)` MUST:
 
-- `stored_pos_count_short == 0`,
+1. if `ctx.pending_reset_long` and `mode_long != ResetPending`, invoke `begin_full_drain_reset(long)`
+2. if `ctx.pending_reset_short` and `mode_short != ResetPending`, invoke `begin_full_drain_reset(short)`
+3. if `mode_long == ResetPending` and `OI_eff_long == 0` and `stale_account_count_long == 0` and `stored_pos_count_long == 0`, invoke `finalize_side_reset(long)`
+4. if `mode_short == ResetPending` and `OI_eff_short == 0` and `stale_account_count_short == 0` and `stored_pos_count_short == 0`, invoke `finalize_side_reset(short)`
 
-then:
+Once either pending-reset flag becomes true during a top-level instruction, that instruction MUST NOT perform any additional account touches, liquidations, or explicit position mutations that rely on live authoritative OI. It MUST proceed directly to end-of-instruction reset handling after finishing any already-started local bookkeeping that does not read or mutate live side exposure.
 
-1. define `clear_bound_q = checked_add_u128(phantom_dust_bound_long_q, phantom_dust_bound_short_q)`
+---
 
-2. define `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0) or (phantom_dust_bound_short_q > 0)`
-
-3. if `has_residual_clear_work`:
-   - require `OI_eff_long == OI_eff_short`; otherwise fail conservatively
-   - if `OI_eff_long <= clear_bound_q` and `OI_eff_short <= clear_bound_q`:
-     - set `OI_eff_long = 0`
-     - set `OI_eff_short = 0`
-     - set `ctx.pending_reset_long = true`
-     - set `ctx.pending_reset_short = true`
-   - else fail conservatively
-
-#### 5.7.B Unilateral-empty symmetric dust clearance
-
-Else if:
-
-- `stored_pos_count_long == 0`, and
-
-- `stored_pos_count_short > 0`,
-
-then:
-
-1. define `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0)`
-
-2. if `has_residual_clear_work`:
-   - require `OI_eff_long == OI_eff_short`; otherwise fail conservatively
-   - if `OI_eff_long <= phantom_dust_bound_long_q`:
-     - set `OI_eff_long = 0`
-     - set `OI_eff_short = 0`
-     - set `ctx.pending_reset_long = true`
-     - set `ctx.pending_reset_short = true`
-   - else fail conservatively
-
-#### 5.7.C Symmetric counterpart
-
-Else if:
-
-- `stored_pos_count_short == 0`, and
-
-- `stored_pos_count_long > 0`,
-
-then:
-
-1. define `has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_short_q > 0)`
-
-2. if `has_residual_clear_work`:
-   - require `OI_eff_long == OI_eff_short`; otherwise fail conservatively
-   - if `OI_eff_short <= phantom_dust_bound_short_q`:
-     - set `OI_eff_long = 0`
-     - set `OI_eff_short = 0`
-     - set `ctx.pending_reset_long = true`
-     - set `ctx.pending_reset_short = true`
-   - else fail conservatively
-
-#### 5.7.D DrainOnly zero-OI reset scheduling
-
-After the above dust-clear logic:
-
-- if `mode_long == DrainOnly` and `OI_eff_long == 0`, set `ctx.pending_reset_long = true`
-
-- if `mode_short == DrainOnly` and `OI_eff_short == 0`, set `ctx.pending_reset_short = true`
-
-### 5.8 `finalize_end_of_instruction_resets(ctx)`
-
-This helper MUST be called exactly once at the end of each top-level external instruction, after §5.7.
-
-Once either `ctx.pending_reset_long` or `ctx.pending_reset_short` becomes true during a top-level external instruction, that instruction MUST NOT perform any additional account touches, liquidations, or explicit position mutations that rely on live authoritative OI. It MUST proceed directly to §§5.7–5.8 after completing any already-started local bookkeeping that does not read or mutate live side exposure.
-
-It MUST, in order:
-
-- if `ctx.pending_reset_long` and `mode_long != ResetPending`, invoke `begin_full_drain_reset(long)`
-
-- if `ctx.pending_reset_short` and `mode_short != ResetPending`, invoke `begin_full_drain_reset(short)`
-
-- if `mode_long == ResetPending` and `OI_eff_long == 0` and `stale_account_count_long == 0` and `stored_pos_count_long == 0`, invoke `finalize_side_reset(long)`
-
-- if `mode_short == ResetPending` and `OI_eff_short == 0` and `stale_account_count_short == 0` and `stored_pos_count_short == 0`, invoke `finalize_side_reset(short)`
-
-## 6. Warmup
+## 6. Warmup and matured-profit release
 
 ### 6.1 Parameter
 
-- `T = warmup_period_slots`.
+- `T = warmup_period_slots`
+- if `T == 0`, warmup is instantaneous
 
-- If `T == 0`, warmup is instantaneous.
+### 6.2 Semantics of `R_i`
 
-### 6.2 Available gross positive PnL
+`R_i` is the reserved portion of positive `PNL_i` that has not yet matured through warmup.
 
-- `AvailGross_i = max(PNL_i, 0) - R_i`.
+- `ReleasedPos_i = max(PNL_i, 0) - R_i`
+- Only `ReleasedPos_i` contributes to `PNL_matured_pos_tot`, to live haircut, to `Eq_init_net_i`, and to profit conversion
+- Reserved fresh positive PnL in `R_i` MAY contribute only to the generating account's maintenance checks
+- `Eq_maint_raw_i` uses full local `PNL_i` on the touched generating account, so pure changes in composition between `ReleasedPos_i` and `R_i` do not by themselves change maintenance equity
+- Fresh positive PnL MUST enter `R_i` first by the automatic reserve-increase rule in `set_pnl`
 
-### 6.3 Warmable gross amount
+### 6.3 Warmup progress
 
-If `T == 0`, define:
+Touched accounts MUST call `advance_profit_warmup(i)` before any logic that depends on current released positive PnL in that touch.
 
-- `WarmableGross_i = AvailGross_i`.
+This helper releases previously reserved positive PnL according to the current slope and elapsed slots but never grants newly added reserve any retroactive maturity.
 
-Otherwise let:
+### 6.4 Anti-retroactivity
 
-- `elapsed = current_slot - w_start_i`
+When `set_pnl` increases `R_i`, the caller MUST immediately invoke `restart_warmup_after_reserve_increase(i)`. This resets `w_start_i = current_slot` and recomputes `w_slope_i` from the new reserve, so newly generated profit cannot inherit old dormant maturity headroom.
 
-- `cap = saturating_mul_u128_u64(w_slope_i, elapsed)`
+### 6.5 Release slope preservation
 
-Then:
+When reserve decreases only because of `advance_profit_warmup(i)`, the engine MUST preserve the existing `w_slope_i` for the remaining reserve (unless the reserve reaches zero). This prevents repeated touches from creating exponential-decay maturity.
 
-- `WarmableGross_i = min(AvailGross_i, cap)`.
+---
 
-### 6.4 Warmup slope update rule
+## 7. Loss settlement, flat-loss resolution, profit conversion, and fee-debt sweep
 
-After any change that increases `AvailGross_i`:
-
-- if `AvailGross_i == 0`, then `w_slope_i = 0`
-
-- else if `T > 0`, then `w_slope_i = max(1, floor(AvailGross_i / T))`
-
-- else (`T == 0`), then `w_slope_i = AvailGross_i`
-
-- `w_start_i = current_slot`
-
-### 6.5 Restart-on-new-profit rule via eager auto-conversion
-
-When an operation increases `AvailGross_i`, the invoking routine MUST provide `old_warmable_i`, which is `WarmableGross_i` evaluated strictly before the profit-increasing event.
-
-The engine MUST:
-
-1. If `old_warmable_i > 0`, execute the profit-conversion logic of §7.4 substituting `x = old_warmable_i`.
-
-2. If step 1 increased `C_i`, the invoking routine MUST immediately execute the fee-debt sweep of §7.5 before any subsequent step in the same top-level routine that may consume capital, assess margin, or absorb uncovered losses.
-
-3. After step 1 (or immediately if `old_warmable_i == 0`), update the warmup slope per §6.4 using the new remaining `AvailGross_i`.
-
-## 7. Loss settlement, uncovered loss resolution, profit conversion, and fee-debt sweep
-
-### 7.1 Loss settlement from principal
+### 7.1 `settle_losses_from_principal(i)`
 
 If `PNL_i < 0`, the engine MUST immediately attempt to settle from principal:
 
 1. require `PNL_i != i128::MIN`
-
-2. `need = (-PNL_i) as u128`
-
-3. `pay = min(need, C_i)`
-
-4. apply:
+2. record `old_R = R_i`
+3. `need = (-PNL_i) as u128`
+4. `pay = min(need, C_i)`
+5. apply:
    - `set_capital(i, C_i - pay)`
-   - `new_PNL = checked_add_i128(PNL_i, pay as i128)`
-   - `set_pnl(i, new_PNL)`
+   - `set_pnl(i, checked_add_i128(PNL_i, pay as i128))`
+
+Because `pay <= need = -PNL_i_before`, the post-write `PNL_i_after = PNL_i_before + pay` lies in `[PNL_i_before, 0]`. Therefore `max(PNL_i_after, 0) = 0`, no reserve can be added, and the helper MUST leave `R_i` unchanged. Implementations SHOULD assert `R_i == old_R` after the helper.
 
 ### 7.2 Open-position negative remainder
 
 If after §7.1:
 
-- `PNL_i < 0` and `effective_pos_q(i) != 0`,
+- `PNL_i < 0`, and
+- `effective_pos_q(i) != 0`
 
-then the account MUST NOT be silently zeroed. It remains liquidatable and must be resolved through liquidation / ADL.
+then the account MUST remain liquidatable. It MUST NOT be silently zeroed or routed through flat-account loss absorption.
 
-### 7.3 Zero-position negative remainder
+### 7.3 Flat-account negative remainder
 
 If after §7.1:
 
-- `PNL_i < 0` and `effective_pos_q(i) == 0`,
+- `PNL_i < 0`, and
+- `effective_pos_q(i) == 0`
 
 then the engine MUST:
 
 1. call `absorb_protocol_loss((-PNL_i) as u128)`
-
 2. `set_pnl(i, 0)`
 
-A capital-only instruction that does not call `settle_side_effects(i)` MAY invoke this path only when `basis_pos_q_i == 0`. It MUST NOT treat `effective_pos_q(i) == 0` arising from a stale or epoch-mismatched nonzero stored basis as a flat-account loss path.
+This path is allowed only for truly flat accounts. A capital-only instruction that does not call `settle_side_effects(i)` MAY invoke this path only when `basis_pos_q_i == 0`.
 
 ### 7.4 Profit conversion
 
-Let `x = WarmableGross_i`. If `x == 0`, do nothing.
+Profit conversion removes matured released profit and converts only its haircutted backed portion into protected principal.
 
-Compute `y` using the pre-conversion haircut ratio:
+In this specification's automatic touch flow, this helper is invoked only on touched states with `basis_pos_q_i == 0`. Open-position accounts that want to voluntarily realize matured profit without closing may instead use the explicit `convert_released_pnl` instruction of §10.4.1.
 
-- if `PNL_pos_tot == 0`, `y = x`
+On an eligible touched state, define `x = ReleasedPos_i`. If `x == 0`, do nothing.
 
-- else `y = wide_mul_div_floor_u128(x, h_num, h_den)`
+Compute `y` using the pre-conversion haircut ratio from §3:
+
+- if `PNL_matured_pos_tot == 0`, `y = x`
+- else `y = mul_div_floor_u128(x, h_num, h_den)`
 
 Apply:
 
-- `new_PNL = checked_sub_i128(PNL_i, x as i128)`
+1. `consume_released_pnl(i, x)`
+2. `set_capital(i, checked_add_u128(C_i, y))`
+3. if `R_i == 0`:
+   - `w_slope_i = 0`
+   - `w_start_i = current_slot`
+4. else leave the existing warmup schedule unchanged
 
-- `set_pnl(i, new_PNL)`
+Profit conversion MUST NOT reduce `R_i`. Any still-reserved warmup balance remains reserved and continues to mature only through §6.
 
-- `set_capital(i, checked_add_u128(C_i, y))`
+### 7.5 Fee-debt sweep
 
-Then handle the warmup schedule as follows:
+After any operation that increases `C_i`, the engine MUST pay down fee debt as soon as that newly available capital is no longer senior-encumbered by all higher-seniority trading losses already attached to the account's locally authoritative state.
 
-- if `T == 0`, set `w_start_i = current_slot` and `w_slope_i = 0` if `AvailGross_i == 0` else `AvailGross_i`
+This means:
 
-- else if `AvailGross_i == 0`, set `w_slope_i = 0` and `w_start_i = current_slot`
+- sweep MUST occur immediately after profit conversion, because the conversion created new capital and the touched account's current-state trading losses have already been settled
+- sweep MUST occur in `deposit` only after `settle_losses_from_principal`, and only when `basis_pos_q_i == 0`
+- a pure `deposit` into an account with `basis_pos_q_i != 0` MUST defer fee-debt sweep until a later full current-state touch, because unresolved A/K side effects are still senior to protocol fee collection from that capital
+- sweep MUST NOT be deferred across instructions once capital is both present and no longer senior-encumbered
 
-- else:
-  - set `w_start_i = current_slot`
-  - preserve the existing `w_slope_i`
-
-### 7.5 Fee-debt sweep after capital increase
-
-After any operation that increases `C_i`, the enclosing routine MUST sweep fee debt as soon as that newly available capital is no longer senior-encumbered by already-realized trading losses on the same local state.
-
-Normative ordering:
-
-- if the enclosing routine already knows current-state realized trading losses that are payable from principal, those losses are senior and MUST be settled first via §7.1 (and, for allowed true-flat capital-only paths, §7.3) before this sweep consumes the same capital
-
-- once that senior-loss ordering is satisfied, the fee-debt sweep MUST occur immediately in the same routine before any later withdrawal, margin check, or protocol-loss routing that relies on the remaining capital
-
-The sweep itself is:
+The sweep is:
 
 1. `debt = fee_debt_u128_checked(fee_credits_i)`
-
 2. `pay = min(debt, C_i)`
-
-3. apply:
+3. if `pay > 0`:
    - `set_capital(i, C_i - pay)`
    - `fee_credits_i = checked_add_i128(fee_credits_i, pay as i128)`
    - `I = checked_add_u128(I, pay)`
 
-Explicit fee debt is senior to future withdrawals and margin availability but is not itself realized PnL.
+---
 
 ## 8. Fees
 
 ### 8.1 Trading fees
 
-Trading fees are explicit transfers to insurance and MUST NOT be socialized through `h`.
+Trading fees are explicit transfers to insurance and MUST NOT be socialized through `h` or `D`.
 
-Canonical symmetric fee schedule:
+Define:
 
 - `fee = mul_div_ceil_u128(trade_notional, trading_fee_bps, 10_000)`
 
-- if `trading_fee_bps > 0` and `trade_notional > 0`, then `fee >= 1`
+with `0 <= trading_fee_bps <= MAX_TRADING_FEE_BPS`.
+
+Rules:
 
 - if `trading_fee_bps == 0` or `trade_notional == 0`, then `fee = 0`
+- if `trading_fee_bps > 0` and `trade_notional > 0`, then `fee >= 1`
 
-The fee MUST be charged using `charge_fee_to_insurance(i, fee)` from §4.10.
+The fee MUST be charged using `charge_fee_to_insurance(i, fee)`.
 
-If an implementation supports asymmetric maker / taker or per-account fee schedules, it MUST instantiate them as explicit bounded `fee_i` values per charged account, and each `fee_i` MUST still be routed through `charge_fee_to_insurance`.
+Deployment guidance: because the strict risk-reducing trade exemption of §10.5 compares actual post-fee maintenance buffers, deployments that want voluntary partial de-risking to remain broadly usable SHOULD configure `trading_fee_bps` materially below `maintenance_bps`.
 
-### 8.2 Maintenance fees
+### 8.2 Account-local maintenance fees
 
-Maintenance fees MAY be charged and MAY create negative `fee_credits_i`.
+Recurring account-local maintenance fees MAY be disabled.
 
-Any maintenance-fee design MUST preserve Protocol-fee neutrality (§0.12):
+If enabled, they MUST satisfy all of the following:
 
-- it MUST realize value only into `I` and/or `fee_credits_i`
+1. They MUST be realized only into `I` and/or `fee_credits_i`.
+2. They MUST NOT mutate `PNL_i`, `PNL_pos_tot`, `PNL_matured_pos_tot`, or any `K_side`.
+3. Position-linear recurring fees MUST use a lazy accumulator, event segmentation, or a formally equivalent method that is exact for the held position over time.
+4. Any one-step realization that would exceed `MAX_PROTOCOL_FEE_ABS` or the permitted one-step `fee_credits_i` write range MUST be split into bounded internal chunks.
+5. Any maintenance-fee routine that uses `last_fee_slot_i` MUST set `last_fee_slot_i = current_slot` when it finishes interval accounting for that touch.
 
-- it MUST NOT realize maintenance fees by mutating `K_side`, `PNL_i`, or `PNL_pos_tot`
-
-- it MUST NOT socialize maintenance fees through counterparty PnL, ADL quote deficit `D`, or haircut `h`
-
-If a recurring maintenance fee depends on the position held over an interval, the implementation MUST represent it through a dedicated lazy fee accumulator or a formally equivalent event-segmented method that measures held position over time without relying on stale stored basis quantities. Realization on touch MUST write only to `I` and/or `fee_credits_i`; it MUST NOT reuse the profit/loss `K_side` indices.
-
-If the implementation charges account-local recurring maintenance fees by elapsed time, then on each touch of account `i` it MUST:
-
-1. compute the fee only over the interval `[last_fee_slot_i, current_slot]`
-
-2. if an immediate explicit fee amount is charged in this touch, route it through `charge_fee_to_insurance`; if the exact immediate fee over the full interval would exceed `MAX_PROTOCOL_FEE_ABS`, split the interval or realization into bounded internal chunks before charging
-
-3. if the fee model is debt-first, realize the debt only through checked `fee_credits_i` writes; if the exact debt increment over the full interval would exceed the permitted one-step write bound, split the interval or realization into bounded internal chunks
-
-4. update `last_fee_slot_i = current_slot`
-
-### 8.3 Fee debt as margin liability
-
-`FeeDebt_i = fee_debt_u128_checked(fee_credits_i)`:
-
-- MUST reduce `Eq_net_i`
-
-- MUST be swept whenever principal becomes available
-
-- MUST NOT directly change `Residual` or `PNL_pos_tot`
-
-### 8.4 Liquidation fees
-
-Liquidation fees MUST be charged during non-bankruptcy or bankruptcy synthetic liquidation.
+### 8.3 Liquidation fees
 
 The protocol MUST define:
 
-- `liquidation_fee_bps`
-
-- `liquidation_fee_cap`
-
-- `min_liquidation_abs`
+- `liquidation_fee_bps` with `0 <= liquidation_fee_bps <= MAX_LIQUIDATION_FEE_BPS`
+- `liquidation_fee_cap` with `0 <= liquidation_fee_cap <= MAX_PROTOCOL_FEE_ABS`
+- `min_liquidation_abs` with `0 <= min_liquidation_abs <= liquidation_fee_cap`
 
 For a liquidation that closes `q_close_q` at `oracle_price`, define:
 
 - if `q_close_q == 0`, then `liq_fee = 0`
-
 - else:
   - `closed_notional = mul_div_floor_u128(q_close_q, oracle_price, POS_SCALE)`
   - `liq_fee_raw = mul_div_ceil_u128(closed_notional, liquidation_fee_bps, 10_000)`
   - `liq_fee = min(max(liq_fee_raw, min_liquidation_abs), liquidation_fee_cap)`
 
-The liquidation fee MUST be charged using `charge_fee_to_insurance(i, liq_fee)`.
+The short-circuit is on `q_close_q`, not `closed_notional`. Therefore the minimum fee floor applies even when `closed_notional` floors to zero.
+
+### 8.4 Fee debt as margin liability
+
+`FeeDebt_i = fee_debt_u128_checked(fee_credits_i)`:
+
+- MUST reduce both `Eq_net_i` and `Eq_init_net_i`
+- MUST be swept whenever principal becomes available and is no longer senior-encumbered by already-realized trading losses on the same local state
+- MUST NOT directly change `Residual`, `PNL_pos_tot`, or `PNL_matured_pos_tot`
+
+---
 
 ## 9. Margin checks and liquidation
 
 ### 9.1 Margin requirements
 
-On current touched state, define:
+After `touch_account_full(i, oracle_price, now_slot)`, define:
 
 - `Notional_i = mul_div_floor_u128(abs(effective_pos_q(i)), oracle_price, POS_SCALE)`
-
-- `MM_req = mul_div_floor_u128(Notional_i, maintenance_bps, 10_000)`
-
-- `IM_req = mul_div_floor_u128(Notional_i, initial_bps, 10_000)`
+- `MM_req_i = mul_div_floor_u128(Notional_i, maintenance_bps, 10_000)`
+- `IM_req_i = mul_div_floor_u128(Notional_i, initial_bps, 10_000)`
 
 Healthy conditions:
 
-- maintenance healthy if `Eq_net_i > MM_req as i128`
+- maintenance healthy if `Eq_net_i > MM_req_i as i128`
+- initial-margin healthy if `Eq_init_net_i >= IM_req_i as i128`
 
-- initial-margin healthy if `Eq_net_i >= IM_req as i128`
+### 9.2 Risk-increasing and strict risk-reducing trades
 
-### 9.2 Risk-increasing definition
-
-A trade is risk-increasing when either:
+A trade for account `i` is **risk-increasing** when either:
 
 1. `abs(new_eff_pos_q_i) > abs(old_eff_pos_q_i)`, or
+2. the position sign flips across zero, or
+3. `old_eff_pos_q_i == 0` and `new_eff_pos_q_i != 0`
 
-2. the position sign flips across zero.
+A trade is **strictly risk-reducing** when:
 
-Flat to nonzero is also risk-increasing.
+- `old_eff_pos_q_i != 0`
+- `new_eff_pos_q_i != 0`
+- `sign(new_eff_pos_q_i) == sign(old_eff_pos_q_i)`
+- `abs(new_eff_pos_q_i) < abs(old_eff_pos_q_i)`
 
 ### 9.3 Liquidation eligibility
 
 An account is liquidatable when after a full `touch_account_full`:
 
 - `effective_pos_q(i) != 0`, and
+- `Eq_net_i <= MM_req_i as i128`
 
-- `Eq_net_i <= MM_req as i128`.
+### 9.4 Partial liquidation
 
-### 9.4 Partial / non-bankruptcy liquidation
+A liquidation MAY be partial only if it closes a strictly positive quantity smaller than the full remaining effective position:
 
-This section defines a successful **non-bankruptcy** synthetic liquidation. It may reduce the position and leave it nonzero, or it may close the position fully to flat, but it MUST NOT leave uncovered negative realized PnL attached to a flat account.
+- `0 < q_close_q < abs(old_eff_pos_q_i)`
 
-Preconditions:
+A successful partial liquidation MUST:
 
-- the enclosing `liquidate(...)` top-level instruction has already called `touch_account_full(i, oracle_price, now_slot)`
-
-- no additional `touch_account_full(i, ...)` may be performed inside this local routine
-
-- let `old_eff_pos_q_i = effective_pos_q(i)`, require `old_eff_pos_q_i != 0`
-
-- let `liq_side = side(old_eff_pos_q_i)`
-
-A successful non-bankruptcy liquidation MUST:
-
-1. choose a quantity `q_close_q` such that `0 < q_close_q <= abs(old_eff_pos_q_i)`
-
-2. because the close is synthetic, execute exactly at `oracle_price` with zero execution-price slippage
-
-3. compute `new_eff_pos_q_i = old_eff_pos_q_i - sign(old_eff_pos_q_i) * q_close_q`
-
-4. apply the resulting effective position using `attach_effective_position(i, new_eff_pos_q_i)`
-
-5. `OI_eff_liq_side` MUST NOT be decremented anywhere except through `enqueue_adl`
-
-6. settle losses from principal via §7.1
-
-7. compute `liq_fee` per §8.4 on the quantity actually closed in this step and charge it using `charge_fee_to_insurance(i, liq_fee)`
-
-8. invoke `enqueue_adl(ctx, liq_side, q_close_q, 0)` to decrease global OI and socialize the quantity reduction with zero quote deficit
-
-9. if `effective_pos_q(i) == 0`, require `PNL_i >= 0` after the loss settlement of step 6
-
-10. if `ctx.pending_reset_long` or `ctx.pending_reset_short` became true in step 8, the liquidation MUST perform no further live-OI-dependent health logic in this instruction and MUST return control to the caller for §§5.7–5.8. This short-circuit MUST NOT waive step 9.
-
-11. if `effective_pos_q(i) != 0`, evaluate `Eq_net_i`, `MM_req`, and any relevant current-state haircut inputs using the **current post-step-8 state** and require maintenance healthy on that current post-step-8 state
-
-If a candidate partial liquidation would fail any of the above postconditions, the engine MUST NOT commit it as a successful partial liquidation; it MUST instead perform bankruptcy liquidation or reject according to the liquidation policy.
+1. use the current touched state
+2. determine `liq_side = side(old_eff_pos_q_i)`
+3. close `q_close_q` synthetically at `oracle_price` with zero execution-price slippage
+4. apply the resulting position using `attach_effective_position(i, new_eff_pos_q_i)`
+5. settle realized losses from principal via §7.1
+6. compute `liq_fee` per §8.3 on the quantity actually closed
+7. charge that fee using `charge_fee_to_insurance(i, liq_fee)`
+8. invoke `enqueue_adl(ctx, liq_side, q_close_q, 0)` to decrease global OI and socialize quantity reduction
+9. if either pending-reset flag becomes true in `ctx`, stop further live-OI-dependent checks and proceed directly to end-of-instruction reset handling
+10. otherwise enforce exact post-step current-state health:
+    - if the resulting effective position is nonzero, it MUST be maintenance healthy
+    - if the resulting effective position is zero, require `PNL_i >= 0` after the post-step loss settlement
 
 ### 9.5 Bankruptcy liquidation
 
-This section defines a local bankruptcy-liquidation routine. It assumes the enclosing top-level `liquidate(...)` instruction has already touched the account.
+If an already-touched liquidatable account cannot be restored by partial liquidation, the engine MUST be able to perform a bankruptcy liquidation.
 
-Preconditions:
+Bankruptcy liquidation is a local subroutine on the current touched state. It MUST NOT call `touch_account_full` again.
 
-- the enclosing `liquidate(...)` top-level instruction has already called `touch_account_full(i, oracle_price, now_slot)`
+It MUST:
 
-- no additional `touch_account_full(i, ...)` may be performed inside this local routine
-
-The engine MUST be able to perform a bankruptcy liquidation:
-
-1. let `old_eff_pos_q_i = effective_pos_q(i)`, require `old_eff_pos_q_i != 0`, and let `liq_side = side(old_eff_pos_q_i)`
-
-2. set `q_close_q = abs(old_eff_pos_q_i)`; bankruptcy liquidation closes the account's full remaining effective position
-
-3. because the close is synthetic, it MUST execute exactly at `oracle_price` with zero execution-price slippage
-
-4. use `attach_effective_position(i, 0)`
-
-5. `OI_eff_liq_side` MUST NOT be decremented anywhere except through `enqueue_adl`
-
-6. settle losses from principal (§7.1)
-
-7. calculate `liq_fee` per §8.4 using the quantity actually closed and charge it using `charge_fee_to_insurance(i, liq_fee)`
-
-8. determine the uncovered bankruptcy deficit `D`:
-   - if `PNL_i < 0`, let `D = (-PNL_i) as u128`
-   - else let `D = 0`
-
-9. invoke `enqueue_adl(ctx, liq_side, q_close_q, D)`
-
-10. if `D > 0`, apply `set_pnl(i, 0)` after the deficit has been routed
-
-Unpaid liquidation fee shortfall remains local `fee_credits_i` debt. It MUST NOT be added to `D`.
+1. use the current touched state
+2. let `old_eff_pos_q_i = effective_pos_q(i)` and require `old_eff_pos_q_i != 0`
+3. set `q_close_q = abs(old_eff_pos_q_i)`; bankruptcy liquidation MUST strictly close the full remaining effective position
+4. let `liq_side = side(old_eff_pos_q_i)`
+5. because the close is synthetic, it MUST execute exactly at `oracle_price` with zero execution-price slippage
+6. `attach_effective_position(i, 0)`
+7. `OI_eff_liq_side` MUST NOT be decremented anywhere except through `enqueue_adl`
+8. `settle_losses_from_principal(i)`
+9. compute `liq_fee` per §8.3 and charge it via `charge_fee_to_insurance(i, liq_fee)`
+10. determine the uncovered bankruptcy deficit `D`:
+    - if `PNL_i < 0`, let `D = (-PNL_i) as u128`
+    - else `D = 0`
+11. if `q_close_q > 0` or `D > 0`, invoke `enqueue_adl(ctx, liq_side, q_close_q, D)`
+12. if `D > 0`, `set_pnl(i, 0)`
 
 ### 9.6 Side-mode gating
 
@@ -1548,566 +1229,529 @@ Before any top-level instruction rejects an OI-increasing operation because a si
 
 Any operation that would increase net side OI on a side whose mode is `DrainOnly` or `ResetPending` MUST be rejected.
 
+---
+
 ## 10. External operations
-
-### 10.0 Account materialization and missing-account handling
-
-The engine MUST distinguish between **materialized** accounts and **missing** accounts.
-
-A missing account MUST NOT be auto-materialized merely because an instruction references its identifier.
-
-Materialization rules:
-
-- A missing account MAY be materialized by `deposit(i, amount, now_slot)` only if `amount > 0`, using the canonical initialization of §2.1.1 with `slot_anchor = now_slot`, and only if that materialization is economically metered by the host chain's native account-allocation / storage-rent model or an equivalent explicit non-refundable creation fee.
-
-- An implementation MAY expose a separate explicit account-creation / registration path. If it does, that path MUST use the canonical initialization of §2.1.1, MUST enforce `materialized_account_count <= MAX_MATERIALIZED_ACCOUNTS`, and MUST be economically metered by the host chain's native account-allocation / storage-rent model or an equivalent explicit non-refundable creation fee. Free unmetered materialization is forbidden.
-
-Missing-account rules for the standard external instructions in this spec:
-
-- `settle_account`, `withdraw`, `execute_trade`, and `liquidate` MUST fail conservatively if any referenced account is missing.
-
-- `keeper_crank` MUST NOT materialize missing work-plan entries. It MUST skip them or fail conservatively, but it MUST NOT create new accounts as part of keeper maintenance.
-
-- Zero-value or no-op instructions MUST NOT create a missing account.
-
-`touch_account_full(i, ...)` is a local canonical settle subroutine. It assumes account `i` is already materialized.
-
-Because `MAX_MATERIALIZED_ACCOUNTS` is finite, implementations MUST support empty-account reclamation per §2.1.2.
 
 ### 10.1 `touch_account_full(i, oracle_price, now_slot)`
 
-`touch_account_full` is the canonical **local** settle subroutine. It is not itself a complete top-level reset lifecycle.
+Canonical settle routine for an existing materialized account. It MUST perform, in order:
 
-Preconditions:
+1. require account `i` is materialized
+2. require trusted `now_slot >= current_slot`
+3. require trusted `now_slot >= slot_last`
+4. require validated `0 < oracle_price <= MAX_ORACLE_PRICE`
+5. set `current_slot = now_slot`
+6. call `accrue_market_to(now_slot, oracle_price)`
+7. call `advance_profit_warmup(i)`
+8. call `settle_side_effects(i)`
+9. call `settle_losses_from_principal(i)`
+10. if `effective_pos_q(i) == 0` and `PNL_i < 0`, resolve uncovered flat loss via §7.3
+11. realize any configured account-local maintenance fee debt per §8.2 and set `last_fee_slot_i = current_slot` if interval accounting was performed
+12. if `basis_pos_q_i == 0`, convert matured released profits via §7.4
+13. sweep fee debt per §7.5
 
-- account `i` is already materialized
+`touch_account_full` MUST NOT itself begin a side reset.
 
-- require `now_slot >= current_slot`
+### 10.2 `settle_account(i, oracle_price, now_slot)`
 
-- require `now_slot >= slot_last`
-
-- require `0 < oracle_price <= MAX_ORACLE_PRICE`
-
-It MUST perform, in order:
-
-1. `current_slot = now_slot`
-
-2. `accrue_market_to(now_slot, oracle_price)`
-
-3. `old_avail = max(PNL_i, 0) - R_i`
-
-4. `old_warmable_i = WarmableGross_i` evaluated strictly before any profit-increasing state transition in this call
-
-5. `settle_side_effects(i)`
-
-6. `new_avail = max(PNL_i, 0) - R_i`
-
-7. if `new_avail > old_avail`:
-   - record `capital_before_restart = C_i`
-   - invoke the restart-on-new-profit rule (§6.5) passing `old_warmable_i`
-   - if `C_i > capital_before_restart`, immediately sweep fee debt (§7.5)
-
-8. settle losses from principal (§7.1)
-
-9. realize any configured maintenance-fee accrual under §8.2, and if such logic is time-based update `last_fee_slot_i = current_slot`
-
-10. if `effective_pos_q(i) == 0` and `PNL_i < 0`, resolve uncovered loss per §7.3
-
-11. convert warmable profits (§7.4)
-
-12. sweep fee debt (§7.5)
-
-This local settle subroutine MUST NOT itself begin a side reset and MUST NOT itself recompute `r_last`.
-
-
-### 10.1.1 `settle_account(i, oracle_price, now_slot)` — standalone top-level settle wrapper
-
-If an implementation exposes settlement as a standalone external instruction, it MUST expose this wrapper rather than exposing raw `touch_account_full` directly.
-
-Procedure:
-
-1. require account `i` is already materialized
-
-2. initialize fresh instruction context `ctx`
-
-3. `touch_account_full(i, oracle_price, now_slot)`
-
-4. `schedule_end_of_instruction_resets(ctx)`
-
-5. `finalize_end_of_instruction_resets(ctx)`
-
-6. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
-
-7. assert `OI_eff_long == OI_eff_short`
-
-### 10.2 `deposit(i, amount, now_slot)`
-
-`deposit` is a pure capital-transfer instruction. It MUST NOT implicitly call `touch_account_full` or otherwise mutate side state.
-
-Procedure:
-
-1. require `now_slot >= current_slot`
-
-2. require `now_slot >= slot_last`
-
-3. if account `i` is missing:
-   - require `amount > 0`
-   - materialize it using `slot_anchor = now_slot` per §10.0
-
-4. `current_slot = now_slot`
-
-5. require `checked_add_u128(V, amount) <= MAX_VAULT_TVL`
-
-6. `V += amount`
-
-7. `set_capital(i, checked_add_u128(C_i, amount))`
-
-8. settle losses from principal (§7.1)
-
-9. if `basis_pos_q_i == 0` and `PNL_i < 0`, resolve uncovered loss per §7.3
-
-10. immediately apply fee-debt sweep (§7.5)
-
-Because `deposit` cannot mutate OI, stored positions, stale-account counts, phantom-dust bounds, side modes, or any permitted funding-rate input, it MAY omit §§5.7–5.8 and MUST NOT recompute `r_last`.
-
-A zero-amount deposit to a missing account MUST fail conservatively and MUST NOT materialize state.
-
-### 10.3 `withdraw(i, amount, oracle_price, now_slot)`
-
-Before step 1, require account `i` is already materialized.
+Standalone settle wrapper for an existing account.
 
 Procedure:
 
 1. initialize fresh instruction context `ctx`
-
 2. `touch_account_full(i, oracle_price, now_slot)`
+3. `schedule_end_of_instruction_resets(ctx)`
+4. `finalize_end_of_instruction_resets(ctx)`
+5. if funding-rate inputs changed because of end-of-instruction reset handling, recompute `r_last` exactly once from the final post-reset state
 
-3. require `amount <= C_i`
+This wrapper MUST NOT materialize a missing account.
 
-4. if `effective_pos_q(i) != 0`, require post-withdraw `Eq_net_i` to satisfy initial margin  
-   **Normative clarification:** when evaluating post-withdraw `Eq_net_i`, the simulation MUST reflect both `C_i := C_i - amount` and `V := V - amount`, or equivalently use the unchanged pre-withdraw `Residual`; the simulation MUST NOT temporarily reduce `C_i` without also reducing `V`
+### 10.3 `deposit(i, amount, now_slot)`
 
-5. apply:
+`deposit` is a pure capital-transfer instruction. It MUST NOT call `accrue_market_to`, MUST NOT mutate side state, and MUST NOT auto-touch unrelated accounts.
+
+A pure deposit does **not** make unresolved A/K side effects locally authoritative. Therefore, for an account with `basis_pos_q_i != 0`, the deposit path MUST NOT treat the account as truly flat and MUST NOT sweep fee debt, because unresolved current-side trading losses remain senior until a later full current-state touch.
+
+Procedure:
+
+1. require trusted `now_slot >= current_slot`
+2. if account `i` is missing:
+   - require `amount >= MIN_INITIAL_DEPOSIT`
+   - `materialize_account(i, now_slot)`
+3. set `current_slot = now_slot`
+4. require `checked_add_u128(V, amount) <= MAX_VAULT_TVL`
+5. set `V = V + amount`
+6. `set_capital(i, checked_add_u128(C_i, amount))`
+7. `settle_losses_from_principal(i)`
+8. if `basis_pos_q_i == 0` and `PNL_i < 0`, resolve uncovered flat loss via §7.3
+9. if `basis_pos_q_i == 0`, sweep fee debt via §7.5
+
+Because `deposit` cannot mutate OI, stored positions, stale-account counts, phantom-dust bounds, or side modes, it MAY omit §§5.7 end-of-instruction reset handling.
+
+### 10.4 `withdraw(i, amount, oracle_price, now_slot)`
+
+The minimum live-balance dust floor applies to **all** withdrawals, not only truly flat ones. This is a finite-capacity liveness safeguard: a temporary dust position MUST NOT be able to bypass the floor and then return to a flat unreclaimable sub-`MIN_INITIAL_DEPOSIT` account.
+
+Procedure:
+
+1. require account `i` is materialized
+2. initialize fresh instruction context `ctx`
+3. `touch_account_full(i, oracle_price, now_slot)`
+4. require `amount <= C_i`
+5. require the post-withdraw capital `C_i - amount` is either `0` or `>= MIN_INITIAL_DEPOSIT`
+6. if `effective_pos_q(i) != 0`, require post-withdraw initial-margin health on the hypothetical post-withdraw state where:
+   - `C_i' = C_i - amount`
+   - `V' = V - amount`
+   - `Eq_init_net_i` is recomputed from that hypothetical state
+   - all other touched-state quantities are unchanged
+   - equivalently, because both `V` and `C_tot` decrease by the same `amount`, `Residual` and `h` are unchanged by the simulation
+7. apply:
    - `set_capital(i, C_i - amount)`
-   - `V -= amount`
+   - `V = V - amount`
+8. `schedule_end_of_instruction_resets(ctx)`
+9. `finalize_end_of_instruction_resets(ctx)`
+10. if funding-rate inputs changed because of end-of-instruction reset handling, recompute `r_last` exactly once from the final post-reset state
 
-6. `schedule_end_of_instruction_resets(ctx)`
+### 10.4.1 `convert_released_pnl(i, x_req, oracle_price, now_slot)`
 
-7. `finalize_end_of_instruction_resets(ctx)`
+Explicit voluntary conversion of matured released positive PnL for an account that still has an open position.
 
-8. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
+This instruction exists because ordinary `touch_account_full` auto-conversion is intentionally flat-only. It allows a user with an open position to realize matured profit into protected principal on current state, accept the resulting maintenance-equity change on their own terms, and immediately sweep any outstanding fee debt from the new capital.
 
-9. assert `OI_eff_long == OI_eff_short`
+Procedure:
 
-### 10.4 `execute_trade(a, b, oracle_price, now_slot, size_q, exec_price)`
+1. require account `i` is materialized
+2. initialize fresh instruction context `ctx`
+3. `touch_account_full(i, oracle_price, now_slot)`
+4. if `basis_pos_q_i == 0`:
+   - the ordinary touch flow has already auto-converted any released profit eligible on the now-flat state
+   - `schedule_end_of_instruction_resets(ctx)`
+   - `finalize_end_of_instruction_resets(ctx)`
+   - if funding-rate inputs changed because of end-of-instruction reset handling, recompute `r_last` exactly once from the final post-reset state
+   - return
+5. require `0 < x_req <= ReleasedPos_i`
+6. compute `y` using the same pre-conversion haircut rule as §7.4:
+   - if `PNL_matured_pos_tot == 0`, `y = x_req`
+   - else `y = mul_div_floor_u128(x_req, h_num, h_den)`
+7. `consume_released_pnl(i, x_req)`
+8. `set_capital(i, checked_add_u128(C_i, y))`
+9. sweep fee debt per §7.5
+10. require the current post-step-9 state is maintenance healthy if `effective_pos_q(i) != 0`
+11. `schedule_end_of_instruction_resets(ctx)`
+12. `finalize_end_of_instruction_resets(ctx)`
+13. if funding-rate inputs changed because of end-of-instruction reset handling, recompute `r_last` exactly once from the final post-reset state
+
+A failed post-conversion maintenance check MUST revert atomically. This instruction MUST NOT materialize a missing account.
+
+### 10.5 `execute_trade(a, b, oracle_price, now_slot, size_q, exec_price)`
 
 `size_q > 0` means account `a` buys base from account `b`.
 
-Before step 1, require both accounts `a` and `b` are already materialized.
-
 Procedure:
 
-1. initialize fresh instruction context `ctx`
-
+1. require both accounts are materialized
 2. require `a != b`
+3. require trusted `now_slot >= current_slot`
+4. require trusted `now_slot >= slot_last`
+5. require validated `0 < oracle_price <= MAX_ORACLE_PRICE`
+6. require validated `0 < exec_price <= MAX_ORACLE_PRICE`
+7. require `0 < size_q <= MAX_TRADE_SIZE_Q`
+8. compute `trade_notional = mul_div_floor_u128(size_q, exec_price, POS_SCALE)`
+9. require `trade_notional <= MAX_ACCOUNT_NOTIONAL`
+10. initialize fresh instruction context `ctx`
+11. `touch_account_full(a, oracle_price, now_slot)`
+12. `touch_account_full(b, oracle_price, now_slot)`
+13. let `old_eff_pos_q_a = effective_pos_q(a)` and `old_eff_pos_q_b = effective_pos_q(b)`
+14. let `MM_req_pre_a`, `MM_req_pre_b` be maintenance requirement on the post-touch pre-trade state
+15. let `margin_buffer_pre_a = Eq_maint_raw_a - (MM_req_pre_a as wide_signed)` evaluated in the exact widened signed domain of §3.4
+16. let `margin_buffer_pre_b = Eq_maint_raw_b - (MM_req_pre_b as wide_signed)` evaluated in the exact widened signed domain of §3.4
+17. invoke `maybe_finalize_ready_reset_sides_before_oi_increase()`
+18. reject if the trade would increase net side OI on any side whose mode is `DrainOnly` or `ResetPending`
+19. define:
+   - `new_eff_pos_q_a = checked_add_i128(old_eff_pos_q_a, size_q as i128)`
+   - `new_eff_pos_q_b = checked_sub_i128(old_eff_pos_q_b, size_q as i128)`
+20. require `abs(new_eff_pos_q_a) <= MAX_POSITION_ABS_Q` and `abs(new_eff_pos_q_b) <= MAX_POSITION_ABS_Q`
+21. apply immediate execution-slippage alignment PnL before fees:
+   - `trade_pnl_num = checked_mul_i128(size_q as i128, (oracle_price as i128) - (exec_price as i128))`
+   - `trade_pnl_a = floor_div_signed_conservative(trade_pnl_num, POS_SCALE)`
+   - `trade_pnl_b = -trade_pnl_a`
+   - record `old_R_a = R_a` and `old_R_b = R_b`
+   - `set_pnl(a, checked_add_i128(PNL_a, trade_pnl_a))`
+   - `set_pnl(b, checked_add_i128(PNL_b, trade_pnl_b))`
+   - if `R_a > old_R_a`, invoke `restart_warmup_after_reserve_increase(a)`
+   - if `R_b > old_R_b`, invoke `restart_warmup_after_reserve_increase(b)`
+22. apply the resulting effective positions using `attach_effective_position(a, new_eff_pos_q_a)` and `attach_effective_position(b, new_eff_pos_q_b)`
+23. update `OI_eff_long` / `OI_eff_short` atomically from the before/after effective positions and require each side to remain `<= MAX_OI_SIDE_Q`
+24. settle post-trade losses from principal for both accounts via §7.1
+25. if `new_eff_pos_q_a == 0`, require `PNL_a >= 0` after step 24
+26. if `new_eff_pos_q_b == 0`, require `PNL_b >= 0` after step 24
+27. compute `fee = mul_div_ceil_u128(trade_notional, trading_fee_bps, 10_000)`
+28. charge explicit trading fees using `charge_fee_to_insurance(a, fee)` and `charge_fee_to_insurance(b, fee)`
+29. enforce post-trade margin for each account using the current post-step-28 state:
+   - if the resulting effective position is zero, the flat-account guard from steps 25–26 already applies
+   - else if the trade is risk-increasing for that account, require initial-margin healthy using `Eq_init_net_i`
+   - else if the account is maintenance healthy using `Eq_net_i`, allow
+   - else if the trade is strictly risk-reducing for that account, allow only if the post-trade raw maintenance buffer `(Eq_maint_raw_i - MM_req_i)` computed in the exact widened signed domain of §3.4 is strictly greater than the corresponding exact widened pre-trade raw maintenance buffer recorded in steps 15–16
+   - else reject
 
-3. require `size_q > 0`
+This strict risk-reducing comparison is intentionally performed on the actual post-step-28 state. Trading fees are immediate liabilities; therefore a trade whose fee cost outweighs its maintenance relief is not maintenance-improving and MAY be rejected even when absolute exposure shrinks.
+30. `schedule_end_of_instruction_resets(ctx)`
+31. `finalize_end_of_instruction_resets(ctx)`
+32. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
+33. assert `OI_eff_long == OI_eff_short`
 
-4. require `size_q <= MAX_TRADE_SIZE_Q`
+### 10.6 `liquidate(i, oracle_price, now_slot, policy...)`
 
-5. require `0 < exec_price <= MAX_ORACLE_PRICE`
+Procedure:
 
-6. compute `trade_notional = mul_div_floor_u128(size_q, exec_price, POS_SCALE)` using checked arithmetic and require `trade_notional <= MAX_ACCOUNT_NOTIONAL`
+1. require account `i` is materialized
+2. initialize fresh instruction context `ctx`
+3. `touch_account_full(i, oracle_price, now_slot)`
+4. require liquidation eligibility from §9.3
+5. execute the partial- or bankruptcy-liquidation subroutine on the already-touched current state per §§9.4–9.5, passing `ctx` through any `enqueue_adl` call
+6. if any remaining nonzero position exists after liquidation, it MUST already have been reattached via `attach_effective_position`
+7. `schedule_end_of_instruction_resets(ctx)`
+8. `finalize_end_of_instruction_resets(ctx)`
+9. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
+10. assert `OI_eff_long == OI_eff_short`
 
-7. `touch_account_full(a, oracle_price, now_slot)`
+### 10.7 `reclaim_empty_account(i)`
 
-8. `touch_account_full(b, oracle_price, now_slot)`
+Permissionless dead-account recycling wrapper.
 
-9. let `old_eff_pos_q_a = effective_pos_q(a)` and `old_eff_pos_q_b = effective_pos_q(b)`
+Procedure:
 
-10. record post-touch pre-trade warmup anchors for each account:
-   - `old_avail_a = max(PNL_a, 0) - R_a`
-   - `old_avail_b = max(PNL_b, 0) - R_b`
-   - `old_warmable_a = WarmableGross_a`
-   - `old_warmable_b = WarmableGross_b`
+1. require account `i` is materialized
+2. require all preconditions of §2.6 hold on the current state
+3. execute the reclamation effects of §2.6
 
-11. invoke `maybe_finalize_ready_reset_sides_before_oi_increase()`
+`reclaim_empty_account` MUST NOT call `accrue_market_to`, MUST NOT mutate side state, and MUST NOT materialize any account.
 
-12. define resulting effective positions using checked signed arithmetic:
-    - `new_eff_pos_q_a = checked_add_i128(old_eff_pos_q_a, size_q as i128)`
-    - `new_eff_pos_q_b = checked_sub_i128(old_eff_pos_q_b, size_q as i128)`
+### 10.8 `keeper_crank(now_slot, oracle_price, ordered_candidates[], max_revalidations)`
 
-13. require `abs(new_eff_pos_q_a) <= MAX_POSITION_ABS_Q` and `abs(new_eff_pos_q_b) <= MAX_POSITION_ABS_Q`
-
-14. reject if the trade would increase net side OI on any side whose mode is `DrainOnly` or `ResetPending`
-
-15. apply immediate execution-slippage alignment PnL before fees:
-    - `trade_pnl_a_num = (size_q as i128) * ((oracle_price as i128) - (exec_price as i128))`, using checked `i128` arithmetic
-    - `trade_pnl_a = floor_div_signed_conservative(trade_pnl_a_num, POS_SCALE)`
-    - `trade_pnl_b = checked_neg_i128(trade_pnl_a)`
-    - `set_pnl(a, checked_add_i128(PNL_a, trade_pnl_a))`
-    - `set_pnl(b, checked_add_i128(PNL_b, trade_pnl_b))`
-
-16. apply the resulting effective positions using `attach_effective_position(a, new_eff_pos_q_a)` and `attach_effective_position(b, new_eff_pos_q_b)`
-
-17. update `OI_eff_long` / `OI_eff_short` atomically from old versus new per-account long / short contributions:
-    - `long_contrib(pos) = max(pos, 0) as u128`
-    - `short_contrib(pos) = max(-pos, 0) as u128`
-    - subtract old contributions for `a` and `b` with checked arithmetic
-    - add new contributions for `a` and `b` with checked arithmetic
-    - require each side to remain `<= MAX_OI_SIDE_Q`
-
-18. settle post-trade losses from principal for both accounts via §7.1
-
-19. charge explicit trading fees per §8.1 for each charged account using the precomputed `trade_notional`
-
-20. for any account whose `AvailGross_i` increased relative to its post-touch pre-trade state, invoke the restart-on-new-profit rule (§6.5) using the corresponding `old_warmable_i`
-
-21. any fee-debt sweep required by §6.5 MUST occur before the next step
-
-22. enforce post-trade margin using the current post-step-21 state:
-    - if the resulting effective position is nonzero, always require maintenance
-    - if risk-increasing, also require initial margin
-    - if the resulting effective position is zero, require `PNL_i >= 0` after the post-trade loss settlement of step 18; an organic close MUST NOT leave uncovered negative realized-PnL obligations
-
-23. `schedule_end_of_instruction_resets(ctx)`
-
-24. `finalize_end_of_instruction_resets(ctx)`
-
-25. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
-
-26. assert `OI_eff_long == OI_eff_short`
-
-### 10.5 `liquidate(i, oracle_price, now_slot, ...)`
-
-Before step 1, require account `i` is already materialized.
+`keeper_crank` is the minimal on-chain permissionless shortlist processor. Candidate discovery, ranking, deduplication, and sequential simulation MAY be performed entirely off chain. `ordered_candidates[]` is an untrusted keeper-supplied ordered list of existing account identifiers and MAY include optional liquidation-policy hints. The on-chain program MUST treat every candidate, every order choice, and every hint as advisory only.
 
 Procedure:
 
 1. initialize fresh instruction context `ctx`
+2. require trusted `now_slot >= current_slot`
+3. require trusted `now_slot >= slot_last`
+4. require validated `0 < oracle_price <= MAX_ORACLE_PRICE`
+5. call `accrue_market_to(now_slot, oracle_price)` exactly once at the start
+6. set `current_slot = now_slot`
+7. let `attempts = 0`
+8. for each candidate in keeper-supplied order:
+   - if `attempts == max_revalidations`, break
+   - if `ctx.pending_reset_long` or `ctx.pending_reset_short`, break
+   - if candidate account is missing, continue
+   - increment `attempts` by exactly `1`
+   - perform one exact current-state revalidation attempt on that account by executing the same local state transition as `touch_account_full` on the already-accrued instruction state, namely the logic of §10.1 steps 7–13 in the same order; this local keeper helper MUST NOT call `accrue_market_to` again
+   - if the account is liquidatable after that exact current-state touch, the keeper MAY execute liquidation on the already-touched state using the same already-touched local liquidation execution as §§9.4–9.5 and §10.6 steps 4–6; any optional liquidation-policy hint is advisory only and MUST be ignored unless it passes the same current-state validity checks as the normal `liquidate` entrypoint; the keeper path MUST reuse `ctx`, MUST NOT repeat the touch, MUST NOT invoke end-of-instruction reset handling inside the loop, and MUST NOT nest a separate top-level instruction
+   - if liquidation or the exact touch schedules a pending reset, break
+9. `schedule_end_of_instruction_resets(ctx)`
+10. `finalize_end_of_instruction_resets(ctx)`
+11. if funding-rate inputs changed because of end-of-instruction effects, recompute `r_last` exactly once from the final post-reset state
+12. assert `OI_eff_long == OI_eff_short`
 
-2. `touch_account_full(i, oracle_price, now_slot)`
+Rules:
 
-3. require liquidation eligibility (§9.3)
+- missing accounts MUST NOT be materialized
+- `max_revalidations` measures normal exact current-state revalidation attempts on materialized accounts; missing-account skips do not count
+- the engine MUST process candidates in keeper-supplied order except for the mandatory stop-on-pending-reset rule
+- the engine MUST NOT impose any on-chain liquidation-first ordering across keeper-supplied candidates
+- a candidate that proves safe or needs only cleanup after exact current-state touch still counts against `max_revalidations`
+- a fatal conservative failure or invariant violation encountered during exact touch or liquidation remains a top-level instruction failure and MUST revert atomically; `max_revalidations` is not a sandbox against corruption
 
-4. execute either:
-   - a successful partial / non-bankruptcy liquidation per §9.4, or
-   - a bankruptcy liquidation per §9.5,
-   passing `ctx` through any `enqueue_adl` call
+---
 
-5. if any remaining nonzero position exists after liquidation, it MUST already have been reattached via `attach_effective_position`
+## 11. Permissionless off-chain shortlist keeper mode
 
-6. `schedule_end_of_instruction_resets(ctx)`
+This section is the sole normative specification for the optimized keeper path. It supersedes the earlier integrated on-chain barrier-wave mode.
 
-7. `finalize_end_of_instruction_resets(ctx)`
+### 11.1 Design intent
 
-8. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
+The engine does **not** require any on-chain phase-1 search, barrier classifier, or no-false-negative scan proof.
 
-9. assert `OI_eff_long == OI_eff_short`
+Instead:
 
-### 10.6 `keeper_crank(oracle_price, now_slot, work_plan...)`
+1. Candidate discovery MAY be performed entirely off chain.
+2. Candidate ranking and sequential path simulation MAY be performed entirely off chain.
+3. On-chain safety derives only from exact current-state revalidation before any liquidation write.
+4. Because `settle_account`, `liquidate`, `reclaim_empty_account`, and `keeper_crank` are all permissionless, reset progress and dead-account recycling do not depend on any mandatory on-chain scan order.
+5. The protocol MUST NOT require that a keeper discover *all* currently liquidatable accounts before it may submit and process a useful subset.
 
-A keeper crank is a top-level external instruction and MUST use the same deferred reset lifecycle as other top-level instructions.
+This design minimizes on-chain compute by moving every non-consensus search task off chain while keeping all consensus-critical economics and risk checks on chain.
 
-Keeper current-state rule:
+### 11.2 Shortlist trust model
 
-- Any keeper action that depends on current account state — including liquidation eligibility, any per-account warmup-conversion decision, any per-account fee-debt extraction, or any other account-local cleanup that relies on current PnL / margin / warmup / fee state — MUST first bring that account to current state with `touch_account_full(i, oracle_price, now_slot)` earlier in the same instruction, unless the action is explicitly defined safe on a stored-flat account with `basis_pos_q_i == 0` and no pending side effects.
+`ordered_candidates[]` in §10.8 is keeper-supplied and untrusted.
 
-- A keeper MUST NOT perform standalone warmup conversion, standalone fee-debt sweep, or liquidation-health decisions on an untouched open-position or stale-basis account.
+Therefore:
 
-Procedure:
+- shortlist contents MAY be stale, incomplete, duplicated, adversarially ordered, or generated from approximate heuristics
+- optional liquidation-policy hints MAY be stale or adversarial
+- the engine MUST NOT trust any off-chain preview, health classification, or estimated deficit value for consensus
+- the engine MUST revalidate the candidate from current on-chain state immediately before any liquidation write
+- an optional liquidation-policy hint that fails current-state validity checks MUST be ignored rather than trusted
 
-1. initialize fresh instruction context `ctx`
+A stale or adversarial shortlist MAY waste that instruction's own `max_revalidations` budget or the submitting keeper's own call opportunity, but it MUST NOT permit an incorrect liquidation.
 
-2. `accrue_market_to(now_slot, oracle_price)`
+### 11.3 Exact current-state revalidation attempts
 
-3. a keeper MAY:
-   - skip missing referenced accounts, but MUST NOT materialize them as part of keeper maintenance
-   - call `touch_account_full(i, oracle_price, now_slot)` on a bounded window of already materialized accounts
-   - liquidate unhealthy accounts only after those accounts have been touched to current state in this instruction, passing `ctx` through any `enqueue_adl` call
-   - perform additional idempotent keeper-only cleanup only on accounts already touched to current state in this instruction
-   - prioritize accounts on a `DrainOnly` or `ResetPending` side
-   - explicitly call `finalize_side_reset(side)` when its preconditions already hold, although this is not required because step 5 auto-finalizes eligible `ResetPending` sides
-   - if, during this work, either `ctx.pending_reset_long` or `ctx.pending_reset_short` becomes true, the keeper MUST stop processing further accounts in that instruction and proceed directly to steps 4–6
+Let `max_revalidations` be the keeper's per-instruction budget measured in **exact current-state revalidation attempts**.
 
-4. `schedule_end_of_instruction_resets(ctx)`
+An exact current-state revalidation attempt begins when `keeper_crank` invokes the local exact-touch path on one materialized account after the single instruction-level `accrue_market_to(now_slot, oracle_price)` and `current_slot = now_slot` anchor.
 
-5. `finalize_end_of_instruction_resets(ctx)`
+It counts against `max_revalidations` once that materialized-account revalidation reaches a normal per-candidate outcome, including when the account:
 
-6. if funding-rate inputs changed, recompute `r_last` exactly once from the final post-reset state
+- is liquidatable and is liquidated
+- is touched and only cleanup happens
+- is touched and proves safe
+- is touched, remains liquidatable, but no valid current-state liquidation action is applied for that attempt
 
-7. assert `OI_eff_long == OI_eff_short`
+It does **not** count for a pure missing-account skip.
 
-The crank MUST maintain a cursor or equivalent progress mechanism so repeated calls eventually cover active accounts supplied to it.
+A fatal conservative failure or invariant violation encountered after the exact-touch path begins is **not** a counted skip. It is a top-level instruction failure and reverts atomically under the execution model of §0.
 
-## 11. Required test properties (minimum)
+The engine MAY expose richer off-chain indexing or preview infrastructure, but such infrastructure is non-consensus and out of scope for this normative section.
+
+### 11.4 Keeper local exact-touch equivalence
+
+Inside `keeper_crank`, the per-candidate local exact-touch helper MUST be economically equivalent to `touch_account_full(i, oracle_price, now_slot)` on a state that has already been globally accrued once to `(now_slot, oracle_price)` at the start of the instruction.
+
+Concretely, for each materialized candidate account it MUST execute the same local logic and in the same order as §10.1 steps 7–13:
+
+1. `advance_profit_warmup(i)`
+2. `settle_side_effects(i)`
+3. `settle_losses_from_principal(i)`
+4. flat-loss routing of §7.3 when `effective_pos_q(i) == 0 and PNL_i < 0`
+5. account-local maintenance-fee realization of §8.2
+6. if `basis_pos_q_i == 0`, matured released-profit conversion of §7.4
+7. fee-debt sweep of §7.5
+
+It MUST NOT call `accrue_market_to` again for that account.
+
+If the account is liquidatable after this local exact-touch path, the keeper MAY invoke liquidation on the already-touched state using the same already-touched local liquidation execution as §§9.4–9.5 and §10.6 steps 4–6. It MUST NOT duplicate the touch, invoke end-of-instruction reset handling mid-loop, or nest a second top-level instruction.
+
+### 11.5 No mandatory on-chain keeper ordering
+
+The protocol MUST NOT impose a mandatory on-chain ordering such as:
+
+- liquidation candidates before cleanup candidates
+- cleanup candidates before liquidation candidates
+- global priority queues derived from an on-chain preview classifier
+
+The only mandatory on-chain ordering constraints inside `keeper_crank` are:
+
+1. the single initial `accrue_market_to(now_slot, oracle_price)` and trusted `current_slot = now_slot` anchor happen before per-candidate exact revalidation
+2. candidates are processed in keeper-supplied order
+3. once either pending-reset flag becomes true, the instruction stops further candidate processing and proceeds directly to end-of-instruction reset handling
+
+This is intentional. It prevents protocol-level deadlocks caused by mandatory liquidation-first queues while preserving permissionless reset-progress submissions.
+
+### 11.6 Recommended off-chain ordering for honest keepers
+
+The following ordering is a normative **SHOULD** for honest keepers that want to maximize expected same-call risk reduction per exact on-chain revalidation while still preserving reset liveness. It is operational guidance, not a consensus rule.
+
+#### 11.6.1 Off-chain simulation loop
+
+When compute permits, an honest keeper SHOULD:
+
+1. start from the latest authoritative on-chain state it can observe
+2. simulate the same single `accrue_market_to(now_slot, oracle_price)` step that §10.8 will execute on chain
+3. choose one candidate
+4. simulate that candidate's exact local touch and, if applicable, exact liquidation on the simulated state
+5. update the simulated state
+6. rerank the remaining candidates on that updated simulated state
+7. repeat until the desired shortlist length or risk target is reached
+
+This sequential re-simulation is recommended because liquidation ordering is path-dependent through `A_side`, `K_side`, `OI_eff_*`, side modes, and end-of-instruction reset stop conditions.
+
+#### 11.6.2 Priority bands
+
+An honest keeper SHOULD rank candidates in the following bands.
+
+**Band A — reserved reset-progress and pre-reset dust-progress**
+
+- If a side is already `ResetPending` and still has targeted stale-account reconciliation work, dust-zero progress work, or other per-account touches that can reduce `stale_account_count_*`, `stored_pos_count_*`, or otherwise advance finalization, the keeper SHOULD place one such candidate for that side near the front of the shortlist.
+- A keeper SHOULD also treat as Band-A progress any side that is not yet `ResetPending` but is already within its phantom-dust-clear bound and has targeted dust-zero accounts whose touch can reduce `stored_pos_count_*` and unblock end-of-instruction dust-clear scheduling.
+- If both sides need such progress and the intended budget permits, the keeper SHOULD place one candidate for each side before ordinary liquidations.
+- If the intended budget is smaller than the number of such sides across repeated calls, the keeper SHOULD rotate fairly across sides so no such side is perpetually skipped.
+- If a candidate touch is expected to zero the last stored position on side `S` while `OI_eff_S` would remain positive until end-of-instruction dust-clear handling, and opposite-side bankruptcies are also predicted in the same simulated wave, an honest keeper SHOULD usually place those opposite-side bankruptcy candidates earlier in the shortlist. This preserves current-instruction ADL realization capacity, because once `stored_pos_count_S == 0` while phantom OI remains, `enqueue_adl` can no longer write K-space loss to `S` and remaining `D_rem` is routed through uninsured protocol loss after insurance.
+- When this preserve-ADL ordering conflict exists, honest keepers SHOULD normally treat those opposite-side bankruptcy candidates as higher priority than the zeroing touch itself unless side `S` is already `ResetPending` and the current call would otherwise make no reset progress for `S`.
+
+**Band B — live-side liquidations not expected to schedule a new pending reset in this instruction**
+
+Within this band, the keeper SHOULD rank:
+
+1. candidates predicted to remain bankruptcy / full-close liquidations before candidates predicted to resolve through partial liquidation
+2. higher predicted uncovered deficit **after** Insurance Fund usage (`D_est_after_I`) before lower ones
+3. larger maintenance shortfall `max(0, MM_req - Eq_net)` before smaller ones
+4. larger notional before smaller ones
+5. candidates on a `DrainOnly` side before otherwise similar candidates on a `Normal` side
+
+This band targets the largest expected unresolved risk without prematurely ending the instruction.
+
+**Band C — live-side candidates expected to schedule a new pending reset, precision-exhaustion terminal drain, or zero remaining OI**
+
+Because §10.8 must stop once such a state transition actually schedules a pending reset, an honest keeper SHOULD usually place these candidates **after** the higher-value Band-B candidates on the same still-live simulated state.
+
+Exception: if the keeper's explicit objective for that call is to restore re-openability as soon as possible, it MAY intentionally place a Band-C candidate earlier.
+
+**Band D — cleanup-only / reclaimable-empty candidates**
+
+These SHOULD be placed after Bands B and C, except for the reserved Band-A reset-progress slots.
+
+### 11.7 Safety and liveness consequences
+
+Under this design:
+
+1. There is no protocol-level on-chain no-false-negative scan guarantee, because the protocol no longer requires an on-chain scan.
+2. There is also no protocol-level mandatory queue that can force one keeper's false positives to starve a different keeper's reset-progress work.
+3. A stale shortlist cannot cause an incorrect liquidation because each candidate is revalidated on current state immediately before any liquidation write.
+4. Reset progress remains permissionless because any keeper can target the needed stale or dust accounts directly through `settle_account` or `keeper_crank`.
+5. Once a candidate schedules a pending reset, later candidates in the same shortlist are intentionally deferred to a future instruction built from fresh state.
+
+## 12. Required test properties (minimum)
 
 An implementation MUST include tests that cover at least:
 
-1. Conservation: `V >= C_tot + I` always, and `Σ PNL_eff_pos_i <= Residual`.
-
-2. Oracle manipulation: inflated positive PnL cannot be withdrawn before maturity.
-
-3. Same-epoch local settlement: settlement of one account does not depend on any canonical-order prefix.
-
-4. Non-compounding quantity basis: repeated same-epoch touches without explicit position mutation do not compound quantity-flooring loss.
-
-5. Dynamic dust bound: after any number of same-epoch zeroing events, explicit basis replacements, and ADL multiplier truncations before a reset, authoritative OI on a side with no stored positions is bounded by that side's cumulative `phantom_dust_bound_side_q`.
-
-6. Dust-clear scheduling: dust clearance and reset initiation happen only at end of top-level instructions, never mid-instruction.
-
-7. Epoch-safe reset: accounts cannot be attached to a new epoch before `begin_full_drain_reset` runs at end of instruction.
-
-8. Precision-exhaustion terminal drain: if `A_candidate == 0` with `OI_post > 0`, the engine force-drains both sides instead of reverting or clamping.
-
-9. ADL representability fallback: if `K_opp + delta_K_exact` would overflow stored `i128`, quantity socialization still proceeds and the quote deficit routes through `absorb_protocol_loss`.
-
-10. Warmup anti-retroactivity: newly generated profit cannot inherit old dormant maturity headroom.
-
-11. Pure conversion slope preservation: frequent cranks do not create exponential-decay maturity.
-
-12. Trade slippage alignment: opening or flipping at `exec_price != oracle_price` realizes immediate zero-sum PnL against the oracle.
-
-13. Unit consistency: margin and notional use quote-token atomic units consistently.
-
-14. `set_pnl` underflow safety: negative PnL updates do not underflow `PNL_pos_tot`.
-
-15. `PNL_i == i128::MIN` forbidden: every negation path is safe.
-
-16. Organic close bankruptcy guard: a flat trade cannot bypass ADL by leaving negative `PNL_i` behind.
-
-17. Explicit fee shortfall routing: trading-fee or liquidation-fee shortfall becomes negative `fee_credits_i`, does not touch `PNL_i`, and does not inflate `D`.
-
-18. Funding anti-retroactivity: changing rate inputs near the end of an interval does not retroactively reprice earlier slots.
-
-19. Funding no-mint: payer-driven funding rounding MUST NOT mint positive aggregate claims even when `A_long != A_short`.
-
-20. Flat-account negative remainder: a flat account with negative `PNL_i` after principal exhaustion resolves through `absorb_protocol_loss` only in the allowed flat-account paths.
-
-21. Reset finalization: after reconciling stale accounts, the side can leave `ResetPending` and accept fresh OI again.
-
-22. Immediate fee seniority after restart conversion: if the restart-on-new-profit rule converts matured entitlement into `C_i` while fee debt is outstanding, the fee-debt sweep occurs immediately before later loss-settlement or margin logic can consume that new capital.
-
-23. Post-trade loss settlement: a solvent trader who closes to flat and can pay losses from principal is not rejected due to an unperformed implicit settlement step.
-
-24. Keeper quiescence after pending reset: if a keeper-triggered `enqueue_adl` or precision-exhaustion terminal drain schedules any reset, the same keeper instruction performs no further live-OI-dependent account processing before end-of-instruction reset handling.
-
-25. Keeper reset lifecycle: `keeper_crank` can touch the last dusty or stale account and still trigger the required end-of-instruction reset scheduling / finalization.
-
-26. Clean-empty market lifecycle: a fully drained and fully reconciled market can return to `Normal` and admit fresh OI without getting stuck in a reset loop.
-
-27. Non-representable `delta_K_abs` fallback: if `delta_K_abs` is not representable as `i128`, quote deficit routes through `absorb_protocol_loss` while quantity socialization still proceeds.
-
-28. Explicit-mutation dust accounting: if a trade or liquidation discards a same-epoch basis whose exact effective quantity had a nonzero fractional remainder, `phantom_dust_bound_side_q` increases by exactly `1` q-unit.
-
-29. Global A-truncation dust accounting: if `enqueue_adl` computes `A_candidate = floor(A_old * OI_post / OI)` with nonzero remainder, the engine increments `phantom_dust_bound_opp_q` by at least the conservative bound from §5.6, and that bound is sufficient to cover the additional phantom OI introduced by the global multiplier truncation.
-
-30. Empty-opposing-side deficit fallback: if `stored_pos_count_opp == 0`, real quote deficits route through `absorb_protocol_loss(D)` and are not written into `K_opp`.
-
-31. Unilateral-empty orphan resolution: if one side has `stored_pos_count_side == 0`, its `OI_eff_side` is within that side's phantom-dust bound, and `OI_eff_long == OI_eff_short`, then `schedule_end_of_instruction_resets(ctx)` schedules reset on both sides even if the opposite side still has stored positions.
-
-32. Unilateral-empty corruption guard: if one side has `stored_pos_count_side == 0` but `OI_eff_long != OI_eff_short`, unilateral dust clearance fails conservatively.
-
-33. Automatic reset finalization: the top-level instruction that reconciles the last stale account can leave the side in `Normal` at end-of-instruction without requiring a separate keeper-only finalize call.
-
-34. Trade-path reopenability: if a side is already `ResetPending` but also already eligible for `finalize_side_reset`, an `execute_trade` instruction can auto-finalize that side before OI-increase gating and admit fresh OI in the same instruction.
-
-35. Trading-loss seniority: in `execute_trade`, realized losses are settled from principal before trading fees are charged.
-
-36. Non-bankruptcy-liquidation loss seniority: in §9.4, realized losses are settled from principal before liquidation fees are charged.
-
-37. Synthetic liquidation zero slippage: bankruptcy and non-bankruptcy liquidation perform no execution-price PnL transfer beyond the current oracle mark.
-
-38. Mark one-shot exactness: `accrue_market_to` applies mark exactly once per invocation even when funding requires multiple bounded sub-steps.
-
-39. Current-state health check after partial liquidation: the post-liquidation maintenance check uses the current post-step state, including updated `I`, `PNL_pos_tot`, and haircut ratio.
-
-40. Instruction-final funding recomputation: if a liquidation or keeper action schedules a terminal drain, the stored next-interval `r_last` corresponds to the final post-reset `OI` and side modes, not a stale pre-reset state.
-
-41. Checked signed addition on settlement: every `set_pnl(PNL_i + delta)` call site uses checked signed addition and cannot wrap.
-
-42. Wide K-difference settlement: `pnl_delta` remains correct even when `K_now - K_snap` would overflow `i128` if computed naively.
-
-43. Aggregate positive-PnL bound: if account creation and `set_pnl` caps are enforced, `PNL_pos_tot` cannot overflow `u128`.
-
-44. Self-trade rejection: `execute_trade(a, a, ...)` fails conservatively.
-
-45. Account initialization safety: a newly materialized account cannot divide by zero in `effective_pos_q` and cannot accrue genesis-to-now maintenance fees on first touch.
-
-46. Empty-market funding no-op: if either snapped side OI is zero, `accrue_market_to` applies no funding K-motion for that invocation even when `r_last != 0`.
-
-47. Withdraw final-state funding recomputation: if a withdraw instruction finalizes a reset or otherwise changes funding-rate inputs through the reset lifecycle, `r_last` is recomputed exactly once from the final post-reset state.
-
-48. Trade-size precondition safety: `execute_trade` rejects `size_q > MAX_TRADE_SIZE_Q` or `trade_notional > MAX_ACCOUNT_NOTIONAL` before any signed cast or slippage multiplication.
-
-49. Maintenance-fee seniority on touch: if immediate account-local maintenance fees are enabled, `touch_account_full` settles existing realized trading losses from principal before extracting maintenance fees, so maintenance cannot inflate a later bankruptcy deficit.
-
-50. Partial-liquidation reset short-circuit: even if `enqueue_adl(ctx, liq_side, q_close_q, 0)` schedules a reset, a candidate partial liquidation that leaves the account flat with `PNL_i < 0` is not a successful partial liquidation and must instead fail as partial or route to bankruptcy according to policy.
-
-51. Keeper end-state parity: `keeper_crank` ends with `OI_eff_long == OI_eff_short`.
-
-52. Timed monotonicity: every timed helper or instruction rejects `now_slot < current_slot` or `now_slot < slot_last`, and `accrue_market_to` leaves `current_slot = now_slot` on success.
-
-53. Slot-anchored materialization: a newly materialized account created inside a timed instruction sets both `w_start_i` and `last_fee_slot_i` to that instruction's `now_slot`, not to `0` or a stale global slot.
-
-54. Deposit loss seniority: in `deposit`, newly deposited capital settles existing realized trading losses before any outstanding fee debt is swept.
-
-55. Deposit true-flat routing: a capital-only `deposit` path may invoke §7.3 only when `basis_pos_q_i == 0`; it MUST NOT treat a stale nonzero stored basis with `effective_pos_q(i) == 0` as eligible for flat-account loss socialization.
-
-56. Dust-liquidation minimum-fee floor: if `q_close_q > 0` but `closed_notional` floors to zero, liquidation still charges `min_liquidation_abs` (subject to `liquidation_fee_cap`).
-
-57. Standalone settle wrapper lifecycle: a top-level `settle_account` instruction can reconcile the last stale or dusty account, run required end-of-instruction reset scheduling / finalization, and recompute `r_last` from the final post-reset state when funding inputs changed.
-
-58. Keeper upfront accrual: a `keeper_crank` that performs only maintenance or reset work still enforces timed monotonicity by accruing the market once at instruction start.
-
-59. Keeper current-state gating: `keeper_crank` does not perform liquidation-health checks, standalone warmup conversion, or standalone fee-debt extraction on an account unless that account has already been brought to current state with `touch_account_full(i, oracle_price, now_slot)` in the same instruction, or the action is explicitly defined safe on a stored-flat account.
-
-60. Maintenance-fee neutrality: any recurring maintenance-fee realization increases `I` and/or negative `fee_credits_i` only; it does not mutate `K_side`, `PNL_i`, `PNL_pos_tot`, haircut inputs, or bankruptcy deficit `D`.
-
-61. Bounded maintenance-fee realization: if a recurring maintenance fee over a long interval would exceed `MAX_PROTOCOL_FEE_ABS` or the permitted one-step `fee_credits_i` write range, the implementation splits the realization into bounded internal chunks instead of overflowing, reverting spuriously, or socializing the excess through PnL.
-
-
-62. Missing-account gating: `settle_account`, `withdraw`, `execute_trade`, and `liquidate` do not auto-materialize missing accounts.
-
-63. Zero-value materialization guard: `deposit(i, 0, now_slot)` on a missing account fails conservatively and does not create state.
-
-64. Permissionless empty-account reclamation: a qualifying zero-state account can be reclaimed without owner cooperation, decrements `materialized_account_count`, and restores capacity for a new account.
-
-65. Keeper missing-account safety: `keeper_crank` skips or rejects missing work-plan entries without materializing them.
-
-66. Trusted time / oracle provenance: production entrypoints reject untrusted or invalid timing / oracle inputs, including stale oracle data beyond `MAX_ORACLE_STALENESS_SLOTS`.
-
-
-## 12. Reference pseudocode (non-normative)
-
-### 12.1 Compute haircut and current-state equity
+1. **Conservation:** `V >= C_tot + I` always, and `Σ PNL_eff_matured_i <= Residual`.
+2. **Fresh-profit reservation:** a positive `set_pnl` increase raises `R_i` by the same positive delta and does not immediately increase `PNL_matured_pos_tot`.
+3. **Oracle-manipulation haircut safety:** fresh, unwarmed manipulated PnL cannot dilute `h`, cannot satisfy initial-margin or withdrawal checks, and cannot reduce another account's equity before warmup release; it MAY only support the generating account's own maintenance equity.
+4. **Warmup anti-retroactivity:** newly generated profit cannot inherit old dormant maturity headroom.
+5. **Pure release slope preservation:** repeated touches do not create exponential-decay maturity.
+6. **Same-epoch local settlement:** settlement of one account does not depend on any canonical-order prefix.
+7. **Non-compounding quantity basis:** repeated same-epoch touches without explicit position mutation do not compound quantity-flooring loss.
+8. **Dynamic dust bound:** after same-epoch zeroing events, basis replacements, and ADL multiplier truncations before a reset, authoritative OI on a side with no stored positions is bounded by that side's cumulative phantom-dust bound.
+9. **Dust-clear scheduling:** dust clearance and reset initiation happen only at end of top-level instructions, never mid-instruction.
+10. **Epoch-safe reset:** accounts cannot be attached to a new epoch before `begin_full_drain_reset` runs.
+11. **Precision-exhaustion terminal drain:** if `A_candidate == 0` with `OI_post > 0`, the engine force-drains both sides instead of reverting.
+12. **ADL representability fallback:** if `delta_K_abs` is non-representable or `K_opp + delta_K_exact` overflows, quantity socialization still proceeds and the remainder routes through `record_uninsured_protocol_loss`.
+13. **Insurance-first deficit coverage:** `enqueue_adl` spends `I` down to `I_floor` before any remaining bankruptcy loss is socialized or left as junior undercollateralization.
+14. **Unit consistency:** margin, notional, and fees use quote-token atomic units consistently.
+15. **`set_pnl` aggregate safety:** positive-PnL updates do not overflow `PNL_pos_tot` or `PNL_matured_pos_tot`.
+16. **`PNL_i == i128::MIN` forbidden:** every negation path is safe.
+17. **Trading and liquidation fee shortfalls:** unpaid explicit fees become negative `fee_credits_i`, not `PNL_i` and not `D`.
+18. **Funding anti-retroactivity:** changing rate inputs near the end of an interval does not retroactively reprice earlier slots.
+19. **Funding no-mint:** payer-driven funding rounding MUST NOT mint positive aggregate claims even when `A_long != A_short`.
+20. **Flat-account negative remainder:** a flat account with negative `PNL_i` after principal exhaustion resolves through `absorb_protocol_loss` only in the allowed flat-account paths.
+21. **Reset finalization:** after reconciling stale accounts, the side can leave `ResetPending` and accept fresh OI again.
+22. **Deposit loss seniority:** in `deposit`, realized losses are settled from newly deposited principal before any outstanding fee debt is swept.
+23. **Deposit materialization threshold:** a missing account cannot be materialized by a deposit smaller than `MIN_INITIAL_DEPOSIT`, while an existing materialized account may still receive smaller top-ups.
+24. **Dust liquidation minimum fee:** if `q_close_q > 0` but `closed_notional` floors to zero, `liq_fee` still honors `min_liquidation_abs`.
+25. **Risk-reducing trade exemption:** a strict non-flipping position reduction that improves the unfloored raw maintenance buffer is allowed even if the account remains below maintenance after the trade. A reduction that worsens raw maintenance buffer is rejected even when floored `Eq_net_i` remains zero.
+26. **Positive local PnL supports maintenance but not initial margin / withdrawal at face value:** on a touched generating account, maintenance uses full local `PNL_i`, so a freshly profitable account is not liquidated solely because profit is still warming up and pure warmup release on unchanged `PNL_i` does not reduce `Eq_maint_raw_i`; the same junior profit still cannot satisfy a risk-increasing initial-margin or withdrawal check except through `Eq_init_net_i`.
+27. **Reserve-loss ordering:** when positive `PNL_i` shrinks for true market-loss reasons, losses consume `R_i` before matured released positive PnL, so neutral price chop does not ratchet previously matured margin into reserve.
+28. **Organic close bankruptcy guard:** a flat trade cannot bypass ADL by leaving negative `PNL_i` behind.
+29. **Bankruptcy full-close requirement:** bankruptcy liquidation always closes the full remaining effective position.
+30. **Dead-account reclamation:** a flat zero-value account with negative `fee_credits_i` can be reclaimed and its slot reused safely.
+31. **Missing-account safety:** `settle_account`, `withdraw`, `execute_trade`, `liquidate`, and `keeper_crank` do not materialize missing accounts.
+32. **Standalone settle lifecycle:** `settle_account` can reconcile the last stale or dusty account and still trigger required reset scheduling/finalization and final-state funding recomputation.
+33. **Off-chain shortlist stale/adversarial safety:** replaying or adversarially ordering an old shortlist cannot cause an incorrect liquidation, because `keeper_crank` revalidates each processed candidate on current state before any liquidation write.
+34. **Keeper single global accrual:** `keeper_crank` calls `accrue_market_to(now_slot, oracle_price)` exactly once per instruction and per-candidate exact revalidation does not reaccrue the market.
+35. **Keeper local-touch equivalence:** the per-candidate exact local touch used inside `keeper_crank` is economically equivalent to `touch_account_full` on the same already-accrued state.
+36. **Keeper revalidation budget accounting:** `max_revalidations` bounds the number of normal exact current-state revalidation attempts on materialized accounts, including safe false positives and cleanup-only touches; missing-account skips do not count. Fatal conservative failures are instruction failures, not counted skips.
+37. **No duplicate keeper touch before liquidation:** when `keeper_crank` liquidates a candidate, it does so from the already-touched current state and does not perform a second full touch of that same candidate inside the same attempt.
+38. **Keeper local liquidation is not a nested top-level finalize:** the per-candidate keeper liquidation path executes only the already-touched local liquidation subroutine and does not call `schedule_end_of_instruction_resets`, `finalize_end_of_instruction_resets`, or `recompute_r_last_from_final_state()` mid-loop.
+39. **Keeper candidate-order freedom:** the engine imposes no on-chain liquidation-first ordering across keeper-supplied candidates; a cleanup-first shortlist is processed in the keeper-supplied order unless a pending reset is scheduled.
+40. **Keeper stop on pending reset:** once a candidate touch or liquidation schedules a pending reset, `keeper_crank` performs no further candidate processing before end-of-instruction reset handling.
+41. **Permissionless reset or dust progress without on-chain scan:** targeted `settle_account` calls or targeted `keeper_crank` shortlists can reconcile stale accounts on a `ResetPending` side and can also clear targeted pre-reset dust-progress accounts on a side already within its phantom-dust-clear bound, without any on-chain phase-1 search.
+42. **Post-reset funding recomputation in keeper:** if keeper work changes funding-rate inputs through end-of-instruction effects, `keeper_crank` recomputes `r_last` exactly once from the final post-reset state.
+43. **K-pair chronology correctness:** same-epoch and epoch-mismatch settlement call `wide_signed_mul_div_floor_from_k_pair(abs_basis, k_then, k_now, den)` in chronological order; a true loss cannot be settled as a gain due to swapped arguments.
+44. **Deposit true-flat guard and latent-loss seniority:** a `deposit` into an account with `basis_pos_q_i != 0` neither routes unresolved negative PnL through §7.3 nor sweeps fee debt before a later full current-state touch.
+45. **No duplicate bankruptcy touch:** both the top-level `liquidate` path and the `keeper_crank` local liquidation path execute bankruptcy liquidation from the already-touched current state and do not perform a second full touch or second maintenance-fee realization.
+46. **Funding-rate bound enforcement:** `recompute_r_last_from_final_state()` never stores `|r_last| > MAX_ABS_FUNDING_BPS_PER_SLOT`; an out-of-range unclamped computed rate is clamped deterministically rather than reverting the instruction.
+47. **Keeper atomicity alignment:** a normal safe / cleanup / liquidated candidate counts against `max_revalidations`, but a fatal conservative failure during exact touch or liquidation reverts the whole instruction atomically rather than being treated as a counted skip.
+48. **Exact raw maintenance-buffer comparison:** strict risk-reducing trade permission uses the exact widened signed pre/post raw maintenance buffers and cannot be satisfied solely because both sides of the comparison were clamped at the negative representation floor.
+
+49. **Profit-conversion reserve preservation:** converting `ReleasedPos_i = x` leaves `R_i` unchanged and reduces both `PNL_pos_tot` and `PNL_matured_pos_tot` by exactly `x`; repeated settles cannot drain reserve faster than `advance_profit_warmup`.
+50. **Flat-only automatic conversion:** an open-position `touch_account_full` does not automatically convert matured released profit into capital, while a truly flat touched state may convert it via §7.4.
+51. **Universal withdrawal dust guard:** any withdrawal must leave either `0` capital or at least `MIN_INITIAL_DEPOSIT`; a materialize-open-dust-withdraw-close loop cannot end at a flat unreclaimable `C_i = 1` account.
+52. **Explicit open-position profit conversion:** `convert_released_pnl` consumes only `ReleasedPos_i`, leaves `R_i` unchanged, sweeps fee debt from the new capital, and rejects atomically if the post-conversion open-position state is not maintenance healthy.
+53. **Phantom-dust ADL ordering awareness:** if a keeper simulation zeroes the last stored position on a side while phantom OI remains, opposite-side bankruptcies processed after that point lose current-instruction K-socialization capacity; processing them before that zeroing touch preserves it.
+54. **Unilateral exact-drain reset scheduling:** if `enqueue_adl` drives `OI_eff_opp` to `0` while `OI_eff_liq_side` remains positive, it still schedules `pending_reset_opp = true`, and subsequent close / liquidation attempts on the drained side do not underflow against a zero authoritative OI.
+
+## 13. Reference pseudocode (non-normative)
+
+### 13.1 `set_pnl`
 
 ```text
-senior_sum = checked_add_u128(C_tot, I)
-Residual = max(0, V - senior_sum)
+set_pnl(i, new):
+    assert new != i128::MIN
+    old_pos = max(PNL_i, 0)
+    old_R   = R_i
+    old_rel = old_pos - old_R
+    new_pos = max(new, 0)
+    assert new_pos <= MAX_ACCOUNT_POSITIVE_PNL
 
-if PNL_pos_tot == 0:
-    h_num = 1
-    h_den = 1
-else:
-    h_num = min(Residual, PNL_pos_tot)
-    h_den = PNL_pos_tot
+    if new_pos > old_pos:
+        reserve_add = new_pos - old_pos
+        new_R = old_R + reserve_add
+        assert new_R <= new_pos
+    else:
+        pos_loss = old_pos - new_pos
+        new_R = saturating_sub(old_R, pos_loss)
+        assert new_R <= new_pos
 
-PNL_pos_i = max(PNL_i, 0)
-if PNL_pos_tot == 0:
-    PNL_eff_pos_i = PNL_pos_i
-else:
-    PNL_eff_pos_i = floor((wide)PNL_pos_i * h_num / h_den)
+    new_rel = new_pos - new_R
 
-Eq_real_raw = checked_add_i128(C_i as i128, min(PNL_i, 0))
-Eq_real_raw = checked_add_i128(Eq_real_raw, PNL_eff_pos_i as i128)
-Eq_real_i = max(0, Eq_real_raw)
+    update PNL_pos_tot by (new_pos - old_pos)
+    update PNL_matured_pos_tot by (new_rel - old_rel)
 
-FeeDebt_i = fee_debt_u128_checked(fee_credits_i)
-Eq_net_raw = checked_sub_i128(Eq_real_i, FeeDebt_i as i128)
-Eq_net_i = max(0, Eq_net_raw)
+    PNL_i = new
+    R_i   = new_R
 ```
 
-### 12.2 Same-epoch settlement
+### 13.1.1 `consume_released_pnl`
 
 ```text
-if basis_pos_q_i != 0:
-    s = side(basis_pos_q_i)
-    if epoch_snap_i == epoch_s:
-        q_eff_new = floor(abs(basis_pos_q_i) * A_s / a_basis_i)
-        den = a_basis_i * POS_SCALE
-        pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i), K_s, k_snap_i, den)
-        set_pnl(i, checked_add_i128(PNL_i, pnl_delta))
-        if q_eff_new == 0:
-            inc_phantom_dust_bound(s)
-            set_position_basis_q(i, 0)
-            reset_zero_position(i, epoch_s)
-        else:
-            k_snap_i = K_s
-            epoch_snap_i = epoch_s
+consume_released_pnl(i, x):
+    assert x > 0
+    old_pos = max(PNL_i, 0)
+    old_R   = R_i
+    old_rel = old_pos - old_R
+    assert x <= old_rel
+
+    new_pos = old_pos - x
+    new_rel = old_rel - x
+    assert new_pos >= old_R
+
+    update PNL_pos_tot by (new_pos - old_pos)
+    update PNL_matured_pos_tot by (new_rel - old_rel)
+    assert PNL_matured_pos_tot <= PNL_pos_tot
+
+    PNL_i = checked_sub_i128(PNL_i, checked_cast_i128(x))
+    R_i   = old_R
 ```
 
-### 12.3 Epoch mismatch
+### 13.2 `advance_profit_warmup`
 
 ```text
-if basis_pos_q_i != 0 and epoch_snap_i != epoch_s:
-    assert mode_s == ResetPending
-    assert epoch_snap_i + 1 == epoch_s
-    den = a_basis_i * POS_SCALE
-    pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i), K_epoch_start_s, k_snap_i, den)
-    set_pnl(i, checked_add_i128(PNL_i, pnl_delta))
-    set_position_basis_q(i, 0)
-    dec_stale_account_count_checked(s)
-    reset_zero_position(i, epoch_s)
-```
-
-### 12.4 Exact one-shot mark plus sub-stepped funding
-
-```text
-accrue_market_to(now_slot, oracle_price):
-    assert now_slot >= current_slot
-    assert now_slot >= slot_last
-    assert 0 < oracle_price <= MAX_ORACLE_PRICE
-
-    oi_long_snap = OI_eff_long
-    oi_short_snap = OI_eff_short
-
-    if now_slot == slot_last and oracle_price == P_last:
-        current_slot = now_slot
+advance_profit_warmup(i):
+    if R_i == 0:
+        w_slope_i = 0
+        w_start_i = current_slot
         return
 
-    delta_p = (oracle_price as i128) - (P_last as i128)
+    if T == 0:
+        set_reserved_pnl(i, 0)
+        w_slope_i = 0
+        w_start_i = current_slot
+        return
 
-    // mark applies exactly once
-    if delta_p != 0:
-        if oi_long_snap > 0:
-            K_long += A_long * delta_p
-        if oi_short_snap > 0:
-            K_short -= A_short * delta_p
+    elapsed = current_slot - w_start_i
+    release = min(R_i, saturating_mul_u128_u64(w_slope_i, elapsed))
+    if release > 0:
+        set_reserved_pnl(i, R_i - release)
 
-    dt_rem = now_slot - slot_last
-    while dt_rem > 0:
-        dt = min(dt_rem, MAX_FUNDING_DT)
-        if r_last != 0 and oi_long_snap > 0 and oi_short_snap > 0:
-            funding_term_raw = fund_px_last * abs(r_last) * dt
-            if r_last > 0:
-                payer = long
-                receiver = short
-            else:
-                payer = short
-                receiver = long
-
-            A_p = A_side(payer)
-            A_r = A_side(receiver)
-
-            delta_K_payer_abs = ceil(A_p * funding_term_raw / 10_000)
-            delta_K_receiver_abs = floor(delta_K_payer_abs * A_r / A_p)
-
-            K_payer -= delta_K_payer_abs
-            K_receiver += delta_K_receiver_abs
-
-        dt_rem -= dt
-
-    slot_last = now_slot
-    P_last = oracle_price
-    fund_px_last = oracle_price
-    current_slot = now_slot
+    if R_i == 0:
+        w_slope_i = 0
+    w_start_i = current_slot
 ```
 
-### 12.5 Charge explicit fee to insurance without PnL socialization
-
-```text
-charge_fee_to_insurance(i, fee):
-    assert fee <= MAX_PROTOCOL_FEE_ABS
-    fee_paid = min(fee, C_i)
-    set_capital(i, C_i - fee_paid)
-    I += fee_paid
-    fee_shortfall = fee - fee_paid
-    if fee_shortfall > 0:
-        fee_credits_i = checked_sub_i128(fee_credits_i, fee_shortfall as i128)
-```
-
-### 12.6 ADL with representability fallback
+### 13.3 `enqueue_adl`
 
 ```text
 enqueue_adl(ctx, liq_side, q_close_q, D):
@@ -2116,58 +1760,64 @@ enqueue_adl(ctx, liq_side, q_close_q, D):
     if q_close_q > 0:
         OI_eff_liq_side -= q_close_q
 
-    OI = OI_eff_opp
+    if D > 0:
+        D_rem = use_insurance_buffer(D)
+    else:
+        D_rem = 0
 
+    OI = OI_eff_opp
     if OI == 0:
-        if D > 0:
-            absorb_protocol_loss(D)
+        if D_rem > 0:
+            record_uninsured_protocol_loss(D_rem)
+        if OI_eff_liq_side == 0:
+            ctx.pending_reset_liq_side = true
+            ctx.pending_reset_opp = true
         return
 
     if stored_pos_count_opp == 0:
-        assert q_close_q <= OI
         OI_post = OI - q_close_q
-        if D > 0:
-            absorb_protocol_loss(D)
+        if D_rem > 0:
+            record_uninsured_protocol_loss(D_rem)
         OI_eff_opp = OI_post
         if OI_post == 0:
             ctx.pending_reset_opp = true
-            ctx.pending_reset_liq_side = true
+            if OI_eff_liq_side == 0:
+                ctx.pending_reset_liq_side = true
         return
 
-    assert q_close_q <= OI
-    A_old = A_opp
+    A_old  = A_opp
     OI_post = OI - q_close_q
 
-    if D > 0:
+    if D_rem > 0:
         adl_scale = A_old * POS_SCALE
-        delta_result = wide_mul_div_ceil_u128_or_over_i128max(D, adl_scale, OI)
-        if delta_result is Value:
-            delta_K_abs = value(delta_result)
+        res = wide_mul_div_ceil_u128_or_over_i128max(D_rem, adl_scale, OI)
+        if res is Ok(delta_K_abs):
             delta_K_exact = -(delta_K_abs as i128)
-            if fits_i128(K_opp + delta_K_exact):
-                K_opp = K_opp + delta_K_exact
+            if checked_add_i128(K_opp, delta_K_exact) succeeds:
+                K_opp += delta_K_exact
             else:
-                absorb_protocol_loss(D)
+                record_uninsured_protocol_loss(D_rem)
         else:
-            absorb_protocol_loss(D)
+            record_uninsured_protocol_loss(D_rem)
 
     if OI_post == 0:
         OI_eff_opp = 0
         ctx.pending_reset_opp = true
-        ctx.pending_reset_liq_side = true
+        if OI_eff_liq_side == 0:
+            ctx.pending_reset_liq_side = true
         return
 
-    A_prod_exact = A_old * OI_post
-    A_candidate = floor(A_prod_exact / OI)
-    A_trunc_rem = A_prod_exact mod OI
+    A_prod = A_old * OI_post
+    A_candidate = floor(A_prod / OI)
+    A_rem = A_prod mod OI
 
     if A_candidate > 0:
         A_opp = A_candidate
         OI_eff_opp = OI_post
-        if A_trunc_rem != 0:
-            N_opp = stored_pos_count_opp as u128
-            global_a_dust_bound = N_opp + ceil((OI + N_opp) / A_old)
-            phantom_dust_bound_opp_q += global_a_dust_bound
+        if A_rem != 0:
+            N_opp = stored_pos_count_opp
+            dust_bound = N_opp + ceil((OI + N_opp) / A_old)
+            phantom_dust_bound_opp_q += dust_bound
         if A_opp < MIN_A_SIDE:
             mode_opp = DrainOnly
         return
@@ -2178,154 +1828,15 @@ enqueue_adl(ctx, liq_side, q_close_q, D):
     ctx.pending_reset_liq_side = true
 ```
 
-### 12.7 Finalize-ready preflight for OI-increasing instructions
-
-```text
-maybe_finalize_ready_reset_sides_before_oi_increase():
-    if mode_long == ResetPending and OI_eff_long == 0 and stale_account_count_long == 0 and stored_pos_count_long == 0:
-        finalize_side_reset(long)
-    if mode_short == ResetPending and OI_eff_short == 0 and stale_account_count_short == 0 and stored_pos_count_short == 0:
-        finalize_side_reset(short)
-```
-
-### 12.8 End-of-instruction dust clearance and finalization
-
-```text
-schedule_end_of_instruction_resets(ctx):
-    if stored_pos_count_long == 0 and stored_pos_count_short == 0:
-        clear_bound_q = phantom_dust_bound_long_q + phantom_dust_bound_short_q
-        has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0) or (phantom_dust_bound_short_q > 0)
-        if has_residual_clear_work:
-            assert OI_eff_long == OI_eff_short
-            if OI_eff_long <= clear_bound_q and OI_eff_short <= clear_bound_q:
-                OI_eff_long = 0
-                OI_eff_short = 0
-                ctx.pending_reset_long = true
-                ctx.pending_reset_short = true
-            else:
-                fail_conservatively()
-
-    else if stored_pos_count_long == 0:
-        has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_long_q > 0)
-        if has_residual_clear_work:
-            assert OI_eff_long == OI_eff_short
-            if OI_eff_long <= phantom_dust_bound_long_q:
-                OI_eff_long = 0
-                OI_eff_short = 0
-                ctx.pending_reset_long = true
-                ctx.pending_reset_short = true
-            else:
-                fail_conservatively()
-
-    else if stored_pos_count_short == 0:
-        has_residual_clear_work = (OI_eff_long > 0) or (OI_eff_short > 0) or (phantom_dust_bound_short_q > 0)
-        if has_residual_clear_work:
-            assert OI_eff_long == OI_eff_short
-            if OI_eff_short <= phantom_dust_bound_short_q:
-                OI_eff_long = 0
-                OI_eff_short = 0
-                ctx.pending_reset_long = true
-                ctx.pending_reset_short = true
-            else:
-                fail_conservatively()
-
-    if mode_long == DrainOnly and OI_eff_long == 0:
-        ctx.pending_reset_long = true
-    if mode_short == DrainOnly and OI_eff_short == 0:
-        ctx.pending_reset_short = true
-
-finalize_end_of_instruction_resets(ctx):
-    if ctx.pending_reset_long and mode_long != ResetPending:
-        begin_full_drain_reset(long)
-    if ctx.pending_reset_short and mode_short != ResetPending:
-        begin_full_drain_reset(short)
-    if mode_long == ResetPending and OI_eff_long == 0 and stale_account_count_long == 0 and stored_pos_count_long == 0:
-        finalize_side_reset(long)
-    if mode_short == ResetPending and OI_eff_short == 0 and stale_account_count_short == 0 and stored_pos_count_short == 0:
-        finalize_side_reset(short)
-```
-
-### 12.9 Trade-path ordering with loss seniority
-
-```text
-execute_trade(...):
-    assert 0 < size_q <= MAX_TRADE_SIZE_Q
-    trade_notional = floor(size_q * exec_price / POS_SCALE)
-    assert trade_notional <= MAX_ACCOUNT_NOTIONAL
-    touch_account_full(a)
-    touch_account_full(b)
-    maybe_finalize_ready_reset_sides_before_oi_increase()
-    apply trade-pnl alignment
-    attach resulting positions
-    update OI atomically
-    settle_losses_from_principal(a)
-    settle_losses_from_principal(b)
-    charge_fee_to_insurance(a, fee_a_from(trade_notional))
-    charge_fee_to_insurance(b, fee_b_from(trade_notional))
-    run warmup restart logic if AvailGross increased
-    enforce post-trade margin on current state
-    schedule_end_of_instruction_resets(ctx)
-    finalize_end_of_instruction_resets(ctx)
-    recompute_next_funding_rate_from_final_state(oracle_price) if inputs changed
-```
-
-### 12.10 `touch_account_full` loss-before-maintenance ordering
-
-```text
-touch_account_full(i, oracle_price, now_slot):
-    assert now_slot >= current_slot
-    assert now_slot >= slot_last
-    assert 0 < oracle_price <= MAX_ORACLE_PRICE
-    current_slot = now_slot
-    accrue_market_to(now_slot, oracle_price)
-    old_avail = max(PNL_i, 0) - R_i
-    old_warmable_i = WarmableGross_i on current_slot before any profit increase
-    settle_side_effects(i)
-    new_avail = max(PNL_i, 0) - R_i
-    if new_avail > old_avail:
-        capital_before_restart = C_i
-        restart_on_new_profit(old_warmable_i)
-        if C_i > capital_before_restart:
-            sweep_fee_debt()
-    settle_losses_from_principal(i)
-    charge_or_extend_account_local_maintenance(i)
-    if effective_pos_q(i) == 0 and PNL_i < 0:
-        absorb_protocol_loss((-PNL_i) as u128)
-        set_pnl(i, 0)
-    convert_warmable_profits()
-    sweep_fee_debt()
-```
-
-### 12.11 Partial-liquidation success path with reset short-circuit guard
-
-```text
-partial_liquidation(i, q_close_q, ctx):
-    old_eff = effective_pos_q(i)
-    new_eff = old_eff - sign(old_eff) * q_close_q
-    attach_effective_position(i, new_eff)
-    settle_losses_from_principal(i)
-    liq_fee = liquidation_fee_from(q_close_q, oracle_price)
-    charge_fee_to_insurance(i, liq_fee)
-    enqueue_adl(ctx, side(old_eff), q_close_q, 0)
-    if effective_pos_q(i) == 0:
-        assert PNL_i >= 0
-    if ctx.pending_reset_long or ctx.pending_reset_short:
-        return
-    if effective_pos_q(i) != 0:
-        assert maintenance_healthy_on_current_post_step_state(i)
-```
-
-
-
-### 12.12 Timed account materialization and deposit loss seniority
+### 13.4 `deposit`
 
 ```text
 deposit(i, amount, now_slot):
     assert now_slot >= current_slot
-    assert now_slot >= slot_last
-    if account i does not exist:
-        assert amount > 0
+    if account_missing(i):
+        assert amount >= MIN_INITIAL_DEPOSIT
         materialize_account(i, now_slot)
+
     current_slot = now_slot
     assert V + amount <= MAX_VAULT_TVL
     V += amount
@@ -2334,580 +1845,165 @@ deposit(i, amount, now_slot):
     if basis_pos_q_i == 0 and PNL_i < 0:
         absorb_protocol_loss((-PNL_i) as u128)
         set_pnl(i, 0)
-    sweep_fee_debt()
+    if basis_pos_q_i == 0:
+        sweep_fee_debt(i)
 ```
 
-### 12.13 Standalone settle wrapper
+### 13.4.1 `convert_released_pnl`
 
 ```text
-settle_account(i, oracle_price, now_slot):
-    assert account i already exists
-    ctx = fresh_reset_context()
+convert_released_pnl(i, x_req, oracle_price, now_slot):
+    assert account_materialized(i)
+    ctx = fresh_instruction_context()
+
     touch_account_full(i, oracle_price, now_slot)
-    schedule_end_of_instruction_resets(ctx)
-    finalize_end_of_instruction_resets(ctx)
-    recompute_next_funding_rate_from_final_state(oracle_price) if inputs changed
-    assert OI_eff_long == OI_eff_short
-```
-
-### 12.14 Keeper upfront accrual, current-state gating, and timed monotonicity
-
-```text
-keeper_crank(oracle_price, now_slot, work_plan):
-    ctx = fresh_reset_context()
-    accrue_market_to(now_slot, oracle_price)
-
-    for each planned account i in bounded work_plan:
-        if account i does not exist:
-            continue   // never materialize missing accounts here
-
-        touch_account_full(i, oracle_price, now_slot)
-
-        // Any liquidation decision or keeper-only cleanup that depends on
-        // PnL, margin, warmup, or fee debt must happen only after this touch.
-        maybe_liquidate_or_cleanup_current_state_account(i, ctx)
-
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            stop further live-OI-dependent account work
-            break
-
-    schedule_end_of_instruction_resets(ctx)
-    finalize_end_of_instruction_resets(ctx)
-    recompute_next_funding_rate_from_final_state(oracle_price) if inputs changed
-    assert OI_eff_long == OI_eff_short
-```
-
-## 13. Compatibility notes
-
-- The spec is compatible with LP accounts and user accounts; both share the same protected-principal and junior-profit mechanics.
-
-- The only mandatory `O(1)` global aggregates for solvency are `C_tot` and `PNL_pos_tot`; the A/K side indices add `O(1)` state for lazy settlement.
-
-- The spec deliberately rejects hidden residual matching. Bankruptcy socialization occurs through explicit A/K state only.
-
-- Same-epoch quantity settlement is local and non-compounding. The design does not require a canonical-order carry allocator.
-
-- Rare side-precision stress is handled by `DrainOnly`, dynamically bounded dust clearance, unilateral / bilateral orphan resolution, and precision-exhaustion terminal drain rather than assertion failure or permanent market deadlock.
-
-- By utilizing base-10 scaling bounded within `10^16` TVL limits, explicit `MAX_TRADE_SIZE_Q`, and `MAX_ACCOUNT_NOTIONAL` enforcement, the engine executes inside native 128-bit persistent boundaries while permitting transient exact wide intermediates only where mathematically necessary.
-
-- Any optional recurring maintenance-fee design must realize value only into `I` and/or `fee_credits_i`; it must not reuse profit/loss `K_side` or mutate `PNL_i` / `PNL_pos_tot`.
-
-- Any upgrade path from a version that did not maintain `basis_pos_q_i`, `a_basis_i`, `stored_pos_count_*`, `stale_account_count_*`, `phantom_dust_bound_*_q`, or `materialized_account_count` consistently MUST complete migration before OI-increasing operations are re-enabled.
-
-
-# Risk Engine Spec Addendum — Compute-Limited Barrier Scan / Two-Phase Keeper Mode
-
-**Addendum ID:** A2  
-**Applies to:** Risk Engine Spec v11.12 family and later compatible revisions  
-**Status:** normative addendum  
-**Scope:** optional keeper execution mode for compute-limited environments  
-**Goal:** allow a keeper to scan many accounts cheaply in a read-only first phase, then perform expensive settlement / liquidation / cleanup only on a bounded shortlisted set, while reducing worst-case divergence caused by mixed mid-cascade passive touches.
-
-This addendum is self-contained. Where an implementation elects to use the two-phase keeper mode defined here, this addendum is normative and supersedes any inconsistent earlier keeper-scan wording in the base spec.
-
----
-
-## A0. Design intent
-
-The base engine remains unchanged: exact economic state is still defined only by the base spec's authoritative current-state helpers and write paths.
-
-This addendum introduces an **optional** keeper mode with the following properties:
-
-1. **Single-barrier scan:** all accounts scanned in phase 1 are evaluated against one frozen barrier snapshot created after a single `accrue_market_to(now_slot, oracle_price)`.
-2. **Read-only phase 1:** phase 1 MUST NOT mutate account state, side state, OI, `A_side`, `K_side`, `epoch_side`, `stored_pos_count_*`, `stale_account_count_*`, `phantom_dust_bound_*_q`, `C_tot`, `PNL_pos_tot`, `I`, `V`, or `r_last`, except for the single top-level `accrue_market_to` done before the scan begins.
-3. **Conservative shortlist:** phase 1 MAY produce false positives, but it MUST NOT discard an account that is liquidatable at the barrier state.
-4. **Priority exact revalidation for risky open accounts:** open-position accounts that phase 1 cannot safely classify MUST remain in the high-priority exact-revalidation queue; they MUST NOT be demoted behind ordinary cleanup-only accounts due solely to preview arithmetic failure.
-5. **Reset-progress fairness:** when a side is already `ResetPending`, the two-phase mode MUST preserve liveness by reserving phase-2 progress for cleanup touches that can reconcile that side. False-positive liquidation candidates MUST NOT be able to starve reset finalization forever.
-6. **Current-state revalidation:** every candidate acted on in phase 2 MUST be revalidated on the then-current state with the base spec's exact helpers before any liquidation or cleanup write is committed.
-7. **Bounded phase-2 compute:** the phase-2 budget MUST count exact current-state revalidation attempts, not only committed writes, so a false-positive flood cannot defeat the keeper's compute cap.
-8. **No carry-forward of safety decisions:** an account classified safe under one barrier snapshot MUST NOT be treated as safe under a later barrier without rescanning it at the later barrier.
-
-This addendum reduces divergence by removing nonlinear local realization from the scan path. It does **not** claim to make multi-wave liquidation outcomes identical to a global eager settlement model.
-
----
-
-## A1. New definitions
-
-### A1.1 Barrier snapshot `B`
-
-A **barrier snapshot** is the tuple captured immediately after a single successful `accrue_market_to(now_slot, oracle_price)` at the start of a keeper instruction and before any account-local touch, liquidation, reset scheduling, or cleanup write in that instruction.
-
-`B` MUST include at least:
-
-- `current_slot_B = now_slot`
-- `oracle_price_B = oracle_price`
-- `A_long_B`, `A_short_B`
-- `K_long_B`, `K_short_B`
-- `epoch_long_B`, `epoch_short_B`
-- `K_epoch_start_long_B`, `K_epoch_start_short_B`
-- `mode_long_B`, `mode_short_B`
-- `OI_eff_long_B`, `OI_eff_short_B`
-- any implementation-specific read-only maintenance-fee accumulator state needed to upper-bound account-local pending fee debt through `current_slot_B`
-
-Within one two-phase keeper instruction, phase 1 MUST use only this single barrier `B`.
-
-### A1.2 Review candidate classes
-
-A **review candidate** is an account that phase 1 does not prove safe at `B`.
-
-This addendum defines three review classes:
-
-- `ReviewLiquidation`: an open-position account that may be liquidatable at `B`, or an open-position account whose preview could not safely complete and therefore requires priority exact revalidation.
-- `ReviewCleanupResetProgress`: an account that is not proven liquidatable, but whose exact touch may be necessary to decrement `stale_account_count_*`, reconcile an epoch-mismatch account on a `ResetPending` side, or clear no-live-OI dust that can block reset scheduling/finalization.
-- `ReviewCleanup`: any other cleanup-only account whose exact touch may still be needed for dust zeroing, flat negative-loss cleanup, or other conservative housekeeping.
-
-### A1.3 Safe account at barrier
-
-An account is **safe at barrier** only if phase 1 proves that, at barrier `B`, the account is not liquidatable and does not require mandatory stale/dust cleanup for current reset progress.
-
-### A1.4 Pending maintenance-fee upper bound
-
-If recurring account-local maintenance fees are disabled, define:
-
-- `pending_maint_fee_ub_i(B) = 0`
-
-If recurring account-local maintenance fees are enabled, the implementation MUST provide a pure helper:
-
-- `preview_account_local_fee_debt_ub(i, B) -> u128`
-
-with all of the following properties:
-
-1. It MUST be read-only.
-2. It MUST use the same bounded arithmetic and interval-splitting obligations as the realized maintenance-fee path.
-3. It MUST return an upper bound on the additional account-local fee effect on `Eq_net_i` that a full current-state touch at barrier `B` could realize.
-4. It MAY model pending maintenance charges as fee debt even if the realized implementation would partially collect them from capital, provided the returned amount is not smaller than the true current-state equity reduction.
-
-Define:
-
-- `pending_maint_fee_ub_i(B) = preview_account_local_fee_debt_ub(i, B)` when enabled.
-
-### A1.5 Local notation
-
-In this addendum:
-
-- `checked_cast_i128(x)` means an exact cast from a bounded nonnegative integer to `i128`, or conservative failure if the cast would not fit
-- `checked_mul_u128(a, b)` means exact `u128` multiplication, or conservative failure on overflow
-
-These are notation shorthands only; an implementation MAY inline equivalent checked logic.
-
----
-
-## A2. Pure preview helper
-
-The implementation MAY expose, or internally use, the following pure helper.
-
-### A2.1 `preview_account_at_barrier(i, B)`
-
-This helper MUST be read-only and MUST NOT materialize missing accounts.
-
-For an existing account `i`, it MUST either:
-
-- return one of the review classes defined in §A1.2 directly, or
-- compute the virtual quantities below and then classify under §A3.
-
-### A2.1.1 Virtual position / epoch status
-
-If `basis_pos_q_i == 0`:
-
-- `preview_kind = Flat`
-- `q_eff_barrier = 0`
-- `pnl_delta_barrier = 0`
-
-Else let `s = side(basis_pos_q_i)` and `den = checked_mul_u128(a_basis_i, POS_SCALE)`.
-
-If `epoch_snap_i == epoch_s_B`:
-
-- `preview_kind = SameEpoch`
-- `q_eff_barrier_abs = mul_div_floor_u128(abs(basis_pos_q_i) as u128, A_s_B, a_basis_i)`
-- `q_eff_barrier = sign(basis_pos_q_i) * (q_eff_barrier_abs as i128)`
-- `pnl_delta_barrier = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_s_B, den)`
-
-Else:
-
-- if `mode_s_B != ResetPending` or `epoch_snap_i + 1 != epoch_s_B`, the preview MUST conservatively return `ReviewLiquidation` when `basis_pos_q_i != 0`; it MUST NOT classify the account `Safe`
-- `preview_kind = EpochMismatch`
-- `q_eff_barrier = 0`
-- `pnl_delta_barrier = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s_B, den)`
-
-The helper MUST then compute:
-
-- `PNL_virtual_i = checked_add_i128(PNL_i, pnl_delta_barrier)`
-
-### A2.1.2 Preview failure routing
-
-Any checked-arithmetic failure, invalid cast under the base spec's numeric bounds, inability to compute a required conservative upper bound, or other failure encountered anywhere in `preview_account_at_barrier(i, B)` MUST be routed as follows:
-
-1. If `basis_pos_q_i != 0`, the preview MUST classify the account as `ReviewLiquidation`.
-2. If `basis_pos_q_i == 0`, the preview MUST classify the account as `ReviewCleanup`.
-3. Phase 1 MUST NOT classify any such account `Safe`.
-
-This rule is normative even when the implementation internally computes fee-debt bounds or equity terms before position terms.
-
-### A2.1.3 Virtual fee-debt upper bound
-
-If preview has not already returned a review class under §A2.1.2, the helper MUST compute:
-
-- `FeeDebt_virtual_ub_i = checked_add_u128(fee_debt_u128_checked(fee_credits_i), pending_maint_fee_ub_i(B))`
-
-### A2.1.4 Conservative equity lower bound
-
-If preview has not already returned a review class under §A2.1.2, the helper MUST compute:
-
-- `Eq_scan_lb_i = max(0, (C_i as i128) + min(PNL_virtual_i, 0) - checked_cast_i128(FeeDebt_virtual_ub_i))`
-
-This helper MUST NOT include positive realized PnL, positive warmup conversion, fee-debt sweeps, or any other capital-increasing effect in `Eq_scan_lb_i`.
-
-### A2.1.5 Maintenance requirement at barrier
-
-If preview has not already returned a review class under §A2.1.2 and `q_eff_barrier != 0`, the helper MUST compute exact current-position maintenance requirement at barrier:
-
-- `Notional_barrier_i = mul_div_floor_u128(abs(q_eff_barrier) as u128, oracle_price_B, POS_SCALE)`
-- `MM_req_barrier_i = mul_div_floor_u128(Notional_barrier_i, maintenance_bps, 10_000)`
-
-Else define:
-
-- `Notional_barrier_i = 0`
-- `MM_req_barrier_i = 0`
-
----
-
-## A3. Conservative classification rule
-
-Phase 1 MUST classify each scanned existing account as follows.
-
-### A3.1 `ReviewCleanupResetProgress`
-
-Classify as `ReviewCleanupResetProgress` if any of the following hold:
-
-1. `preview_kind == EpochMismatch`
-2. `basis_pos_q_i != 0` and `q_eff_barrier == 0`, and at least one of the following also holds:
-   - `mode_s_B == ResetPending`
-   - `mode_s_B == DrainOnly`
-   - `OI_eff_s_B == 0`
-
-An implementation MAY also classify additional accounts as `ReviewCleanupResetProgress` for conservative reset-progress reasons.
-
-### A3.2 `ReviewCleanup`
-
-Otherwise classify as `ReviewCleanup` if any of the following hold:
-
-1. `basis_pos_q_i != 0` and `q_eff_barrier == 0`
-2. `basis_pos_q_i == 0` and `PNL_virtual_i < 0`
-
-An implementation MAY also classify additional accounts as `ReviewCleanup` for conservative operational reasons.
-
-### A3.3 `ReviewLiquidation`
-
-Otherwise, if `q_eff_barrier != 0` and `Eq_scan_lb_i <= (MM_req_barrier_i as i128)`, classify as `ReviewLiquidation`.
-
-Accounts already returned as `ReviewLiquidation` under §A2.1.2 remain in this class.
-
-### A3.4 `Safe`
-
-Otherwise classify as `Safe`.
-
-### A3.5 No-false-negative guarantee
-
-For the barrier state `B`, the phase-1 classifier MUST satisfy:
-
-- if a full exact current-state touch at `B` would make the account liquidatable under the base spec, phase 1 MUST classify it as `ReviewLiquidation`, `ReviewCleanupResetProgress`, or `ReviewCleanup`, never `Safe`
-
-This follows because:
-
-1. `q_eff_barrier` is exact at `B` when preview succeeds
-2. `MM_req_barrier_i` is exact at `B`
-3. `Eq_scan_lb_i` ignores positive realized PnL and treats pending maintenance charges adversarially, so it is a lower bound on the account's true post-linear-settlement current-state equity at `B`
-4. principal loss settlement and fee-debt sweep are local bookkeeping transfers that do not improve liquidation health for an open account beyond what `Eq_scan_lb_i` already lower-bounds
-5. any preview failure on an open-position account is conservatively routed to `ReviewLiquidation`, never `Safe`
-
----
-
-## A4. Two-phase keeper mode
-
-### A4.1 Phase 1 — read-only scan
-
-A keeper instruction using this addendum MUST perform phase 1 as follows:
-
-1. validate trusted `now_slot` and validated `oracle_price` exactly as required by the base spec
-2. call `accrue_market_to(now_slot, oracle_price)` exactly once
-3. capture barrier snapshot `B`
-4. choose a bounded window of existing accounts and scan them using `preview_account_at_barrier(i, B)`
-5. build an in-memory or off-chain shortlist of `ReviewLiquidation`, `ReviewCleanupResetProgress`, and `ReviewCleanup` accounts
-6. perform **no** account-local or side-state writes during this scan other than the single initial accrual in step 2
-
-A missing account in the scan window MUST be ignored or rejected according to the base spec's missing-account rules. It MUST NOT be materialized by the scan.
-
-### A4.1.1 ResetPending scan fairness
-
-If either side is `ResetPending` at barrier `B`, the keeper's scan-window selection policy MUST eventually include the remaining accounts whose exact touch can decrement `stale_account_count_side` or otherwise progress reconciliation for that side. It MUST NOT indefinitely spend all scan windows on unrelated accounts while such reset-progress accounts remain.
-
-### A4.2 Optional preliminary sieve
-
-An implementation MAY prepend a cheaper preliminary sieve before the exact phase-1 preview above.
-
-However, any such sieve MUST satisfy one of the following:
-
-- it proves the account would be `Safe` under the exact phase-1 preview, or
-- it forwards the account to the exact phase-1 preview
-
-A preliminary sieve MUST NOT discard an account unless the exact phase-1 preview would also classify it as `Safe`.
-
-### A4.3 Phase 2 — exact current-state processing
-
-After phase 1 completes for the chosen scan window, phase 2 MAY process a bounded subset of shortlisted accounts.
-
-For every phase-2 account revalidation attempt, the keeper MUST:
-
-1. revalidate exact current state using the base spec's authoritative write path for that action
-2. decide liquidation / cleanup only from the current state at the moment of revalidation, not from the old barrier preview alone
-3. count the attempted exact current-state revalidation against the phase-2 budget whether or not it ultimately commits a liquidation or cleanup write
-4. stop further processing immediately and proceed to end-of-instruction reset handling if any pending reset flag becomes true during processing, exactly as required by the base spec
-
-### A4.3.1 Phase-2 budget metric
-
-The phase-2 budget MUST be expressed in terms of **exact current-state revalidation attempts**, not only committed writes.
-
-For this addendum, one **phase-2 revalidation attempt** is one shortlisted account for which the keeper invokes the base spec's exact current-state path (`touch_account_full`, an equivalent exact settle wrapper, or an exact liquidation revalidation sequence) in order to decide whether to write.
-
-A false-positive candidate that exact revalidation proves safe still consumes one phase-2 revalidation attempt.
-
-### A4.4 Scheduling and anti-starvation rule
-
-Within one two-phase keeper instruction, phase 2 scheduling MUST satisfy all of the following:
-
-1. `ReviewLiquidation` candidates are risk-priority candidates.
-2. `ReviewCleanup` candidates are ordinary cleanup-only candidates.
-3. If either side is `ResetPending` at barrier `B` and the shortlist contains one or more `ReviewCleanupResetProgress` candidates relevant to that side, then before the keeper exhausts its phase-2 revalidation budget on candidates that exact revalidation proves non-liquidatable, it MUST spend at least one phase-2 revalidation attempt on a relevant `ReviewCleanupResetProgress` candidate for that side, unless an earlier phase-2 write in the same instruction schedules a pending reset and forces immediate finalization.
-4. The keeper MAY interleave chosen `ReviewLiquidation` and `ReviewCleanupResetProgress` candidates in any order consistent with rule 3.
-5. The keeper MUST NOT process an ordinary `ReviewCleanup` candidate before it has completed all chosen `ReviewLiquidation` work and all chosen `ReviewCleanupResetProgress` work from the same shortlist.
-6. An implementation MAY reserve more than one reset-progress slot, and MAY run dedicated reset-progress waves when a side is `ResetPending`.
-
-This rule prevents both of the following:
-
-- dangerous open-position accounts being demoted behind ordinary cleanup solely because preview arithmetic failed
-- a false-positive `ReviewLiquidation` flood permanently starving reset-progress cleanup on an already `ResetPending` side
-
-### A4.5 Barrier invalidation after writes
-
-Once phase 2 performs any write that may change `A_side`, `K_side`, `epoch_side`, `OI_eff_*`, `stored_pos_count_*`, `stale_account_count_*`, `phantom_dust_bound_*_q`, or any account-local state used by classification, the original barrier `B` is no longer authoritative for future instructions.
-
-Therefore:
-
-- a `Safe` decision from one barrier MUST NOT be reused in any later instruction
-- an off-chain shortlist derived from one barrier MAY be stale or adversarial and MUST be revalidated on current state before any write
-
-This rule does **not** prevent the same instruction from continuing to process already-shortlisted candidates, because every such candidate is revalidated on current state immediately before action.
-
----
-
-## A5. Allowed and forbidden write shortcuts
-
-### A5.1 Forbidden in phase 1
-
-Phase 1 MUST NOT do any of the following for scanned accounts:
-
-- call `touch_account_full`
-- call `settle_side_effects`
-- call `attach_effective_position`
-- call `set_pnl`
-- call `set_capital`
-- mutate `fee_credits_i`, `R_i`, `w_start_i`, `w_slope_i`, `last_fee_slot_i`, `k_snap_i`, `a_basis_i`, `basis_pos_q_i`, or `epoch_snap_i`
-- schedule resets
-- finalize resets
-- sweep fee debt
-- convert warmup profits
-- settle losses from principal
-- perform cleanup-only zeroing
-
-### A5.2 Required exact path in phase 2
-
-A phase-2 `ReviewLiquidation` candidate MUST be revalidated by the base spec's exact current-state path before liquidation.
-
-A phase-2 `ReviewCleanupResetProgress` or `ReviewCleanup` candidate MUST be revalidated by the base spec's exact current-state path before any zeroing, stale reconciliation, or flat-loss cleanup.
-
-This addendum introduces **no** new economic write path. It introduces only a new read-only shortlist path and a new processing order.
-
----
-
-## A6. Pseudocode (non-normative)
-
-### A6.1 Pure preview
-
-```text
-preview_account_at_barrier(i, B):
-    if account i is missing:
-        return Missing
-
-    // Any preview failure on an open-position account routes to ReviewLiquidation.
-    // Any preview failure on a flat account routes to ReviewCleanup.
-
-    fee_due_ub = preview_account_local_fee_debt_ub(i, B)   // or 0 if disabled
-    fee_debt_ub = checked_add_u128(fee_debt_u128_checked(fee_credits_i), fee_due_ub)
 
     if basis_pos_q_i == 0:
-        pnl_virtual = PNL_i
-        if any_checked_failure_so_far:
-            return ReviewCleanup
-        if pnl_virtual < 0:
-            return ReviewCleanup
-        return Safe
+        schedule_end_of_instruction_resets(ctx)
+        finalize_end_of_instruction_resets(ctx)
+        recompute_r_last_from_final_state_if_needed()
+        return
 
-    s = side(basis_pos_q_i)
-    den = checked_mul_u128(a_basis_i, POS_SCALE)
+    assert 0 < x_req <= ReleasedPos_i
 
-    if epoch_snap_i == epoch_s_B:
-        q_eff_abs = mul_div_floor_u128(abs(basis_pos_q_i) as u128, A_s_B, a_basis_i)
-        q_eff = sign(basis_pos_q_i) * q_eff_abs
-        pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_s_B, den)
-        pnl_virtual = checked_add_i128(PNL_i, pnl_delta)
+    if PNL_matured_pos_tot == 0:
+        y = x_req
     else:
-        if mode_s_B != ResetPending or epoch_snap_i + 1 != epoch_s_B:
-            return ReviewLiquidation
-        q_eff = 0
-        pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs(basis_pos_q_i) as u128, k_snap_i, K_epoch_start_s_B, den)
-        pnl_virtual = checked_add_i128(PNL_i, pnl_delta)
-        return ReviewCleanupResetProgress
+        y = floor(x_req * h_num / h_den)
 
-    if any_checked_failure:
-        return ReviewLiquidation
+    consume_released_pnl(i, x_req)
+    set_capital(i, C_i + y)
+    sweep_fee_debt(i)
 
-    if q_eff == 0:
-        if mode_s_B == ResetPending or mode_s_B == DrainOnly or OI_eff_s_B == 0:
-            return ReviewCleanupResetProgress
-        return ReviewCleanup
+    if effective_pos_q(i) != 0:
+        assert maintenance_healthy(i)
 
-    eq_lb = max(0, checked_cast_i128(C_i) + min(pnl_virtual, 0) - checked_cast_i128(fee_debt_ub))
-    notional = floor(abs(q_eff) * oracle_price_B / POS_SCALE)
-    mm_req = floor(notional * maintenance_bps / 10_000)
-
-    if eq_lb <= mm_req:
-        return ReviewLiquidation
-    return Safe
-```
-
-### A6.2 Two-phase keeper
-
-```text
-keeper_barrier_wave(now_slot, oracle_price, scan_window, max_phase2_revalidations):
-    ctx = fresh_instruction_context()
-    assert max_phase2_revalidations >= 0
-    accrue_market_to(now_slot, oracle_price)
-    B = capture_barrier_snapshot(now_slot, oracle_price)
-
-    review_liq = []
-    review_reset = []
-    review_cleanup = []
-
-    for i in scan_window:
-        cls = preview_account_at_barrier(i, B)
-        if cls == ReviewLiquidation:
-            review_liq.push(i)
-        else if cls == ReviewCleanupResetProgress:
-            review_reset.push(i)
-        else if cls == ReviewCleanup:
-            review_cleanup.push(i)
-
-    revalidations = 0
-    reset_slot_required = (
-        max_phase2_revalidations > 0 and (
-            (mode_long_B == ResetPending and exists_relevant(review_reset, long)) or
-            (mode_short_B == ResetPending and exists_relevant(review_reset, short))
-        )
-    )
-    reset_slot_used = false
-
-    for i in review_liq:
-        if revalidations == max_phase2_revalidations:
-            break
-        remaining = max_phase2_revalidations - revalidations
-        if reset_slot_required and not reset_slot_used and remaining == 1:
-            break
-
-        touch_account_full(i, oracle_price, now_slot)
-        revalidations += 1
-        if account_is_liquidatable_now(i):
-            liquidate_current_state(i, oracle_price, now_slot, ctx)
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            goto finalize
-
-    if reset_slot_required and not reset_slot_used and revalidations < max_phase2_revalidations:
-        j = choose_relevant_reset_progress_candidate(review_reset, B)
-        if j exists:
-            touch_account_full(j, oracle_price, now_slot)
-            revalidations += 1
-            reset_slot_used = true
-            if ctx.pending_reset_long or ctx.pending_reset_short:
-                goto finalize
-
-    for i in review_liq not yet revalidated:
-        if revalidations == max_phase2_revalidations:
-            break
-        touch_account_full(i, oracle_price, now_slot)
-        revalidations += 1
-        if account_is_liquidatable_now(i):
-            liquidate_current_state(i, oracle_price, now_slot, ctx)
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            goto finalize
-
-    for i in review_reset not yet revalidated:
-        if revalidations == max_phase2_revalidations:
-            break
-        touch_account_full(i, oracle_price, now_slot)
-        revalidations += 1
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            goto finalize
-
-    for i in review_cleanup:
-        if revalidations == max_phase2_revalidations:
-            break
-        touch_account_full(i, oracle_price, now_slot)
-        revalidations += 1
-        if ctx.pending_reset_long or ctx.pending_reset_short:
-            goto finalize
-
-finalize:
     schedule_end_of_instruction_resets(ctx)
     finalize_end_of_instruction_resets(ctx)
-    if funding_rate_inputs_changed:
-        recompute_r_last_from_final_post_reset_state()
+    recompute_r_last_from_final_state_if_needed()
+```
+
+### 13.5 `reclaim_empty_account`
+
+```text
+reclaim_empty_account(i):
+    assert account_materialized(i)
+    assert C_i == 0
+    assert PNL_i == 0
+    assert R_i == 0
+    assert basis_pos_q_i == 0
+    assert fee_credits_i <= 0
+
+    fee_credits_i = 0
+    reset_local_fields_to_canonical_zero_defaults()
+    mark_slot_missing_and_reusable(i)
+    materialized_account_count -= 1
+```
+
+### 13.6 Off-chain shortlist keeper
+
+```text
+touch_account_after_instruction_accrual(i):
+    advance_profit_warmup(i)
+    settle_side_effects(i)
+    settle_losses_from_principal(i)
+    if effective_pos_q(i) == 0 and PNL_i < 0:
+        absorb_protocol_loss((-PNL_i) as u128)
+        set_pnl(i, 0)
+    realize_account_local_maintenance_fee_debt_if_enabled(i)
+    if basis_pos_q_i == 0:
+        convert_matured_released_profits(i)
+    sweep_fee_debt(i)
+
+keeper_crank(now_slot, oracle_price, ordered_candidates, max_revalidations):
+    ctx = fresh_instruction_context()
+    assert now_slot >= current_slot
+    assert now_slot >= slot_last
+    assert 0 < oracle_price <= MAX_ORACLE_PRICE
+
+    accrue_market_to(now_slot, oracle_price)
+    current_slot = now_slot
+
+    attempts = 0
+    for cand in ordered_candidates:
+        if attempts == max_revalidations:
+            break
+        if ctx.pending_reset_long or ctx.pending_reset_short:
+            break
+        if account_missing(cand.account_id):
+            continue
+
+        attempts += 1
+        i = cand.account_id
+
+        touch_account_after_instruction_accrual(i)
+
+        if account_is_liquidatable_now(i):
+            liquidate_from_current_touch(i, ctx, cand.policy_hint)  // same already-touched local liquidation execution as §§9.4–9.5 and §10.6 steps 4–6; no second touch; do not finalize resets mid-loop; ignore invalid hints
+
+        if ctx.pending_reset_long or ctx.pending_reset_short:
+            break
+
+    schedule_end_of_instruction_resets(ctx)
+    finalize_end_of_instruction_resets(ctx)
+    if funding_inputs_changed():
+        recompute_r_last_from_final_state()
     assert OI_eff_long == OI_eff_short
 ```
 
----
+### 13.7 Recommended off-chain shortlist builder
 
-## A7. Required tests for this addendum
+```text
+build_shortlist_offchain(sim_state, target_budget, fair_reset_rotation_state):
+    shortlist = []
 
-An implementation using this addendum MUST add tests that cover at least:
+    progress_sides = sides_already_resetpending_with_progress(sim_state)
+    for side in choose_fair_subset(progress_sides, target_budget, fair_reset_rotation_state):
+        shortlist.append(best_progress_candidate_for_side(sim_state, side))
+        if len(shortlist) == target_budget:
+            return shortlist
 
-1. **Read-only scan:** phase 1 mutates no account-local or side state except the single initial `accrue_market_to`.
-2. **No false negatives at barrier:** any account that is liquidatable after a full exact current-state touch at barrier `B` is never classified `Safe` by phase 1.
-3. **Positive-PnL conservatism:** ignoring positive realized PnL in `Eq_scan_lb_i` cannot turn a truly liquidatable account into `Safe`.
-4. **Maintenance-fee conservatism:** `preview_account_local_fee_debt_ub(i, B)` is never smaller than the true current-state equity reduction from recurring account-local maintenance through `B`.
-5. **Epoch-mismatch routing:** accounts with `epoch_snap_i + 1 == epoch_s_B` are classified `ReviewCleanupResetProgress`, never `Safe`.
-6. **Dust-zero routing:** same-epoch accounts with `basis_pos_q_i != 0` but `q_eff_barrier == 0` are classified as a cleanup class, never `Safe`.
-7. **Open-position preview failure priority:** any preview arithmetic failure on an account with `basis_pos_q_i != 0` routes to `ReviewLiquidation`, not to an ordinary cleanup class.
-8. **Reset-progress fairness:** when a side is `ResetPending` and the shortlist contains at least one relevant `ReviewCleanupResetProgress` candidate, the keeper spends at least one phase-2 revalidation attempt on such a candidate before exhausting its budget on candidates that exact revalidation proves non-liquidatable, unless an earlier write forces immediate finalization.
-9. **Ordinary cleanup ordering:** ordinary `ReviewCleanup` accounts are not processed before chosen `ReviewLiquidation` and chosen `ReviewCleanupResetProgress` work from the same shortlist.
-10. **Stale shortlist safety:** a candidate list derived from one barrier cannot cause an incorrect liquidation when replayed later, because phase 2 revalidates on current state before any write.
-11. **Barrier invalidation:** after a phase-2 liquidation mutates `A/K` or OI, accounts not yet processed must be rescanned in a later instruction before any new `Safe` decision is relied upon.
-12. **Reset short-circuit:** if a phase-2 action schedules a reset, the instruction stops further account processing and proceeds directly to end-of-instruction reset handling.
-13. **No repeated-rounding writes in phase 1:** repeated phase-1 scans without phase-2 writes do not change `k_snap_i`, `basis_pos_q_i`, `stored_pos_count_*`, or `phantom_dust_bound_*_q`.
-14. **Open-account loss-settlement invariance:** for an open account at a fixed barrier state, the scan lower-bound remains conservative even though phase 1 does not run `settle_losses_from_principal`.
-15. **Missing-account safety:** scanning a missing account neither materializes it nor creates a candidate write path.
-16. **Optional sieve superset property:** any configured preliminary sieve may reduce scan compute, but it never discards an account that the exact phase-1 preview would classify as a review class.
-17. **Phase-2 budget counts false positives:** a false-positive `ReviewLiquidation` candidate that exact revalidation proves safe still consumes one phase-2 revalidation attempt.
-18. **ResetPending scan fairness:** repeated keeper waves eventually scan the remaining reset-progress accounts on a `ResetPending` side; they are not starved forever by unrelated scan windows.
+    while len(shortlist) < target_budget and not sim_state.predicted_pending_reset:
+        band_b = live_liquidations_not_expected_to_schedule_reset(sim_state)
+        band_c = live_liquidations_expected_to_schedule_reset(sim_state)
+        band_d = cleanup_only_or_reclaimable(sim_state)
 
----
+        preserve_adl = opposite_side_bankruptcies_before_last_dust_zero(sim_state, band_b)
+        if preserve_adl exists:
+            cand = preserve_adl
+        elif band_b is not empty:
+            cand = argmax_lexicographic(
+                band_b,
+                bankruptcy_before_partial,
+                D_est_after_I_desc,
+                maintenance_shortfall_desc,
+                notional_desc,
+                drainonly_before_normal
+            )
+        elif band_c is not empty:
+            cand = argmax_lexicographic(
+                band_c,
+                D_est_after_I_desc,
+                maintenance_shortfall_desc,
+                notional_desc,
+                drainonly_before_normal
+            )
+        elif band_d is not empty:
+            cand = choose_cleanup_candidate(sim_state, band_d)
+        else:
+            break
 
-## A8. Integration notes
+        shortlist.append(cand)
+        sim_state = simulate_exact_touch_and_optional_liquidation(sim_state, cand)
 
-1. This addendum does **not** replace the base spec's exact settlement, liquidation, reset, or funding logic.
-2. This addendum is compatible with on-chain in-memory shortlists and with off-chain candidate derivation, provided every phase-2 action is revalidated on current state before write.
-3. The intended fairness improvement comes from two facts:
-   - phase 1 never performs passive nonlinear realization on accounts that are merely scanned
-   - phase 2 keeps risky open-account revalidation high-priority while reserving explicit progress for already-`ResetPending` sides
-4. This addendum intentionally allows false positives. It does not allow false negatives at the barrier.
-5. The addendum's phase-2 cap is a compute cap on **revalidation attempts**, not merely on successful writes.
+    return shortlist
+```
+
+## 14. Compatibility and upgrade notes
+
+1. LP accounts and user accounts may share the same protected-principal and junior-profit mechanics.
+2. The mandatory `O(1)` global aggregates for solvency are `C_tot`, `PNL_pos_tot`, and `PNL_matured_pos_tot`; the A/K side indices add `O(1)` state for lazy settlement.
+3. This spec deliberately rejects hidden residual matching. Bankruptcy socialization occurs only through explicit Insurance Fund usage, explicit A/K state, or junior undercollateralization.
+4. Any upgrade path from a version that did not maintain `R_i`, `PNL_matured_pos_tot`, `basis_pos_q_i`, `a_basis_i`, `stored_pos_count_*`, `stale_account_count_*`, or `phantom_dust_bound_*_q` consistently MUST complete migration before OI-increasing operations are re-enabled.
+5. Any upgrade from an earlier integrated barrier-preview or addendum-based keeper design MAY drop the on-chain preview helper and barrier-scan logic once the exact current-state `keeper_crank` path and the shortlist-oriented tests from §12 are implemented.
 

@@ -194,7 +194,7 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn t9_35_warmup_slope_preservation() {
+fn t9_35_warmup_release_monotone_in_time() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 10_000_000, 100, 0).unwrap();
@@ -202,18 +202,27 @@ fn t9_35_warmup_slope_preservation() {
     let pnl_val: u8 = kani::any();
     kani::assume(pnl_val > 0);
     engine.set_pnl(idx as usize, pnl_val as i128);
+    engine.restart_warmup_after_reserve_increase(idx as usize);
 
-    engine.accounts[idx as usize].warmup_started_at_slot = 0;
-    engine.accounts[idx as usize].warmup_slope_per_step = 1u128;
-    engine.accounts[idx as usize].reserved_pnl = 0u128;
+    let r_initial = engine.accounts[idx as usize].reserved_pnl;
 
-    engine.current_slot = 1;
-    let w1 = engine.warmable_gross(idx as usize);
+    let t1: u8 = kani::any();
+    let t2: u8 = kani::any();
+    kani::assume(t1 < t2);
 
-    engine.current_slot = 2;
-    let w2 = engine.warmable_gross(idx as usize);
+    // Compute release at t1 on a clone
+    let mut e1 = engine.clone();
+    e1.current_slot = t1 as u64;
+    e1.advance_profit_warmup(idx as usize);
+    let released1 = r_initial - e1.accounts[idx as usize].reserved_pnl;
 
-    assert!(w2 >= w1, "warmable_gross must be monotonically non-decreasing");
+    // Compute release at t2 on another clone
+    let mut e2 = engine;
+    e2.current_slot = t2 as u64;
+    e2.advance_profit_warmup(idx as usize);
+    let released2 = r_initial - e2.accounts[idx as usize].reserved_pnl;
+
+    assert!(released2 >= released1, "warmup release must be monotone non-decreasing in time");
 }
 
 #[kani::proof]

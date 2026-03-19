@@ -796,7 +796,12 @@ fn proof_funding_rate_validated_before_storage() {
 
     // Pass an invalid funding rate (> MAX_ABS_FUNDING_BPS_PER_SLOT)
     let bad_rate: i64 = MAX_ABS_FUNDING_BPS_PER_SLOT + 1;
-    let result = engine.keeper_crank(a, 1, 100, bad_rate);
+    // keeper_crank no longer accepts funding rate — it uses stored rate.
+    // Set a bad rate directly and verify crank still works.
+    engine.set_funding_rate_for_next_interval(bad_rate);
+
+    // The stored rate should be clamped or validated
+    let result = engine.keeper_crank(1, 100, &[a], 1);
 
     if result.is_ok() {
         let stored = engine.funding_rate_bps_per_slot_last;
@@ -804,7 +809,9 @@ fn proof_funding_rate_validated_before_storage() {
             "stored funding rate must be within bounds after successful crank");
     }
 
-    let result2 = engine.keeper_crank(a, 2, 100, 0);
+    // Reset to valid rate and verify protocol works
+    engine.set_funding_rate_for_next_interval(0);
+    let result2 = engine.keeper_crank(2, 100, &[a], 1);
     assert!(result2.is_ok(),
         "protocol must not be bricked by a previous bad funding rate input");
 }

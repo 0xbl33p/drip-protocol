@@ -255,7 +255,7 @@ fn t11_53_keeper_crank_quiesces_after_pending_reset() {
     let c_cap_before = engine.accounts[c as usize].capital.get();
     let c_pnl_before = engine.accounts[c as usize].pnl;
 
-    let result = engine.keeper_crank(a, 1, 100, 0);
+    let result = engine.keeper_crank(1, 100, &[a], 1);
     assert!(result.is_ok());
 
     assert!(engine.accounts[c as usize].capital.get() == c_cap_before,
@@ -336,7 +336,7 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
 
     assert!(engine.side_mode_long == SideMode::ResetPending);
 
-    let result = engine.keeper_crank(b, 1, 100, 0);
+    let result = engine.keeper_crank(1, 100, &[a, b], 2);
     assert!(result.is_ok());
 
     assert!(engine.side_mode_long == SideMode::Normal,

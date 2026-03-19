@@ -245,10 +245,11 @@ fn proof_notional_scales_with_price() {
     assert!(n2 >= n1, "notional must be monotone in price");
 }
 
+/// advance_profit_warmup releases at most reserved_pnl (§4.9)
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_warmup_bounded_by_available() {
+fn proof_warmup_release_bounded_by_reserved() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
@@ -256,50 +257,46 @@ fn proof_warmup_bounded_by_available() {
     let pnl_val: u16 = kani::any();
     kani::assume(pnl_val > 0 && pnl_val <= 10_000);
     engine.set_pnl(idx as usize, pnl_val as i128);
-    engine.update_warmup_slope(idx as usize);
+    // After set_pnl, reserved_pnl tracks the positive PnL increase
+    let r_before = engine.accounts[idx as usize].reserved_pnl;
+    engine.restart_warmup_after_reserve_increase(idx as usize);
 
     let elapsed: u16 = kani::any();
     kani::assume(elapsed <= 500);
     engine.current_slot = DEFAULT_SLOT + elapsed as u64;
 
-    let warmable = engine.warmable_gross(idx as usize);
-    let pnl = engine.accounts[idx as usize].pnl;
-    let avail = if pnl > 0 {
-        (pnl as u128).saturating_sub(engine.accounts[idx as usize].reserved_pnl)
-    } else {
-        0u128
-    };
+    engine.advance_profit_warmup(idx as usize);
+    let r_after = engine.accounts[idx as usize].reserved_pnl;
 
-    assert!(warmable <= avail);
+    // reserved can only decrease or stay the same
+    assert!(r_after <= r_before, "advance_profit_warmup must not increase reserve");
 }
 
+/// advance_profit_warmup releases at most slope * elapsed (§4.9)
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_warmup_bounded_by_cap() {
+fn proof_warmup_release_bounded_by_slope() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     engine.set_pnl(idx as usize, 50_000i128);
-    engine.update_warmup_slope(idx as usize);
+    engine.restart_warmup_after_reserve_increase(idx as usize);
 
     let slope = engine.accounts[idx as usize].warmup_slope_per_step;
-    let started = engine.accounts[idx as usize].warmup_started_at_slot;
+    let r_before = engine.accounts[idx as usize].reserved_pnl;
 
     let elapsed: u16 = kani::any();
     kani::assume(elapsed <= 500);
-    engine.current_slot = started + elapsed as u64;
+    engine.current_slot = engine.accounts[idx as usize].warmup_started_at_slot + elapsed as u64;
 
-    let warmable = engine.warmable_gross(idx as usize);
+    engine.advance_profit_warmup(idx as usize);
+    let r_after = engine.accounts[idx as usize].reserved_pnl;
+    let released = r_before - r_after;
 
-    let cap = if slope == 0 {
-        0u128
-    } else {
-        slope.checked_mul(elapsed as u128).unwrap_or(u128::MAX)
-    };
-
-    assert!(warmable <= cap);
+    let cap = saturating_mul_u128_u64(slope, elapsed as u64);
+    assert!(released <= cap, "release must not exceed slope * elapsed");
 }
 
 // ============================================================================

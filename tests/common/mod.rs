@@ -114,6 +114,7 @@ pub fn zero_fee_params() -> RiskParams {
         liquidation_fee_cap: U128::ZERO,
         liquidation_buffer_bps: 50,
         min_liquidation_abs: U128::ZERO,
+        min_initial_deposit: U128::ZERO,
     }
 }
 
@@ -131,5 +132,6 @@ pub fn default_params() -> RiskParams {
         liquidation_fee_cap: U128::new(1_000_000),
         liquidation_buffer_bps: 50,
         min_liquidation_abs: U128::new(0),
+        min_initial_deposit: U128::ZERO,
     }
 }
