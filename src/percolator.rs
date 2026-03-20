@@ -79,7 +79,7 @@ pub use i128::{I128, U128};
 // ============================================================================
 pub mod wide_math;
 use wide_math::{
-    U256,
+    U256, I256,
     mul_div_floor_u128, mul_div_ceil_u128,
     wide_mul_div_floor_u128,
     wide_signed_mul_div_floor_from_k_pair,
@@ -1233,9 +1233,11 @@ impl RiskEngine {
     // absorb_protocol_loss (spec §4.7)
     // ========================================================================
 
-    pub fn absorb_protocol_loss(&mut self, loss: u128) {
+    /// use_insurance_buffer (spec §4.11): deduct loss from insurance down to floor,
+    /// return the remaining uninsured loss.
+    pub fn use_insurance_buffer(&mut self, loss: u128) -> u128 {
         if loss == 0 {
-            return;
+            return 0;
         }
         let ins_bal = self.insurance_fund.balance.get();
         let available = ins_bal.saturating_sub(self.insurance_floor);
@@ -1243,6 +1245,16 @@ impl RiskEngine {
         if pay > 0 {
             self.insurance_fund.balance = U128::new(ins_bal - pay);
         }
+        loss - pay
+    }
+
+    /// absorb_protocol_loss (spec §4.11): use_insurance_buffer then record
+    /// any remaining uninsured loss as implicit haircut.
+    pub fn absorb_protocol_loss(&mut self, loss: u128) {
+        if loss == 0 {
+            return;
+        }
+        let _rem = self.use_insurance_buffer(loss);
         // Remaining loss is implicit haircut through h
     }
 
@@ -1260,35 +1272,41 @@ impl RiskEngine {
             self.set_oi_eff(liq_side, new_oi);
         }
 
-        // Step 2: read opposing OI
+        // Step 2 (§5.6 step 2): insurance-first deficit coverage
+        let d_rem = if d > 0 { self.use_insurance_buffer(d) } else { 0u128 };
+
+        // Step 3: read opposing OI
         let oi = self.get_oi_eff(opp);
 
-        // Step 3: if OI == 0
+        // Step 4 (§5.6 step 4): if OI == 0
         if oi == 0 {
-            if d != 0 {
-                self.absorb_protocol_loss(d);
-            }
-            return Ok(());
-        }
-
-        // Step 4 (v10.5): if OI > 0 and stored_pos_count_opp == 0,
-        // route deficit through absorb and do NOT modify K_opp.
-        if self.get_stored_pos_count(opp) == 0 {
-            if q_close_q > oi {
-                return Err(RiskError::CorruptState);
-            }
-            let oi_post = oi.checked_sub(q_close_q).ok_or(RiskError::Overflow)?;
-            if d != 0 {
-                self.absorb_protocol_loss(d);
-            }
-            self.set_oi_eff(opp, oi_post);
-            if oi_post == 0 {
+            // D_rem > 0 → record_uninsured_protocol_loss (implicit through h, no-op)
+            if self.get_oi_eff(liq_side) == 0 {
+                set_pending_reset(ctx, liq_side);
                 set_pending_reset(ctx, opp);
             }
             return Ok(());
         }
 
-        // Step 5: require q_close_q <= OI
+        // Step 5 (§5.6 step 5): if OI > 0 and stored_pos_count_opp == 0,
+        // route deficit through record_uninsured and do NOT modify K_opp.
+        if self.get_stored_pos_count(opp) == 0 {
+            if q_close_q > oi {
+                return Err(RiskError::CorruptState);
+            }
+            let oi_post = oi.checked_sub(q_close_q).ok_or(RiskError::Overflow)?;
+            // D_rem > 0 → record_uninsured_protocol_loss (implicit through h, no-op)
+            self.set_oi_eff(opp, oi_post);
+            if oi_post == 0 {
+                set_pending_reset(ctx, opp);
+                if self.get_oi_eff(liq_side) == 0 {
+                    set_pending_reset(ctx, liq_side);
+                }
+            }
+            return Ok(());
+        }
+
+        // Step 6 (§5.6 step 6): require q_close_q <= OI
         if q_close_q > oi {
             return Err(RiskError::CorruptState);
         }
@@ -1296,16 +1314,14 @@ impl RiskEngine {
         let a_old = self.get_a_side(opp);
         let oi_post = oi.checked_sub(q_close_q).ok_or(RiskError::Overflow)?;
 
-        // Step 6: handle D > 0 (quote deficit)
-        // v10.5: fused delta_K_abs = ceil(D * A_old * POS_SCALE / OI)
+        // Step 7 (§5.6 step 7): handle D_rem > 0 (quote deficit after insurance)
+        // Fused delta_K_abs = ceil(D_rem * A_old * POS_SCALE / OI)
         // Per §1.5 Rule 14: if the quotient doesn't fit in i128, route to
-        // absorb_protocol_loss instead of panicking.
-        if d != 0 {
+        // record_uninsured_protocol_loss instead of panicking.
+        if d_rem != 0 {
             let a_ps = a_old.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            // Use wide_mul_div_ceil_u128_or_over_i128max for representability check
-            match wide_mul_div_ceil_u128_or_over_i128max(d, a_ps, oi) {
+            match wide_mul_div_ceil_u128_or_over_i128max(d_rem, a_ps, oi) {
                 Ok(delta_k_abs) => {
-                    // delta_k_abs fits in i128::MAX as u128, so negate is safe
                     let delta_k = -(delta_k_abs as i128);
                     let k_opp = self.get_k_side(opp);
                     match k_opp.checked_add(delta_k) {
@@ -1313,21 +1329,23 @@ impl RiskEngine {
                             self.set_k_side(opp, new_k);
                         }
                         None => {
-                            self.absorb_protocol_loss(d);
+                            // K-space overflow: record_uninsured (no-op)
                         }
                     }
                 }
                 Err(OverI128Magnitude) => {
-                    // Quotient overflow: deficit too large to represent in K-space
-                    self.absorb_protocol_loss(d);
+                    // Quotient overflow: record_uninsured (no-op)
                 }
             }
         }
 
-        // Step 7: if OI_post == 0
+        // Step 8 (§5.6 step 8): if OI_post == 0
         if oi_post == 0 {
             self.set_oi_eff(opp, 0u128);
             set_pending_reset(ctx, opp);
+            if self.get_oi_eff(liq_side) == 0 {
+                set_pending_reset(ctx, liq_side);
+            }
             return Ok(());
         }
 
@@ -1577,16 +1595,34 @@ impl RiskEngine {
         wide_mul_div_floor_u128(released, h_num, h_den)
     }
 
-    /// Eq_maint_raw_i (spec §3.4): C_i + PNL_i - FeeDebt_i in wide signed domain.
-    /// For maintenance margin and liquidation checks. Uses full local PNL_i.
-    /// Returns i128 (may be negative).
+    /// Eq_maint_raw_i (spec §3.4): C_i + PNL_i - FeeDebt_i in exact widened signed domain.
+    /// For maintenance margin and one-sided health checks. Uses full local PNL_i.
+    /// Returns i128. Negative overflow is projected to i128::MIN + 1 per §3.4
+    /// (safe for one-sided checks against nonneg thresholds). For strict
+    /// before/after buffer comparisons, use account_equity_maint_raw_wide.
     pub fn account_equity_maint_raw(&self, account: &Account) -> i128 {
-        let cap_i128 = account.capital.get() as i128;
-        let pnl = account.pnl;
-        let fee_debt = fee_debt_u128_checked(account.fee_credits.get());
-        let fee_debt_i128 = if fee_debt > i128::MAX as u128 { i128::MAX } else { fee_debt as i128 };
+        let wide = self.account_equity_maint_raw_wide(account);
+        match wide.try_into_i128() {
+            Some(v) => v,
+            None => {
+                // Positive overflow: unreachable, fail conservatively (return 0)
+                // Negative overflow: project to i128::MIN + 1 per spec §3.4
+                if wide.is_negative() { i128::MIN + 1 } else { 0i128 }
+            }
+        }
+    }
 
-        cap_i128.saturating_add(pnl).saturating_sub(fee_debt_i128)
+    /// Eq_maint_raw_i in exact I256 (spec §3.4 "transient widened signed type").
+    /// MUST be used for strict before/after raw maintenance-buffer comparisons
+    /// (§10.5 step 29). No saturation or clamping.
+    pub fn account_equity_maint_raw_wide(&self, account: &Account) -> I256 {
+        let cap = I256::from_u128(account.capital.get());
+        let pnl = I256::from_i128(account.pnl);
+        let fee_debt = I256::from_u128(fee_debt_u128_checked(account.fee_credits.get()));
+
+        // C + PNL - FeeDebt in exact I256 — cannot overflow 256 bits
+        let sum = cap.checked_add(pnl).expect("I256 add overflow");
+        sum.checked_sub(fee_debt).expect("I256 sub overflow")
     }
 
     /// Eq_net_i (spec §3.4): max(0, Eq_maint_raw_i). For maintenance margin checks.
@@ -1597,16 +1633,23 @@ impl RiskEngine {
 
     /// Eq_init_raw_i (spec §3.4): C_i + min(PNL_i, 0) + PNL_eff_matured_i - FeeDebt_i
     /// For initial margin and withdrawal checks. Uses haircutted matured PnL only.
-    /// Returns i128 (may be negative).
+    /// Returns i128. Negative overflow projected to i128::MIN + 1 per §3.4.
     pub fn account_equity_init_raw(&self, account: &Account, idx: usize) -> i128 {
-        let cap_i128 = account.capital.get() as i128;
-        let neg_pnl: i128 = if account.pnl < 0 { account.pnl } else { 0i128 };
-        let eff_matured = self.effective_matured_pnl(idx);
-        let eff_matured_i128 = if eff_matured > i128::MAX as u128 { i128::MAX } else { eff_matured as i128 };
-        let fee_debt = fee_debt_u128_checked(account.fee_credits.get());
-        let fee_debt_i128 = if fee_debt > i128::MAX as u128 { i128::MAX } else { fee_debt as i128 };
+        let cap = I256::from_u128(account.capital.get());
+        let neg_pnl = I256::from_i128(if account.pnl < 0 { account.pnl } else { 0i128 });
+        let eff_matured = I256::from_u128(self.effective_matured_pnl(idx));
+        let fee_debt = I256::from_u128(fee_debt_u128_checked(account.fee_credits.get()));
 
-        cap_i128.saturating_add(neg_pnl).saturating_add(eff_matured_i128).saturating_sub(fee_debt_i128)
+        let sum = cap.checked_add(neg_pnl).expect("I256 add overflow")
+            .checked_add(eff_matured).expect("I256 add overflow")
+            .checked_sub(fee_debt).expect("I256 sub overflow");
+
+        match sum.try_into_i128() {
+            Some(v) => v,
+            None => {
+                if sum.is_negative() { i128::MIN + 1 } else { 0i128 }
+            }
+        }
     }
 
     /// Eq_init_net_i (spec §3.4): max(0, Eq_init_raw_i). For IM/withdrawal checks.
@@ -2237,10 +2280,10 @@ impl RiskEngine {
             let not = self.notional(b as usize, oracle_price);
             mul_u128(not, self.params.maintenance_margin_bps as u128) / 10_000
         };
-        let maint_raw_pre_a = self.account_equity_maint_raw(&self.accounts[a as usize]);
-        let maint_raw_pre_b = self.account_equity_maint_raw(&self.accounts[b as usize]);
-        let buffer_pre_a = maint_raw_pre_a.saturating_sub(mm_req_pre_a as i128);
-        let buffer_pre_b = maint_raw_pre_b.saturating_sub(mm_req_pre_b as i128);
+        let maint_raw_wide_pre_a = self.account_equity_maint_raw_wide(&self.accounts[a as usize]);
+        let maint_raw_wide_pre_b = self.account_equity_maint_raw_wide(&self.accounts[b as usize]);
+        let buffer_pre_a = maint_raw_wide_pre_a.checked_sub(I256::from_u128(mm_req_pre_a)).expect("I256 sub");
+        let buffer_pre_b = maint_raw_wide_pre_b.checked_sub(I256::from_u128(mm_req_pre_b)).expect("I256 sub");
 
         // Step 6: compute new effective positions
         let new_eff_a = old_eff_a.checked_add(size_q).ok_or(RiskError::Overflow)?;
@@ -2404,7 +2447,7 @@ impl RiskEngine {
     }
 
     /// Enforce post-trade margin per spec §10.5 step 29.
-    /// Uses strict risk-reducing buffer comparison with Eq_maint_raw.
+    /// Uses strict risk-reducing buffer comparison with exact I256 Eq_maint_raw.
     fn enforce_post_trade_margin(
         &self,
         a: usize,
@@ -2414,8 +2457,8 @@ impl RiskEngine {
         new_eff_a: &i128,
         old_eff_b: &i128,
         new_eff_b: &i128,
-        buffer_pre_a: i128,
-        buffer_pre_b: i128,
+        buffer_pre_a: I256,
+        buffer_pre_b: I256,
     ) -> Result<()> {
         self.enforce_one_side_margin(a, oracle_price, old_eff_a, new_eff_a, buffer_pre_a)?;
         self.enforce_one_side_margin(b, oracle_price, old_eff_b, new_eff_b, buffer_pre_b)?;
@@ -2428,7 +2471,7 @@ impl RiskEngine {
         oracle_price: u64,
         old_eff: &i128,
         new_eff: &i128,
-        buffer_pre: i128,
+        buffer_pre: I256,
     ) -> Result<()> {
         if *new_eff == 0 {
             // Flat: PnL must be >= 0 after settle_losses (steps 25-26)
@@ -2463,12 +2506,13 @@ impl RiskEngine {
         } else if strictly_reducing {
             // Strict risk-reducing: allow only if post-trade raw maintenance buffer
             // is strictly greater than pre-trade buffer (spec §10.5 step 29)
+            // Uses exact I256 per §3.4 — no saturation or clamping.
             let mm_req_post = {
                 let not = self.notional(idx, oracle_price);
                 mul_u128(not, self.params.maintenance_margin_bps as u128) / 10_000
             };
-            let maint_raw_post = self.account_equity_maint_raw(&self.accounts[idx]);
-            let buffer_post = maint_raw_post.saturating_sub(mm_req_post as i128);
+            let maint_raw_wide_post = self.account_equity_maint_raw_wide(&self.accounts[idx]);
+            let buffer_post = maint_raw_wide_post.checked_sub(I256::from_u128(mm_req_post)).expect("I256 sub");
             if buffer_post > buffer_pre {
                 // Improved: allow
             } else {
