@@ -1,6 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v11.5
+//! Formally Verified Risk Engine for Perpetual DEX — v11.26
 //!
-//! Implements the v11.5 spec: Native 128-bit Architecture.
+//! Implements the v11.26 spec: Native 128-bit Architecture.
 //!
 //! This module implements a formally verified risk engine that guarantees:
 //! 1. Protected principal for flat accounts
