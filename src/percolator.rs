@@ -1688,15 +1688,17 @@ impl RiskEngine {
         eq_net > mm_req_i128
     }
 
-    /// is_above_initial_margin (spec §9.1): Eq_init_net_i >= IM_req_i
+    /// is_above_initial_margin (spec §9.1): exact Eq_init_raw_i >= IM_req_i
     /// IM_req_i = max(proportional, MIN_NONZERO_IM_REQ)
+    /// Per spec §3.4: MUST use exact raw equity, not clamped Eq_init_net_i,
+    /// so negative raw equity is distinguishable from zero.
     pub fn is_above_initial_margin(&self, account: &Account, idx: usize, oracle_price: u64) -> bool {
-        let eq_init_net = self.account_equity_init_net(account, idx);
+        let eq_init_raw = self.account_equity_init_raw(account, idx);
         let not = self.notional(idx, oracle_price);
         let proportional = mul_div_floor_u128(not, self.params.initial_margin_bps as u128, 10_000);
         let im_req = core::cmp::max(proportional, self.params.min_nonzero_im_req);
         let im_req_i128 = if im_req > i128::MAX as u128 { i128::MAX } else { im_req as i128 };
-        eq_init_net >= im_req_i128
+        eq_init_raw >= im_req_i128
     }
 
     // ========================================================================
@@ -1862,20 +1864,9 @@ impl RiskEngine {
                 .saturating_add(pay_i128);
             self.insurance_fund.balance = self.insurance_fund.balance + pay;
         }
-        // If capital insufficient, consume matured released PnL to cover remaining debt.
-        // Prevents fee starvation of insurance fund by profitable open-position accounts.
-        let remaining = fee_debt_u128_checked(self.accounts[idx].fee_credits.get());
-        if remaining > 0 {
-            let released = self.released_pos(idx);
-            let pay_pnl = core::cmp::min(remaining, released);
-            if pay_pnl > 0 {
-                self.consume_released_pnl(idx, pay_pnl);
-                let pay_i128 = core::cmp::min(pay_pnl, i128::MAX as u128) as i128;
-                self.accounts[idx].fee_credits = self.accounts[idx].fee_credits
-                    .saturating_add(pay_i128);
-                self.insurance_fund.balance = self.insurance_fund.balance + pay_pnl;
-            }
-        }
+        // Per spec §7.5: unpaid fee debt remains as local fee_credits until
+        // physical capital becomes available or manual profit conversion occurs.
+        // MUST NOT consume junior PnL claims to mint senior insurance capital.
     }
 
     // ========================================================================
@@ -3026,11 +3017,6 @@ impl RiskEngine {
             let block = idx >> 6;
             let bit = idx & 63;
             if (self.used[block] & (1u64 << bit)) == 0 {
-                continue;
-            }
-
-            // Never GC LP accounts
-            if self.accounts[idx].is_lp() {
                 continue;
             }
 

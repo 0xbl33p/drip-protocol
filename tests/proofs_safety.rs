@@ -1499,3 +1499,168 @@ fn proof_property_56_exact_raw_im_approval() {
 
     assert!(engine.check_conservation());
 }
+
+// ############################################################################
+// AUDIT ISSUE #2: fee_debt_sweep PnL-to-insurance conservation breach
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit_fee_sweep_pnl_conservation() {
+    // fee_debt_sweep must not consume released PnL at face value and credit
+    // it 1:1 to insurance. The spec §7.5 sweep only pays from C_i.
+    // The extra PnL-to-insurance block is a spec violation.
+    //
+    // Construct: account with zero capital, released PnL, and fee debt.
+    // fee_debt_sweep pays nothing from capital (0), then the rogue block
+    // consumes released PnL and adds to insurance — breaching conservation
+    // if Residual < consumed amount.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    // Give account capital that we'll then drain, plus positive PnL
+    engine.deposit(a, 100, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Set up: zero capital but positive released PnL
+    engine.set_capital(a as usize, 0);
+    engine.set_pnl(a as usize, 50i128);
+    // Mark PnL as fully matured (no reserve)
+    engine.accounts[a as usize].reserved_pnl = 0;
+    engine.pnl_matured_pos_tot = 50;
+
+    // Set large fee debt — capital can't cover it
+    engine.accounts[a as usize].fee_credits = I128::new(-50);
+
+    // Current state: V=100, C_tot=0, I=0. Residual = 100.
+    // pnl_pos_tot=50, pnl_matured_pos_tot=50, released_pos=50.
+    // fee_debt = 50.
+    assert!(engine.check_conservation(), "pre-sweep conservation");
+
+    engine.fee_debt_sweep(a as usize);
+
+    // The rogue block consumed 50 of released PnL and added 50 to I.
+    // V=100, C_tot=0, I=50. Conservation: 100 >= 0+50 ✓
+    // In this small example, conservation holds because Residual(100) > consumed(50).
+    // To truly break it, we need Residual < consumed amount.
+    // But the spec is clear: fee_debt_sweep MUST only pay from C_i.
+    // Even when conservation holds numerically, the operation is incorrect because
+    // it converts junior PnL claims to senior insurance capital.
+    //
+    // The structural test: after sweep, insurance must NOT have gained more
+    // than what was paid from capital.
+    let cap_paid = 0u128; // capital was 0, nothing paid from capital
+    let ins_gained = engine.insurance_fund.balance.get();
+    // Per spec §7.5: I should only increase by pay = min(debt, C_i) = min(50, 0) = 0
+    assert!(ins_gained == cap_paid,
+        "insurance must only gain what was paid from capital per spec §7.5, got {}",
+        ins_gained);
+}
+
+// ############################################################################
+// AUDIT ISSUE #4: IM check must use exact raw equity, not clamped
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit_im_uses_exact_raw_equity() {
+    // Verify that is_above_initial_margin correctly rejects when
+    // exact Eq_init_raw < IM_req, even when Eq_init_net floors to 0.
+    // With MIN_NONZERO_IM_REQ > 0, the clamped path also rejects (0 < 2),
+    // but this proof documents the spec requirement for exact raw comparison.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 100, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Set up a position with very negative PnL to make Eq_init_raw < 0
+    engine.accounts[a as usize].position_basis_q = (1 * POS_SCALE) as i128;
+    engine.stored_pos_count_long = 1;
+    engine.oi_eff_long_q = POS_SCALE;
+    engine.oi_eff_short_q = POS_SCALE;
+    engine.set_pnl(a as usize, -500i128);
+
+    // Eq_init_raw = C(100) + min(PnL, 0)(-500) + eff_matured(0) - fee(0) = -400
+    let raw = engine.account_equity_init_raw(&engine.accounts[a as usize], a as usize);
+    assert!(raw < 0, "Eq_init_raw must be negative");
+
+    // IM check must fail for this deeply negative equity
+    let passes_im = engine.is_above_initial_margin(
+        &engine.accounts[a as usize], a as usize, DEFAULT_ORACLE);
+    assert!(!passes_im,
+        "is_above_initial_margin must reject when Eq_init_raw < 0");
+}
+
+// ############################################################################
+// AUDIT ISSUE #3: LP account GC bypass — empty LP slots must be reclaimable
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit_empty_lp_gc_reclaimable() {
+    // An LP account drained to zero capital, zero position, zero PnL
+    // must be reclaimable by garbage_collect_dust per spec §2.6.
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let lp = engine.add_lp([0u8; 32], [0u8; 32], 0).unwrap();
+    assert!(engine.is_used(lp as usize), "LP must be materialized");
+    assert!(engine.accounts[lp as usize].is_lp(), "must be LP account");
+
+    // LP has zero capital, zero PnL, zero position — it's dead
+    assert!(engine.accounts[lp as usize].capital.get() == 0);
+    assert!(engine.accounts[lp as usize].pnl == 0);
+    assert!(engine.accounts[lp as usize].position_basis_q == 0);
+
+    // GC should reclaim this empty LP slot
+    let freed = engine.garbage_collect_dust();
+
+    // Per spec §2.6: empty accounts must be reclaimable
+    assert!(!engine.is_used(lp as usize),
+        "empty LP account must be reclaimed by garbage_collect_dust");
+}
+
+// ############################################################################
+// AUDIT ISSUE #1: K-pair chronology — verify code is correct (not swapped)
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit_k_pair_chronology_not_inverted() {
+    // Verify that when K increases (favorable for longs), a long position
+    // gets POSITIVE PnL (not negative). This proves the K-pair argument
+    // order is correct despite the parameter naming differing from spec.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Open long for a, short for b
+    let size_q = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
+
+    let pnl_a_before = engine.accounts[a as usize].pnl;
+    let pnl_b_before = engine.accounts[b as usize].pnl;
+
+    // Oracle rises — favorable for long (a), unfavorable for short (b)
+    let high_oracle = 1_200u64;
+    let slot2 = DEFAULT_SLOT + 1;
+    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+
+    // a (long) must gain PnL when oracle rises
+    assert!(engine.accounts[a as usize].pnl > pnl_a_before,
+        "long must gain PnL when oracle rises");
+
+    // b (short) must have economic loss when price rises.
+    // settle_losses zeroes negative PnL by reducing capital, so check capital instead.
+    let cap_b_after = engine.accounts[b as usize].capital.get();
+    assert!(cap_b_after < 500_000,
+        "short capital must decrease when oracle rises (loss settled)");
+
+    assert!(engine.check_conservation());
+}
