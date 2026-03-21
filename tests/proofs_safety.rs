@@ -1664,3 +1664,144 @@ fn proof_audit_k_pair_chronology_not_inverted() {
 
     assert!(engine.check_conservation());
 }
+
+// ############################################################################
+// AUDIT ROUND 2, ISSUE #3: close_account structural correctness
+// (FALSE POSITIVE — engine has no auth layer; this proves accounting safety)
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_close_account_structural_safety() {
+    // close_account requires zero effective position, zero PnL, and
+    // only returns the capital. It cannot extract more than deposited.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    let deposit_amt: u32 = kani::any();
+    kani::assume(deposit_amt >= 1000 && deposit_amt <= 1_000_000);
+    engine.deposit(a, deposit_amt as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let v_before = engine.vault.get();
+
+    // close_account on a flat account with no position
+    let result = engine.close_account(a, DEFAULT_SLOT, DEFAULT_ORACLE);
+    assert!(result.is_ok(), "flat zero-PnL account must close");
+
+    let capital_returned = result.unwrap();
+    // Returned capital equals deposited amount
+    assert!(capital_returned == deposit_amt as u128,
+        "close_account must return exactly the account's capital");
+    // Vault decreased by exactly the capital returned
+    assert!(engine.vault.get() == v_before - capital_returned,
+        "vault must decrease by exactly capital returned");
+    // Account freed
+    assert!(!engine.is_used(a as usize), "slot must be freed after close");
+}
+
+// ############################################################################
+// AUDIT ROUND 2, ISSUE #4: Funding rate clamping — prevent liveness lockup
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_funding_rate_clamped() {
+    // Setting an out-of-range funding rate must be clamped so that
+    // subsequent accrue_market_to does not abort.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
+
+    // Open positions so funding has effect
+    let size_q = (10 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
+
+    // Set an extreme out-of-range funding rate
+    let extreme_rate: i64 = kani::any();
+    kani::assume(extreme_rate > MAX_ABS_FUNDING_BPS_PER_SLOT || extreme_rate < -MAX_ABS_FUNDING_BPS_PER_SLOT);
+    engine.set_funding_rate_for_next_interval(extreme_rate);
+
+    // The stored rate must be clamped
+    let stored = engine.funding_rate_bps_per_slot_last;
+    assert!(stored.abs() <= MAX_ABS_FUNDING_BPS_PER_SLOT,
+        "stored rate must be clamped to MAX_ABS_FUNDING_BPS_PER_SLOT");
+
+    // accrue_market_to must succeed (not abort)
+    let slot2 = DEFAULT_SLOT + 1;
+    let result = engine.keeper_crank(slot2, DEFAULT_ORACLE, &[a, b], 64);
+    assert!(result.is_ok(), "accrue_market_to must not abort after clamped rate");
+}
+
+// ############################################################################
+// AUDIT ROUND 2, ISSUE #6: Positive overflow equity — conservative fallback
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_positive_overflow_equity_conservative() {
+    // When account equity overflows i128 positively, the function must
+    // return i128::MAX (conservative — account is over-collateralized),
+    // not 0 (which would falsely trigger liquidation).
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    // Directly set capital to a value > i128::MAX to force positive overflow.
+    // This bypasses MAX_VAULT_TVL but tests the overflow fallback path.
+    let huge_capital = (i128::MAX as u128) + 1; // 2^127
+    engine.accounts[a as usize].capital = U128::new(huge_capital);
+    engine.accounts[a as usize].pnl = 0i128;
+    engine.accounts[a as usize].fee_credits = I128::ZERO;
+
+    // Eq_maint_raw = C + PnL - FeeDebt = huge_capital + 0 - 0 = huge_capital > i128::MAX
+    let eq_maint = engine.account_equity_maint_raw(&engine.accounts[a as usize]);
+    assert!(eq_maint == i128::MAX,
+        "positive overflow must project to i128::MAX, not 0");
+
+    // The wide version must be positive
+    let wide = engine.account_equity_maint_raw_wide(&engine.accounts[a as usize]);
+    assert!(!wide.is_negative(), "wide equity must be positive");
+
+    // Eq_init_raw with same setup
+    let eq_init = engine.account_equity_init_raw(&engine.accounts[a as usize], a as usize);
+    assert!(eq_init == i128::MAX,
+        "init raw positive overflow must project to i128::MAX, not 0");
+}
+
+// ############################################################################
+// AUDIT ROUND 2, ISSUE #6 (corollary): Positive overflow must not liquidate
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_positive_overflow_no_false_liquidation() {
+    // An account with equity overflowing i128 positively must pass
+    // maintenance margin check (it's massively over-collateralized).
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    // Set up a position + huge capital
+    let huge_capital = (i128::MAX as u128) + 1;
+    engine.accounts[a as usize].capital = U128::new(huge_capital);
+    engine.accounts[a as usize].position_basis_q = (1 * POS_SCALE) as i128;
+    engine.stored_pos_count_long = 1;
+    engine.oi_eff_long_q = POS_SCALE;
+    engine.oi_eff_short_q = POS_SCALE;
+
+    let above_mm = engine.is_above_maintenance_margin(
+        &engine.accounts[a as usize], a as usize, DEFAULT_ORACLE);
+    assert!(above_mm,
+        "massively over-collateralized account must pass MM check");
+
+    let above_im = engine.is_above_initial_margin(
+        &engine.accounts[a as usize], a as usize, DEFAULT_ORACLE);
+    assert!(above_im,
+        "massively over-collateralized account must pass IM check");
+}

@@ -1297,8 +1297,9 @@ fn proof_property_51_withdrawal_dust_guard() {
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_property_31_missing_account_safety() {
-    // settle_account, withdraw, execute_trade, liquidate, and deposit
-    // must all reject missing (unmaterialized) accounts.
+    // Per spec §2.3: settle_account, withdraw, execute_trade, liquidate,
+    // and keeper_crank must NOT auto-materialize missing accounts.
+    // deposit IS the canonical materialization path (spec §10.3 step 2).
     let mut engine = RiskEngine::new(zero_fee_params());
 
     // Add one real user for counterparty testing
@@ -1309,10 +1310,6 @@ fn proof_property_31_missing_account_safety() {
     // Pick an index that was never add_user'd — it's missing
     let missing: u16 = 3; // MAX_ACCOUNTS=4 in kani, index 3 never materialized
     assert!(!engine.is_used(missing as usize), "account must be unmaterialized");
-
-    // deposit must reject missing account
-    let dep_result = engine.deposit(missing, 1000, DEFAULT_ORACLE, DEFAULT_SLOT);
-    assert!(dep_result.is_err(), "deposit must reject missing account");
 
     // settle_account must reject missing account
     let settle_result = engine.settle_account(missing, DEFAULT_ORACLE, DEFAULT_SLOT);
@@ -1567,4 +1564,83 @@ fn proof_property_52_convert_released_pnl_instruction() {
         "account must be maintenance healthy after conversion");
 
     assert!(engine.check_conservation());
+}
+
+// ############################################################################
+// AUDIT ROUND 2, ISSUE #7: Deposit must materialize missing accounts
+// ############################################################################
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_deposit_materializes_missing_account() {
+    // Per spec §10.3 step 2 and §2.3: deposit with amount >= MIN_INITIAL_DEPOSIT
+    // on a missing account must materialize it, not reject with AccountNotFound.
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    // Slot 0 is free (no add_user called for it)
+    assert!(!engine.is_used(0), "slot 0 must start free");
+
+    let amount: u32 = kani::any();
+    let min_dep = engine.params.min_initial_deposit.get() as u32;
+    kani::assume(amount >= min_dep && amount <= 1_000_000);
+
+    // Deposit directly on the missing slot — must succeed and materialize
+    let result = engine.deposit(0, amount as u128, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_ok(), "deposit must succeed and materialize missing account");
+
+    // Account must now be materialized
+    assert!(engine.is_used(0), "account must be materialized after deposit");
+
+    // Capital must equal deposited amount
+    assert!(engine.accounts[0].capital.get() == amount as u128,
+        "capital must equal deposited amount");
+
+    // Vault must contain the deposited amount
+    assert!(engine.vault.get() == amount as u128,
+        "vault must contain deposited amount");
+
+    // Conservation must hold
+    assert!(engine.check_conservation());
+}
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_deposit_rejects_below_min_initial_for_missing() {
+    // Per spec §10.3 step 2: deposit below MIN_INITIAL_DEPOSIT on a
+    // missing account must fail.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    assert!(!engine.is_used(0));
+
+    let min_dep = engine.params.min_initial_deposit.get();
+    if min_dep == 0 {
+        return; // can't test sub-threshold if threshold is 0
+    }
+    let amount = min_dep - 1;
+
+    let result = engine.deposit(0, amount, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_err(), "deposit below MIN_INITIAL_DEPOSIT must fail for missing account");
+    // Account must NOT be materialized
+    assert!(!engine.is_used(0), "account must not be materialized on failed deposit");
+}
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit2_deposit_existing_accepts_small_topup() {
+    // Per spec §12 property #23: an existing materialized account may
+    // receive deposits smaller than MIN_INITIAL_DEPOSIT.
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+
+    // First deposit to establish the account
+    let min_dep = engine.params.min_initial_deposit.get();
+    engine.deposit(a, min_dep, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Small top-up below MIN_INITIAL_DEPOSIT must succeed
+    let small_amount = 1u128;
+    let result = engine.deposit(a, small_amount, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_ok(), "existing account must accept small top-ups");
+    assert!(engine.accounts[a as usize].capital.get() == min_dep + small_amount);
 }

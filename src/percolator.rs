@@ -571,6 +571,73 @@ impl RiskEngine {
         self.materialized_account_count = self.materialized_account_count.saturating_sub(1);
     }
 
+    /// materialize_account(i, slot_anchor) — spec §2.5.
+    /// Materializes a missing account at a specific slot index.
+    /// The slot must not be currently in use.
+    fn materialize_at(&mut self, idx: u16, slot_anchor: u64) -> Result<()> {
+        if idx as usize >= MAX_ACCOUNTS {
+            return Err(RiskError::AccountNotFound);
+        }
+
+        let used_count = self.num_used_accounts as u64;
+        if used_count >= self.params.max_accounts {
+            return Err(RiskError::Overflow);
+        }
+
+        // Enforce materialized_account_count bound (spec §10.0)
+        self.materialized_account_count = self.materialized_account_count
+            .checked_add(1).ok_or(RiskError::Overflow)?;
+        if self.materialized_account_count > MAX_MATERIALIZED_ACCOUNTS {
+            self.materialized_account_count -= 1;
+            return Err(RiskError::Overflow);
+        }
+
+        // Remove idx from free list
+        if self.free_head == idx {
+            self.free_head = self.next_free[idx as usize];
+        } else {
+            let mut prev = self.free_head;
+            let mut steps = 0usize;
+            while prev != u16::MAX && steps < MAX_ACCOUNTS {
+                if self.next_free[prev as usize] == idx {
+                    self.next_free[prev as usize] = self.next_free[idx as usize];
+                    break;
+                }
+                prev = self.next_free[prev as usize];
+                steps += 1;
+            }
+        }
+
+        self.set_used(idx as usize);
+        self.num_used_accounts = self.num_used_accounts.saturating_add(1);
+
+        let account_id = self.next_account_id;
+        self.next_account_id = self.next_account_id.saturating_add(1);
+
+        // Initialize per spec §2.5
+        self.accounts[idx as usize] = Account {
+            kind: AccountKind::User,
+            account_id,
+            capital: U128::ZERO,
+            pnl: 0i128,
+            reserved_pnl: 0u128,
+            warmup_started_at_slot: slot_anchor,
+            warmup_slope_per_step: 0u128,
+            position_basis_q: 0i128,
+            adl_a_basis: ADL_ONE,
+            adl_k_snap: 0i128,
+            adl_epoch_snap: 0,
+            matcher_program: [0; 32],
+            matcher_context: [0; 32],
+            owner: [0; 32],
+            fee_credits: I128::ZERO,
+            last_fee_slot: slot_anchor,
+            fees_earned_total: U128::ZERO,
+        };
+
+        Ok(())
+    }
+
     // ========================================================================
     // O(1) Aggregate Helpers (spec §4)
     // ========================================================================
@@ -1224,7 +1291,16 @@ impl RiskEngine {
 
     /// Set funding rate for next interval (spec §5.5 anti-retroactivity)
     pub fn set_funding_rate_for_next_interval(&mut self, new_rate: i64) {
-        self.funding_rate_bps_per_slot_last = new_rate;
+        // Spec §5.5: stored result MUST satisfy |r_last| <= MAX_ABS_FUNDING_BPS_PER_SLOT.
+        // Clamp to prevent liveness lockup in accrue_market_to.
+        let clamped = if new_rate > MAX_ABS_FUNDING_BPS_PER_SLOT {
+            MAX_ABS_FUNDING_BPS_PER_SLOT
+        } else if new_rate < -MAX_ABS_FUNDING_BPS_PER_SLOT {
+            -MAX_ABS_FUNDING_BPS_PER_SLOT
+        } else {
+            new_rate
+        };
+        self.funding_rate_bps_per_slot_last = clamped;
     }
 
     /// recompute_r_last_from_final_state (spec §4.12).
@@ -1614,9 +1690,11 @@ impl RiskEngine {
         match wide.try_into_i128() {
             Some(v) => v,
             None => {
-                // Positive overflow: unreachable, fail conservatively (return 0)
-                // Negative overflow: project to i128::MIN + 1 per spec §3.4
-                if wide.is_negative() { i128::MIN + 1 } else { 0i128 }
+                // Positive overflow: unreachable under configured bounds (spec §3.4),
+                // but MUST fail conservatively — account is over-collateralized,
+                // so project to i128::MAX to prevent false liquidation.
+                // Negative overflow: project to i128::MIN + 1 per spec §3.4.
+                if wide.is_negative() { i128::MIN + 1 } else { i128::MAX }
             }
         }
     }
@@ -1656,7 +1734,10 @@ impl RiskEngine {
         match sum.try_into_i128() {
             Some(v) => v,
             None => {
-                if sum.is_negative() { i128::MIN + 1 } else { 0i128 }
+                // Positive overflow: unreachable under configured bounds (spec §3.4),
+                // but MUST fail conservatively — project to i128::MAX.
+                // Negative overflow: project to i128::MIN + 1 per spec §3.4.
+                if sum.is_negative() { i128::MIN + 1 } else { i128::MAX }
             }
         }
     }
@@ -2091,14 +2172,13 @@ impl RiskEngine {
         }
 
         // Step 2: if account missing, require amount >= MIN_INITIAL_DEPOSIT and materialize
+        // Per spec §10.3 step 2 and §2.3: deposit is the canonical materialization path.
         if !self.is_used(idx as usize) {
             let min_dep = self.params.min_initial_deposit.get();
             if amount < min_dep {
                 return Err(RiskError::InsufficientBalance);
             }
-            // Note: add_user handles materialization; for the deposit path,
-            // we require the account to already be materialized.
-            return Err(RiskError::AccountNotFound);
+            self.materialize_at(idx, now_slot)?;
         }
 
         // Step 3: current_slot = now_slot
