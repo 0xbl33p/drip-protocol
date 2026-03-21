@@ -3046,7 +3046,9 @@ impl RiskEngine {
             if account.position_basis_q != 0 {
                 continue;
             }
-            if !account.capital.is_zero() {
+            // Spec §2.6: reclaim when C_i == 0 OR 0 < C_i < MIN_INITIAL_DEPOSIT
+            if account.capital.get() >= self.params.min_initial_deposit.get()
+                && !account.capital.is_zero() {
                 continue;
             }
             if account.reserved_pnl != 0 {
@@ -3057,6 +3059,13 @@ impl RiskEngine {
             }
             if account.fee_credits.get() > 0 {
                 continue;
+            }
+
+            // Sweep dust capital into insurance (spec §2.6)
+            let dust_cap = self.accounts[idx].capital.get();
+            if dust_cap > 0 {
+                self.set_capital(idx, 0);
+                self.insurance_fund.balance = self.insurance_fund.balance + dust_cap;
             }
 
             // Write off negative PnL

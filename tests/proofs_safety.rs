@@ -1283,3 +1283,50 @@ fn proof_v1126_min_nonzero_margin_floor() {
     assert!(engine.check_conservation());
     kani::cover!(result.is_ok(), "tiny position trade with margin floor");
 }
+
+// ############################################################################
+// v11.26 §2.6: flat-dust reclamation (GC sweeps 0 < C_i < MIN_INITIAL_DEPOSIT)
+// ############################################################################
+
+/// A flat account with 0 < C_i < MIN_INITIAL_DEPOSIT, zero PnL/basis/reserved,
+/// and nonpositive fee credits must be reclaimable by garbage_collect_dust.
+/// The dust capital must be swept into insurance, not lost.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_gc_reclaims_flat_dust_capital() {
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(10_000); // $0.01 minimum
+    let mut engine = RiskEngine::new(params);
+
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Simulate dust: set capital to 1 (below MIN_INITIAL_DEPOSIT of 10_000)
+    // This models an account whose capital was drained by fees/losses to dust level.
+    engine.set_capital(idx as usize, 1);
+
+    let cap = engine.accounts[idx as usize].capital.get();
+    assert!(cap > 0 && cap < 10_000, "account must have dust capital");
+    assert!(engine.accounts[idx as usize].pnl == 0);
+    assert!(engine.accounts[idx as usize].position_basis_q == 0);
+    assert!(engine.is_used(idx as usize));
+
+    let ins_before = engine.insurance_fund.balance.get();
+    let vault_before = engine.vault.get();
+
+    // GC must reclaim this account
+    engine.garbage_collect_dust();
+
+    // Account must be freed
+    assert!(!engine.is_used(idx as usize),
+        "GC must reclaim flat account with dust capital below MIN_INITIAL_DEPOSIT");
+
+    // Dust capital must be swept to insurance (not lost)
+    let ins_after = engine.insurance_fund.balance.get();
+    assert!(ins_after == ins_before + cap,
+        "dust capital must be swept into insurance fund");
+
+    // Conservation must hold
+    assert!(engine.check_conservation());
+}
