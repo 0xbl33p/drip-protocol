@@ -474,16 +474,62 @@ impl RiskEngine {
         engine
     }
 
-    /// Initialize in place (for Solana BPF zero-copy)
+    /// Initialize in place (for Solana BPF zero-copy).
+    /// Fully canonicalizes all state — safe even on non-zeroed memory.
     pub fn init_in_place(&mut self, params: RiskParams) {
         assert!(
             params.maintenance_margin_bps < params.initial_margin_bps,
             "maintenance_margin_bps must be strictly less than initial_margin_bps"
         );
+        assert!(
+            params.min_nonzero_mm_req < params.min_nonzero_im_req,
+            "min_nonzero_mm_req must be strictly less than min_nonzero_im_req"
+        );
+        self.vault = U128::ZERO;
+        self.insurance_fund = InsuranceFund { balance: U128::ZERO, fee_revenue: U128::ZERO };
         self.params = params;
+        self.current_slot = 0;
+        self.funding_rate_bps_per_slot_last = 0;
+        self.last_crank_slot = 0;
         self.max_crank_staleness_slots = params.max_crank_staleness_slots;
+        self.c_tot = U128::ZERO;
+        self.pnl_pos_tot = 0;
+        self.pnl_matured_pos_tot = 0;
+        self.liq_cursor = 0;
+        self.gc_cursor = 0;
+        self.last_full_sweep_start_slot = 0;
+        self.last_full_sweep_completed_slot = 0;
+        self.crank_cursor = 0;
+        self.sweep_start_idx = 0;
+        self.lifetime_liquidations = 0;
         self.adl_mult_long = ADL_ONE;
         self.adl_mult_short = ADL_ONE;
+        self.adl_coeff_long = 0;
+        self.adl_coeff_short = 0;
+        self.adl_epoch_long = 0;
+        self.adl_epoch_short = 0;
+        self.adl_epoch_start_k_long = 0;
+        self.adl_epoch_start_k_short = 0;
+        self.oi_eff_long_q = 0;
+        self.oi_eff_short_q = 0;
+        self.side_mode_long = SideMode::Normal;
+        self.side_mode_short = SideMode::Normal;
+        self.stored_pos_count_long = 0;
+        self.stored_pos_count_short = 0;
+        self.stale_account_count_long = 0;
+        self.stale_account_count_short = 0;
+        self.phantom_dust_bound_long_q = 0;
+        self.phantom_dust_bound_short_q = 0;
+        self.materialized_account_count = 0;
+        self.last_oracle_price = 0;
+        self.last_market_slot = 0;
+        self.funding_price_sample_last = 0;
+        self.insurance_floor = 0;
+        self.used = [0; BITMAP_WORDS];
+        self.num_used_accounts = 0;
+        self.next_account_id = 0;
+        self.free_head = 0;
+        self.accounts = [empty_account(); MAX_ACCOUNTS];
         for i in 0..MAX_ACCOUNTS - 1 {
             self.next_free[i] = (i + 1) as u16;
         }
@@ -592,20 +638,29 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Remove idx from free list
+        // Remove idx from free list. Must succeed — if idx is not in the
+        // freelist, the state is corrupt and we must not proceed.
+        let mut found = false;
         if self.free_head == idx {
             self.free_head = self.next_free[idx as usize];
+            found = true;
         } else {
             let mut prev = self.free_head;
             let mut steps = 0usize;
             while prev != u16::MAX && steps < MAX_ACCOUNTS {
                 if self.next_free[prev as usize] == idx {
                     self.next_free[prev as usize] = self.next_free[idx as usize];
+                    found = true;
                     break;
                 }
                 prev = self.next_free[prev as usize];
                 steps += 1;
             }
+        }
+        if !found {
+            // Roll back materialized_account_count
+            self.materialized_account_count -= 1;
+            return Err(RiskError::CorruptState);
         }
 
         self.set_used(idx as usize);
@@ -2042,12 +2097,14 @@ impl RiskEngine {
             return Err(RiskError::InsufficientBalance);
         }
 
-        let excess = fee_payment.saturating_sub(required_fee);
+        // MAX_VAULT_TVL bound
+        let v_candidate = self.vault.get().checked_add(fee_payment)
+            .ok_or(RiskError::Overflow)?;
+        if v_candidate > MAX_VAULT_TVL {
+            return Err(RiskError::Overflow);
+        }
 
-        self.vault = self.vault + fee_payment;
-        self.insurance_fund.balance = self.insurance_fund.balance + required_fee;
-        self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + required_fee;
-
+        // All fallible checks before state mutations
         // Enforce materialized_account_count bound (spec §10.0)
         self.materialized_account_count = self.materialized_account_count
             .checked_add(1).ok_or(RiskError::Overflow)?;
@@ -2057,6 +2114,12 @@ impl RiskEngine {
         }
 
         let idx = self.alloc_slot()?;
+
+        // Commit vault/insurance only after all checks pass
+        let excess = fee_payment.saturating_sub(required_fee);
+        self.vault = U128::new(v_candidate);
+        self.insurance_fund.balance = self.insurance_fund.balance + required_fee;
+        self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + required_fee;
         let account_id = self.next_account_id;
         self.next_account_id = self.next_account_id.saturating_add(1);
 
@@ -2104,7 +2167,12 @@ impl RiskEngine {
             return Err(RiskError::InsufficientBalance);
         }
 
-        let excess = fee_payment.saturating_sub(required_fee);
+        // MAX_VAULT_TVL bound
+        let v_candidate = self.vault.get().checked_add(fee_payment)
+            .ok_or(RiskError::Overflow)?;
+        if v_candidate > MAX_VAULT_TVL {
+            return Err(RiskError::Overflow);
+        }
 
         // Enforce materialized_account_count bound (spec §10.0)
         self.materialized_account_count = self.materialized_account_count
@@ -2114,11 +2182,13 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        self.vault = self.vault + fee_payment;
+        let idx = self.alloc_slot()?;
+
+        // Commit vault/insurance only after all checks pass
+        let excess = fee_payment.saturating_sub(required_fee);
+        self.vault = U128::new(v_candidate);
         self.insurance_fund.balance = self.insurance_fund.balance + required_fee;
         self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + required_fee;
-
-        let idx = self.alloc_slot()?;
         let account_id = self.next_account_id;
         self.next_account_id = self.next_account_id.saturating_add(1);
 
@@ -3183,8 +3253,15 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn top_up_insurance_fund(&mut self, amount: u128) -> Result<bool> {
-        self.vault = U128::new(add_u128(self.vault.get(), amount));
-        self.insurance_fund.balance = U128::new(add_u128(self.insurance_fund.balance.get(), amount));
+        let new_vault = self.vault.get().checked_add(amount)
+            .ok_or(RiskError::Overflow)?;
+        if new_vault > MAX_VAULT_TVL {
+            return Err(RiskError::Overflow);
+        }
+        let new_ins = self.insurance_fund.balance.get().checked_add(amount)
+            .ok_or(RiskError::Overflow)?;
+        self.vault = U128::new(new_vault);
+        self.insurance_fund.balance = U128::new(new_ins);
         Ok(self.insurance_fund.balance.get() > self.insurance_floor)
     }
 
@@ -3200,15 +3277,30 @@ impl RiskEngine {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
         }
+        if now_slot < self.current_slot {
+            return Err(RiskError::Unauthorized);
+        }
         if amount > i128::MAX as u128 {
             return Err(RiskError::Overflow);
         }
+        let new_vault = self.vault.get().checked_add(amount)
+            .ok_or(RiskError::Overflow)?;
+        if new_vault > MAX_VAULT_TVL {
+            return Err(RiskError::Overflow);
+        }
+        let new_ins = self.insurance_fund.balance.get().checked_add(amount)
+            .ok_or(RiskError::Overflow)?;
+        let new_rev = self.insurance_fund.fee_revenue.get().checked_add(amount)
+            .ok_or(RiskError::Overflow)?;
+        let new_credits = self.accounts[idx as usize].fee_credits
+            .checked_add(amount as i128)
+            .ok_or(RiskError::Overflow)?;
+        // All checks passed — commit state
         self.current_slot = now_slot;
-        self.vault = self.vault + amount;
-        self.insurance_fund.balance = self.insurance_fund.balance + amount;
-        self.insurance_fund.fee_revenue = self.insurance_fund.fee_revenue + amount;
-        self.accounts[idx as usize].fee_credits = self.accounts[idx as usize]
-            .fee_credits.saturating_add(amount as i128);
+        self.vault = U128::new(new_vault);
+        self.insurance_fund.balance = U128::new(new_ins);
+        self.insurance_fund.fee_revenue = U128::new(new_rev);
+        self.accounts[idx as usize].fee_credits = new_credits;
         Ok(())
     }
 

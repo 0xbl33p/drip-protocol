@@ -1644,3 +1644,53 @@ fn proof_audit2_deposit_existing_accepts_small_topup() {
     assert!(result.is_ok(), "existing account must accept small top-ups");
     assert!(engine.accounts[a as usize].capital.get() == min_dep + small_amount);
 }
+
+// ============================================================================
+// Audit round 4: Atomicity and structural integrity proofs
+// ============================================================================
+
+/// Proof: add_user is atomic — if it fails, vault and insurance are unchanged.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_add_user_atomic_on_failure() {
+    let mut params = zero_fee_params();
+    params.new_account_fee = U128::new(100);
+    let mut engine = RiskEngine::new(params);
+
+    // Fill up all account slots (fee_payment must match new_account_fee)
+    for _ in 0..MAX_ACCOUNTS {
+        engine.add_user(100).unwrap();
+    }
+
+    let vault_before = engine.vault.get();
+    let ins_before = engine.insurance_fund.balance.get();
+
+    // Next add_user must fail (no free slots)
+    let result = engine.add_user(100);
+    assert!(result.is_err());
+
+    // Vault and insurance must be unchanged
+    assert!(engine.vault.get() == vault_before,
+        "vault must not change on failed add_user");
+    assert!(engine.insurance_fund.balance.get() == ins_before,
+        "insurance must not change on failed add_user");
+}
+
+/// Proof: deposit_fee_credits enforces MAX_VAULT_TVL.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_deposit_fee_credits_max_tvl() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Set vault at MAX_VAULT_TVL
+    engine.vault = U128::new(MAX_VAULT_TVL);
+
+    // Any positive deposit must fail
+    let result = engine.deposit_fee_credits(idx, 1, 0);
+    assert!(result.is_err(), "must reject deposit that would exceed MAX_VAULT_TVL");
+    assert!(engine.vault.get() == MAX_VAULT_TVL, "vault unchanged on failure");
+}

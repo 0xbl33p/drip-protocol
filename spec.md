@@ -1,4 +1,4 @@
-# Risk Engine Spec (Source of Truth) — v11.26
+# Risk Engine Spec (Source of Truth) — v11.27
 
 **Combined Single-Document Native 128-bit Revision  
 (Off-Chain Shortlist Keeper / Flat-Only Auto-Conversion / Full-Local-PnL Maintenance Edition)**
@@ -9,6 +9,17 @@
 **Goal:** preserve conservation, bounded insolvency handling, oracle-manipulation resistance, and liveness while supporting lazy ADL across the opposing open-interest side without global scans, canonical-order dependencies, or sequential prefix requirements for user settlement.
 
 This is a single combined spec. It supersedes prior delta-style revisions by restating the full current design in one document and replacing the earlier integrated on-chain barrier-scan keeper mode with a minimal on-chain exact-revalidation crank that assumes candidate discovery is performed off chain by permissionless keepers.
+
+## Change summary from v11.26
+
+This revision enforces six existing invariants that were under-specified in the implementation:
+
+1. **`init_in_place` full canonicalization.** All engine state fields (vault, insurance, aggregates, side modes, epochs, stale counts, cursors, used bitmap, accounts, freelist) MUST be explicitly initialized. Safe even on non-zeroed memory. The `min_nonzero_mm_req < min_nonzero_im_req` assertion is now enforced at init.
+2. **`add_user`/`add_lp` atomicity.** All fallible checks (max_accounts, fee check, MAX_VAULT_TVL, materialized count, slot allocation) MUST complete before any state mutation. Vault and insurance fund MUST be unchanged if the operation fails.
+3. **`materialize_at` freelist integrity.** Freelist removal MUST verify the target index was actually found. If the index is not in the freelist (double-materialization), the operation MUST fail with `CorruptState`.
+4. **`deposit_fee_credits` time monotonicity.** MUST reject `now_slot < current_slot` per §1.1.
+5. **`deposit_fee_credits` checked arithmetic.** Vault, insurance, fee_revenue, and fee_credits MUST use checked addition (not saturating). MAX_VAULT_TVL MUST be enforced.
+6. **`top_up_insurance_fund` checked arithmetic.** MUST use checked addition (not panicking `add_u128`). MAX_VAULT_TVL MUST be enforced.
 
 ## Change summary from v11.25
 

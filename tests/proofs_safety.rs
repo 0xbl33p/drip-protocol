@@ -1849,3 +1849,174 @@ fn proof_audit3_compute_trade_pnl_no_panic_at_boundary() {
     // Must never panic — may return Ok or Err
     let _ = compute_trade_pnl(size_q as i128, price_diff as i128);
 }
+
+// ============================================================================
+// Audit round 4: Structural safety proofs
+// ============================================================================
+
+/// Proof: init_in_place fully canonicalizes all state fields.
+/// After init_in_place, the engine must be in a clean state with
+/// valid freelist, zero aggregates, and Normal side modes.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_init_in_place_canonical() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+
+    // Dirty the engine state to simulate non-zeroed memory
+    engine.vault = U128::new(999);
+    engine.insurance_fund.balance = U128::new(777);
+    engine.c_tot = U128::new(555);
+    engine.pnl_pos_tot = 333;
+    engine.adl_mult_long = 42;
+    engine.adl_coeff_long = 100;
+    engine.adl_epoch_long = 7;
+    engine.side_mode_long = SideMode::DrainOnly;
+    engine.num_used_accounts = 10;
+    engine.materialized_account_count = 5;
+    engine.oi_eff_long_q = 1000;
+    engine.last_oracle_price = 9999;
+
+    // Re-initialize
+    engine.init_in_place(params);
+
+    // All aggregates must be zero
+    assert!(engine.vault.get() == 0);
+    assert!(engine.insurance_fund.balance.get() == 0);
+    assert!(engine.c_tot.get() == 0);
+    assert!(engine.pnl_pos_tot == 0);
+    assert!(engine.pnl_matured_pos_tot == 0);
+
+    // Side state reset
+    assert!(engine.adl_mult_long == ADL_ONE);
+    assert!(engine.adl_mult_short == ADL_ONE);
+    assert!(engine.adl_coeff_long == 0);
+    assert!(engine.adl_coeff_short == 0);
+    assert!(engine.adl_epoch_long == 0);
+    assert!(engine.adl_epoch_short == 0);
+    assert!(engine.oi_eff_long_q == 0);
+    assert!(engine.oi_eff_short_q == 0);
+    assert!(engine.side_mode_long == SideMode::Normal);
+    assert!(engine.side_mode_short == SideMode::Normal);
+
+    // Account tracking reset
+    assert!(engine.num_used_accounts == 0);
+    assert!(engine.materialized_account_count == 0);
+    assert!(engine.last_oracle_price == 0);
+
+    // Freelist integrity: head is 0, chain covers all slots
+    assert!(engine.free_head == 0);
+    // Last slot points to sentinel
+    assert!(engine.next_free[MAX_ACCOUNTS - 1] == u16::MAX);
+}
+
+/// Proof: deposit to an already-used slot does not corrupt the freelist.
+/// materialize_at (called by deposit for missing accounts) must detect
+/// that the slot is already allocated and not double-materialize.
+/// Since materialize_at is private, we test via deposit on an existing account.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_materialize_at_freelist_integrity() {
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(100);
+    let mut engine = RiskEngine::new(params);
+
+    // Allocate slot 0 via add_user and deposit
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 100, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    assert!(engine.is_used(idx as usize));
+
+    let num_used_before = engine.num_used_accounts;
+    let mat_before = engine.materialized_account_count;
+
+    // Second deposit to the same slot must succeed (top-up, not re-materialize)
+    // and must NOT increment materialized_account_count
+    let result = engine.deposit(idx, 50, DEFAULT_ORACLE, DEFAULT_SLOT);
+    assert!(result.is_ok());
+    assert!(engine.num_used_accounts == num_used_before);
+    assert!(engine.materialized_account_count == mat_before);
+}
+
+/// Proof: top_up_insurance_fund never panics and enforces MAX_VAULT_TVL.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_top_up_insurance_no_panic() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+
+    // Set vault near MAX_VAULT_TVL
+    engine.vault = U128::new(MAX_VAULT_TVL - 1);
+    engine.insurance_fund.balance = U128::new(MAX_VAULT_TVL - 1);
+
+    // Amount that would exceed MAX_VAULT_TVL
+    let result = engine.top_up_insurance_fund(2);
+    assert!(result.is_err(), "must reject amount that exceeds MAX_VAULT_TVL");
+
+    // Amount that stays within MAX_VAULT_TVL
+    let result2 = engine.top_up_insurance_fund(1);
+    assert!(result2.is_ok(), "must accept amount within MAX_VAULT_TVL");
+    assert!(engine.vault.get() == MAX_VAULT_TVL);
+}
+
+/// Proof: top_up_insurance_fund rejects u128::MAX (overflow before TVL check).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_top_up_insurance_overflow() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    engine.vault = U128::new(1);
+    engine.insurance_fund.balance = U128::new(1);
+
+    // u128::MAX must not panic — must return Err
+    let result = engine.top_up_insurance_fund(u128::MAX);
+    assert!(result.is_err());
+}
+
+/// Proof: deposit_fee_credits rejects time regression (now_slot < current_slot).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_deposit_fee_credits_time_monotonicity() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Set current_slot to 100
+    engine.current_slot = 100;
+
+    // Deposit at slot 99 must fail
+    let result = engine.deposit_fee_credits(idx, 1000, 99);
+    assert!(result.is_err(), "must reject time regression");
+
+    // Deposit at slot 100 (equal) must succeed
+    let result2 = engine.deposit_fee_credits(idx, 1000, 100);
+    assert!(result2.is_ok());
+}
+
+/// Proof: deposit_fee_credits uses checked arithmetic, not saturating.
+/// Verifies that an amount causing fee_credits overflow returns Err.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit4_deposit_fee_credits_checked_arithmetic() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Set fee_credits near i128::MAX
+    engine.accounts[idx as usize].fee_credits = I128::new(i128::MAX - 1);
+
+    // Deposit amount 2 would overflow i128 fee_credits
+    // First check vault won't be the limiting factor
+    engine.vault = U128::ZERO;
+    let result = engine.deposit_fee_credits(idx, 2, 0);
+    assert!(result.is_err(), "must reject fee_credits overflow");
+
+    // Verify fee_credits was NOT silently saturated
+    assert!(engine.accounts[idx as usize].fee_credits.get() == i128::MAX - 1,
+        "fee_credits must not change on failed deposit");
+}
