@@ -1721,11 +1721,14 @@ fn proof_audit4_deposit_fee_credits_max_tvl() {
     let mut engine = RiskEngine::new(params);
     let idx = engine.add_user(0).unwrap();
 
+    // Give account fee debt so deposit is not a no-op
+    engine.accounts[idx as usize].fee_credits = I128::new(-1000);
+
     // Set vault at MAX_VAULT_TVL
     engine.vault = U128::new(MAX_VAULT_TVL);
 
-    // Any positive deposit must fail
-    let result = engine.deposit_fee_credits(idx, 1, 0);
+    // Deposit must fail (vault already at MAX)
+    let result = engine.deposit_fee_credits(idx, 500, 0);
     assert!(result.is_err(), "must reject deposit that would exceed MAX_VAULT_TVL");
     assert!(engine.vault.get() == MAX_VAULT_TVL, "vault unchanged on failure");
 }

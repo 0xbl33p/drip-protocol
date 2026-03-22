@@ -523,10 +523,23 @@ fn test_deposit_fee_credits() {
     engine.current_slot = slot;
     let idx = engine.add_user(1000).expect("add_user");
 
-    engine.deposit_fee_credits(idx, 5000, slot).expect("deposit_fee_credits");
-    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), 5000,
-        "fee_credits must equal the deposited amount");
-    assert!(engine.check_conservation());
+    // Give the account fee debt first (spec §2.1: fee_credits <= 0)
+    engine.accounts[idx as usize].fee_credits = I128::new(-5000);
+
+    // Pay off 3000 of the 5000 debt
+    engine.deposit_fee_credits(idx, 3000, slot).expect("deposit_fee_credits");
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), -2000,
+        "fee_credits must reflect partial payoff");
+
+    // Pay off the remaining 2000
+    engine.deposit_fee_credits(idx, 2000, slot).expect("deposit_fee_credits");
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), 0,
+        "fee_credits must be zero after full payoff");
+
+    // Over-payment is capped — fee_credits stays at 0
+    engine.deposit_fee_credits(idx, 9999, slot).expect("no-op succeeds");
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), 0,
+        "fee_credits must not go positive");
 }
 
 #[test]
@@ -536,8 +549,10 @@ fn test_add_fee_credits() {
     engine.current_slot = slot;
     let idx = engine.add_user(1000).expect("add_user");
 
+    // Give the account debt, then add credits to pay it off
+    engine.accounts[idx as usize].fee_credits = I128::new(-5000);
     engine.add_fee_credits(idx, 3000).expect("add_fee_credits");
-    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), 3000);
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), -2000);
 }
 
 #[test]

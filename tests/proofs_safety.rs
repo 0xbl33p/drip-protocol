@@ -2110,6 +2110,9 @@ fn proof_audit4_deposit_fee_credits_time_monotonicity() {
     let mut engine = RiskEngine::new(params);
     let idx = engine.add_user(0).unwrap();
 
+    // Give the account fee debt so deposits are not no-ops
+    engine.accounts[idx as usize].fee_credits = I128::new(-10000);
+
     // Set current_slot to 100
     engine.current_slot = 100;
 
@@ -2147,16 +2150,144 @@ fn proof_audit4_deposit_fee_credits_checked_arithmetic() {
     let mut engine = RiskEngine::new(params);
     let idx = engine.add_user(0).unwrap();
 
-    // Set fee_credits near i128::MAX
-    engine.accounts[idx as usize].fee_credits = I128::new(i128::MAX - 1);
+    // Set fee_credits to large debt to test checked arithmetic on vault
+    engine.accounts[idx as usize].fee_credits = I128::new(-10000);
 
-    // Deposit amount 2 would overflow i128 fee_credits
-    // First check vault won't be the limiting factor
-    engine.vault = U128::ZERO;
-    let result = engine.deposit_fee_credits(idx, 2, 0);
-    assert!(result.is_err(), "must reject fee_credits overflow");
+    // Set vault near u128::MAX to force vault overflow
+    engine.vault = U128::new(u128::MAX - 1);
+    engine.insurance_fund.balance = U128::new(u128::MAX - 1);
+    let result = engine.deposit_fee_credits(idx, 5000, 0);
+    assert!(result.is_err(), "must reject vault overflow");
 
-    // Verify fee_credits was NOT silently saturated
-    assert!(engine.accounts[idx as usize].fee_credits.get() == i128::MAX - 1,
+    // Verify fee_credits unchanged on failure
+    assert!(engine.accounts[idx as usize].fee_credits.get() == -10000,
         "fee_credits must not change on failed deposit");
+}
+
+/// Proof: deposit_fee_credits enforces spec §2.1 fee_credits <= 0 invariant.
+/// Over-deposits beyond outstanding debt are capped.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit5_deposit_fee_credits_no_positive() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Give account 500 in fee debt
+    engine.accounts[idx as usize].fee_credits = I128::new(-500);
+
+    // Try to deposit 1000 (more than the 500 debt)
+    engine.deposit_fee_credits(idx, 1000, 0).unwrap();
+
+    // fee_credits must be exactly 0, not +500
+    assert!(engine.accounts[idx as usize].fee_credits.get() == 0,
+        "fee_credits must be capped at 0 (spec §2.1)");
+
+    // Vault and insurance should reflect only the 500 that was actually applied
+    assert!(engine.vault.get() == 500,
+        "vault must increase by capped amount only");
+}
+
+/// Proof: deposit_fee_credits on account with zero debt is a no-op.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit5_deposit_fee_credits_zero_debt_noop() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // fee_credits = 0 (no debt)
+    let vault_before = engine.vault.get();
+    engine.deposit_fee_credits(idx, 9999, 0).unwrap();
+
+    // Nothing should change
+    assert!(engine.vault.get() == vault_before, "vault unchanged when no debt");
+    assert!(engine.accounts[idx as usize].fee_credits.get() == 0, "credits stay 0");
+}
+
+/// Proof: reclaim_empty_account follows spec §2.6 preconditions and effects.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit5_reclaim_empty_account_basic() {
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(1000);
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Account is flat, zero capital, zero PnL — reclaimable
+    assert!(engine.is_used(idx as usize));
+    let used_before = engine.num_used_accounts;
+
+    let result = engine.reclaim_empty_account(idx);
+    assert!(result.is_ok());
+    assert!(!engine.is_used(idx as usize), "slot must be freed");
+    assert!(engine.num_used_accounts == used_before - 1);
+}
+
+/// Proof: reclaim_empty_account sweeps dust capital to insurance.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit5_reclaim_dust_sweep() {
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(1000);
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Give the account dust capital (< MIN_INITIAL_DEPOSIT)
+    // Must set vault to cover it
+    engine.vault = U128::new(500);
+    engine.accounts[idx as usize].capital = U128::new(500);
+    engine.c_tot = U128::new(500);
+
+    let ins_before = engine.insurance_fund.balance.get();
+
+    let result = engine.reclaim_empty_account(idx);
+    assert!(result.is_ok());
+
+    // Dust must have been swept to insurance
+    assert!(engine.insurance_fund.balance.get() == ins_before + 500,
+        "dust capital must be swept to insurance");
+    // Conservation holds: vault unchanged, C_tot decreased, I increased
+    assert!(engine.check_conservation());
+}
+
+/// Proof: reclaim_empty_account rejects accounts with open positions.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit5_reclaim_rejects_open_position() {
+    let params = zero_fee_params();
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Give the account a position
+    engine.accounts[idx as usize].position_basis_q = 100;
+
+    let result = engine.reclaim_empty_account(idx);
+    assert!(result.is_err(), "must reject account with open position");
+    assert!(engine.is_used(idx as usize), "slot must not be freed on rejection");
+}
+
+/// Proof: reclaim_empty_account rejects accounts with capital >= MIN_INITIAL_DEPOSIT.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_audit5_reclaim_rejects_live_capital() {
+    let mut params = zero_fee_params();
+    params.min_initial_deposit = U128::new(1000);
+    let mut engine = RiskEngine::new(params);
+    let idx = engine.add_user(0).unwrap();
+
+    // Capital at exactly MIN_INITIAL_DEPOSIT — not reclaimable
+    engine.vault = U128::new(1000);
+    engine.accounts[idx as usize].capital = U128::new(1000);
+    engine.c_tot = U128::new(1000);
+
+    let result = engine.reclaim_empty_account(idx);
+    assert!(result.is_err(), "must reject account with live capital");
+    assert!(engine.is_used(idx as usize));
 }

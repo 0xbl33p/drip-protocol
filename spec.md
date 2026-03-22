@@ -1,4 +1,4 @@
-# Risk Engine Spec (Source of Truth) — v11.27
+# Risk Engine Spec (Source of Truth) — v11.28
 
 **Combined Single-Document Native 128-bit Revision  
 (Off-Chain Shortlist Keeper / Flat-Only Auto-Conversion / Full-Local-PnL Maintenance Edition)**
@@ -9,6 +9,13 @@
 **Goal:** preserve conservation, bounded insolvency handling, oracle-manipulation resistance, and liveness while supporting lazy ADL across the opposing open-interest side without global scans, canonical-order dependencies, or sequential prefix requirements for user settlement.
 
 This is a single combined spec. It supersedes prior delta-style revisions by restating the full current design in one document and replacing the earlier integrated on-chain barrier-scan keeper mode with a minimal on-chain exact-revalidation crank that assumes candidate discovery is performed off chain by permissionless keepers.
+
+## Change summary from v11.27
+
+This revision fixes two spec-compliance issues:
+
+1. **`deposit_fee_credits` fee_credits <= 0 invariant (§2.1).** Deposits are now capped at the outstanding debt (`amount.min(debt)`). Over-deposits beyond the owed amount are silently capped to prevent `fee_credits` from going positive.
+2. **`reclaim_empty_account` (§10.7) implemented.** Permissionless O(1) targeted empty/dust-account recycling per spec §2.6. Does not call `accrue_market_to`, does not mutate side state. Sweeps dust capital to insurance, forgives uncollectible fee debt, frees the slot.
 
 ## Change summary from v11.26
 
