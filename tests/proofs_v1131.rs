@@ -33,8 +33,9 @@ fn proof_recompute_r_last_always_zero() {
 // PROPERTY: accrue_market_to has no funding transfer (zero-rate core profile)
 // ############################################################################
 
-/// accrue_market_to with nonzero stored rate and time elapsed does NOT modify K
+/// accrue_market_to with arbitrary stored rate and time elapsed does NOT modify K
 /// via funding. Only mark-to-market (A*ΔP) changes K.
+/// Symbolic rate (full i64) and slot delta exercise all rate/time combinations.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -50,14 +51,20 @@ fn proof_accrue_no_funding_transfer() {
     engine.last_market_slot = 0;
     engine.funding_price_sample_last = DEFAULT_ORACLE;
 
-    // Store nonzero funding rate
-    engine.funding_rate_bps_per_slot_last = 5000;
+    // Store arbitrary nonzero funding rate (symbolic, full i64 domain)
+    let rate: i64 = kani::any();
+    kani::assume(rate != 0);
+    engine.funding_rate_bps_per_slot_last = rate;
+
+    // Symbolic time delta (1..1000 slots)
+    let dt: u16 = kani::any();
+    kani::assume(dt >= 1 && dt <= 1000);
 
     let k_long_before = engine.adl_coeff_long;
     let k_short_before = engine.adl_coeff_short;
 
     // Same price, time passes — only funding could change K
-    let result = engine.accrue_market_to(10, DEFAULT_ORACLE);
+    let result = engine.accrue_market_to(dt as u64, DEFAULT_ORACLE);
     assert!(result.is_ok());
 
     // K must NOT change (no mark ΔP=0, no funding in this revision)
@@ -106,13 +113,17 @@ fn proof_accrue_mark_still_works() {
 // PROPERTY: maintenance fees disabled (spec §8.2)
 // ############################################################################
 
-/// touch_account_full must NOT charge maintenance fees (fee_credits unchanged).
+/// touch_account_full must NOT charge maintenance fees for any fee param or time delta.
+/// Symbolic fee_per_slot and dt prove fee_credits invariance structurally.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_touch_no_maintenance_fee() {
     let mut params = zero_fee_params();
-    params.maintenance_fee_per_slot = U128::new(100); // high fee param
+    // Symbolic fee parameter — even extreme values must not produce charges
+    let fee_per_slot: u32 = kani::any();
+    kani::assume(fee_per_slot >= 1);
+    params.maintenance_fee_per_slot = U128::new(fee_per_slot as u128);
     let mut engine = RiskEngine::new(params);
 
     let idx = engine.add_user(0).unwrap();
@@ -122,8 +133,11 @@ fn proof_touch_no_maintenance_fee() {
 
     let fc_before = engine.accounts[idx as usize].fee_credits.get();
 
-    // Advance time and touch
-    let result = engine.touch_account_full(idx as usize, DEFAULT_ORACLE, 100);
+    // Symbolic time delta (1..10000 slots)
+    let dt: u16 = kani::any();
+    kani::assume(dt >= 1 && dt <= 10000);
+
+    let result = engine.touch_account_full(idx as usize, DEFAULT_ORACLE, dt as u64);
     assert!(result.is_ok());
 
     // fee_credits must NOT change (fees disabled per §8.2)
@@ -174,7 +188,7 @@ fn proof_deposit_no_insurance_draw() {
 // ############################################################################
 
 /// deposit does NOT sweep fee debt when PNL < 0 persists after settle_losses.
-/// PNL < 0 can survive settle_losses when capital is insufficient to cover the loss.
+/// Symbolic deposit amount — for any amount, if PNL stays negative, no sweep.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -185,20 +199,23 @@ fn proof_deposit_sweep_pnl_guard() {
     // Start with zero capital
     engine.deposit(idx, 0, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Give account fee debt
-    engine.accounts[idx as usize].fee_credits = I128::new(-5000);
+    // Symbolic fee debt
+    let debt: u16 = kani::any();
+    kani::assume(debt >= 1 && debt <= 10_000);
+    engine.accounts[idx as usize].fee_credits = I128::new(-(debt as i128));
 
     // Set large negative PNL that exceeds any deposit amount
     engine.set_pnl(idx as usize, -10_000_000i128);
 
     let fc_before = engine.accounts[idx as usize].fee_credits.get();
 
-    // Small deposit — after settle_losses, capital is consumed but PNL stays negative
-    // (10000 < 10_000_000), so PNL remains < 0 and sweep is blocked
-    engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Symbolic deposit — always insufficient to cover PNL=-10M
+    let amount: u32 = kani::any();
+    kani::assume(amount >= 1 && amount <= 1_000_000);
+    engine.deposit(idx, amount as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // After deposit: capital went to settle_losses (paid 10000 toward PNL=-10M)
-    // PNL is still -9_990_000 < 0, so sweep must NOT happen
+    // After deposit: capital went to settle_losses (paid toward PNL=-10M)
+    // PNL is still very negative, so sweep must NOT happen
     assert!(engine.accounts[idx as usize].fee_credits.get() == fc_before,
         "deposit must not sweep when PNL < 0 after settle_losses");
     assert!(engine.accounts[idx as usize].pnl < 0,
@@ -206,6 +223,7 @@ fn proof_deposit_sweep_pnl_guard() {
 }
 
 /// deposit DOES sweep fee debt on flat state with PNL >= 0.
+/// Symbolic deposit amount exercises sweep with varying capital levels.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -213,7 +231,10 @@ fn proof_deposit_sweep_when_pnl_nonneg() {
     let mut engine = RiskEngine::new(zero_fee_params());
 
     let idx = engine.add_user(0).unwrap();
-    engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Symbolic initial capital — ensures fee_debt_sweep has capital to pay from
+    let init_cap: u32 = kani::any();
+    kani::assume(init_cap >= 10_000 && init_cap <= 1_000_000);
+    engine.deposit(idx, init_cap as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Give account fee debt
     engine.accounts[idx as usize].fee_credits = I128::new(-5000);
@@ -221,8 +242,10 @@ fn proof_deposit_sweep_when_pnl_nonneg() {
     // PNL = 0 (flat position, no losses)
     assert!(engine.accounts[idx as usize].pnl == 0);
 
-    // Deposit — with PNL >= 0, sweep MUST happen
-    engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Symbolic deposit amount
+    let dep: u32 = kani::any();
+    kani::assume(dep >= 1 && dep <= 100_000);
+    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // fee_credits must have improved (debt partially/fully paid)
     assert!(engine.accounts[idx as usize].fee_credits.get() > -5000,
@@ -316,7 +339,7 @@ fn proof_positive_conversion_denominator() {
 // ############################################################################
 
 /// Trade uses exact bilateral OI after-values for both gating and writeback.
-/// Verify OI_long + OI_short change exactly by the bilateral decomposition.
+/// Symbolic trade size exercises open, close, and flip paths.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -331,13 +354,20 @@ fn proof_bilateral_oi_decomposition() {
     engine.last_market_slot = DEFAULT_SLOT;
     engine.last_oracle_price = DEFAULT_ORACLE;
 
-    // Execute a trade
-    let size_q = (100 * POS_SCALE) as i128;
+    // First trade: open a position (a long, b short)
+    let open_size = (100 * POS_SCALE) as i128;
+    let r1 = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, open_size, DEFAULT_ORACLE);
+    assert!(r1.is_ok(), "initial trade must succeed");
+
+    // Second trade: symbolic size exercises close, reduce, and flip paths
+    let raw_size: i16 = kani::any();
+    kani::assume(raw_size != 0);
+    // Scale to position units — covers -32768..32767 * POS_SCALE
+    let size_q = (raw_size as i128) * (POS_SCALE as i128);
+
     let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE);
 
     if result.is_ok() {
-        // After trade: OI must equal the exact bilateral values
-        // a is long 100, b is short 100
         let eff_a = engine.effective_pos_q(a as usize);
         let eff_b = engine.effective_pos_q(b as usize);
 
@@ -363,43 +393,49 @@ fn proof_bilateral_oi_decomposition() {
 // ############################################################################
 
 /// Partial liquidation with 0 < q_close < abs(eff) produces nonzero remainder.
+/// Close most of the position (90%) so post-partial health check passes.
+/// Non-vacuity: explicitly assert Ok(true) is reached.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
 fn proof_partial_liquidation_remainder_nonzero() {
-    let mut engine = RiskEngine::new(zero_fee_params());
+    let mut params = zero_fee_params();
+    params.maintenance_margin_bps = 100; // 1% margin — easy to restore health after partial
+    let mut engine = RiskEngine::new(params);
 
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
-    engine.deposit(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Small deposit for a — high leverage. Large deposit for b — counterparty.
+    engine.deposit(a, 50_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.last_crank_slot = DEFAULT_SLOT;
     engine.last_market_slot = DEFAULT_SLOT;
     engine.last_oracle_price = DEFAULT_ORACLE;
 
-    // Open position
-    let size_q = (400 * POS_SCALE) as i128;
+    // Open near-max leverage: 480 units, notional=480K, IM ~48K with 50K capital
+    let size_q = (480 * POS_SCALE) as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
 
-    let eff_a = engine.effective_pos_q(a as usize);
-    let abs_eff = eff_a.unsigned_abs();
+    let abs_eff = engine.effective_pos_q(a as usize).unsigned_abs();
     assert!(abs_eff > 0, "position must be open");
 
-    // Try partial close of half
-    let q_close = abs_eff / 2;
-    kani::assume(q_close > 0);
+    // Close all but 1 unit — leaves minimal remainder
+    // Post-partial: 1 unit notional = ~crash_price/POS_SCALE, MM ~= 0
+    let q_close = abs_eff - POS_SCALE;
+    assert!(q_close > 0 && q_close < abs_eff, "q_close must be valid partial");
 
-    // Crash price to make liquidatable
-    let crash = 500u64;
-    // Set up directly for the partial liq check
+    // Crash: 10% drop triggers liquidation (PNL = -480*100 = -48K, equity ~2K < MM=4800)
+    let crash = 900u64;
     let result = engine.liquidate_at_oracle(a, DEFAULT_SLOT + 1, crash,
         LiquidationPolicy::ExactPartial(q_close));
 
-    // If it succeeds, remainder must be nonzero
-    if result.is_ok() && result.unwrap() {
-        let eff_after = engine.effective_pos_q(a as usize);
-        assert!(eff_after != 0, "partial liquidation must leave nonzero remainder");
-    }
+    // Non-vacuity: partial MUST succeed
+    assert!(result.is_ok(), "partial liquidation must not revert");
+    assert!(result.unwrap(), "account must be liquidatable at crash price");
+
+    // Core property: remainder must be nonzero
+    let eff_after = engine.effective_pos_q(a as usize);
+    assert!(eff_after != 0, "partial liquidation must leave nonzero remainder");
 }
 
 // ############################################################################
@@ -477,11 +513,10 @@ fn proof_deposit_fee_credits_cap() {
 // PROPERTY 70: Partial liquidation health check survives reset scheduling
 // ############################################################################
 
-/// If a partial liquidation reattaches a nonzero remainder, the post-step
-/// local maintenance-health check (§9.4 step 14) MUST still run even when
-/// enqueue_adl schedules a pending reset.
-/// We test this indirectly: a partial liquidation that leaves an unhealthy
-/// remainder must return Err, even if a reset was scheduled.
+/// Partial liquidation that closes a tiny amount MUST be rejected by the
+/// mandatory post-partial health check (§9.4 step 14). Closing 1 unit out
+/// of a large position at a crash price cannot restore health.
+/// This proves enforcement: the health check rejects insufficient partials.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -496,32 +531,23 @@ fn proof_partial_liq_health_check_mandatory() {
     engine.last_market_slot = DEFAULT_SLOT;
     engine.last_oracle_price = DEFAULT_ORACLE;
 
-    // Open position
+    // Open near-max leverage position
     let size_q = (400 * POS_SCALE) as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
 
-    let abs_eff = engine.effective_pos_q(a as usize).unsigned_abs();
+    // Symbolic tiny close amount (1..100 units — all too small to restore health)
+    let tiny_close: u8 = kani::any();
+    kani::assume(tiny_close >= 1);
 
-    // Attempt partial that closes only a tiny amount (leaving still-unhealthy remainder)
-    let tiny_close = 1u128; // close 1 unit — almost nothing
-
+    // Severe crash — account is deeply unhealthy
     let result = engine.liquidate_at_oracle(a, DEFAULT_SLOT + 1, 500,
-        LiquidationPolicy::ExactPartial(tiny_close));
+        LiquidationPolicy::ExactPartial(tiny_close as u128));
 
-    // The result must be either:
-    // 1. Err (health check failed — remainder still unhealthy), OR
-    // 2. Ok(false) (not liquidatable), OR
-    // 3. Ok(true) IF the tiny close somehow made it healthy (unlikely with 500 crash)
-    // We verify the health check was enforced by checking the engine post-state
-    if let Ok(true) = result {
-        // If partial succeeded, the remainder MUST be healthy
-        let eff_after = engine.effective_pos_q(a as usize);
-        if eff_after != 0 {
-            assert!(engine.is_above_maintenance_margin(
-                &engine.accounts[a as usize], a as usize, 500),
-                "partial liq succeeded but remainder is not healthy — health check must have run");
-        }
-    }
+    // Health check at step 14 MUST reject: closing a few units out of 400M
+    // position at 50% crash cannot restore maintenance margin.
+    // Result is Err(Undercollateralized) — NOT Ok(true).
+    assert!(!matches!(result, Ok(true)),
+        "tiny partial must be rejected by health check — remainder still unhealthy");
 }
 
 // ############################################################################
@@ -530,6 +556,7 @@ fn proof_partial_liq_health_check_mandatory() {
 
 /// keeper_crank recomputes r_last exactly once after final reset handling,
 /// and the stored value is exactly 0 under the zero-rate core profile.
+/// Symbolic initial rate proves this for all possible pre-crank rates.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -539,14 +566,15 @@ fn proof_keeper_crank_r_last_zero() {
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Set nonzero rate before crank
-    engine.funding_rate_bps_per_slot_last = 9999;
+    // Symbolic nonzero rate before crank — full i64 domain
+    let rate: i64 = kani::any();
+    engine.funding_rate_bps_per_slot_last = rate;
 
     let result = engine.keeper_crank(DEFAULT_SLOT + 1, DEFAULT_ORACLE,
         &[(idx, None)], 64);
     assert!(result.is_ok());
 
-    // r_last must be 0 after crank
+    // r_last must be 0 after crank regardless of initial rate
     assert!(engine.funding_rate_bps_per_slot_last == 0,
         "r_last must be 0 after keeper_crank");
 }
@@ -557,6 +585,7 @@ fn proof_keeper_crank_r_last_zero() {
 
 /// A deposit into an account with basis_pos_q != 0 neither routes unresolved
 /// negative PnL through §7.3 nor sweeps fee debt.
+/// Symbolic deposit amount and fee debt prove this for all combinations.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
@@ -575,23 +604,25 @@ fn proof_deposit_nonflat_no_sweep_no_resolve() {
     let size_q = (100 * POS_SCALE) as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
 
-    // Give a fee debt and negative PNL
-    engine.accounts[a as usize].fee_credits = I128::new(-1000);
+    // Symbolic fee debt
+    let debt: u16 = kani::any();
+    kani::assume(debt >= 1 && debt <= 10_000);
+    engine.accounts[a as usize].fee_credits = I128::new(-(debt as i128));
     engine.set_pnl(a as usize, -500i128);
 
     let fc_before = engine.accounts[a as usize].fee_credits.get();
-    let pnl_before = engine.accounts[a as usize].pnl;
     let ins_before = engine.insurance_fund.balance.get();
 
-    // Deposit into account with open position (basis != 0)
-    engine.deposit(a, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Symbolic deposit into account with open position (basis != 0)
+    let dep_amount: u32 = kani::any();
+    kani::assume(dep_amount >= 1 && dep_amount <= 1_000_000);
+    engine.deposit(a, dep_amount as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // fee_credits unchanged (no sweep on non-flat account)
     assert!(engine.accounts[a as usize].fee_credits.get() == fc_before,
         "deposit must not sweep fee debt when basis != 0");
 
-    // PNL unchanged (no resolve_flat_negative when not flat)
-    // Note: settle_losses may have reduced PNL toward 0, but insurance must not decrease
+    // Insurance must not decrease (no resolve_flat_negative when not flat)
     assert!(engine.insurance_fund.balance.get() >= ins_before,
         "deposit must not decrement insurance on non-flat account");
 }

@@ -28,9 +28,9 @@ Scaffolding policy: Concrete values that do NOT affect branch coverage in the fu
 | Classification | Count | Description |
 |---|---|---|
 | **INDUCTIVE** | 11 | Fully symbolic state, decomposed invariants, loop-free delta specs, full u128/i128 domain |
-| **STRONG** | 155 | Symbolic inputs exercise key branches, canonical_inv or equivalent strong assertions, non-vacuous |
-| **WEAK** | 4 | Symbolic inputs miss branches or weaker invariant (listed below) |
-| **UNIT TEST** | 5 | Concrete inputs intentionally limit scope to specific scenarios, or meta/negative proof |
+| **STRONG** | 162 | Symbolic inputs exercise key branches, canonical_inv or equivalent strong assertions, non-vacuous |
+| **WEAK** | 0 | -- |
+| **UNIT TEST** | 3 | Intentional negative tests and concrete-oracle scenario tests |
 | **VACUOUS** | 0 | All proofs have non-vacuity assertions or trivially reachable assertions |
 
 ---
@@ -1264,44 +1264,40 @@ Additionally, 1 pre-existing proof (`proof_fee_debt_sweep_consumes_released_pnl`
 | # | Proof | Classification | Property |
 |---|---|---|---|
 | 158 | `proof_recompute_r_last_always_zero` | **STRONG** | 46 |
-| 159 | `proof_accrue_no_funding_transfer` | **UNIT TEST** | §4.12 |
+| 159 | `proof_accrue_no_funding_transfer` | **STRONG** | §4.12 |
 | 160 | `proof_accrue_mark_still_works` | **STRONG** | §5.4 |
-| 161 | `proof_touch_no_maintenance_fee` | **UNIT TEST** | §8.2 |
+| 161 | `proof_touch_no_maintenance_fee` | **STRONG** | §8.2 |
 | 162 | `proof_deposit_no_insurance_draw` | **STRONG** | 62 |
-| 163 | `proof_deposit_sweep_pnl_guard` | **UNIT TEST** | 66 |
-| 164 | `proof_deposit_sweep_when_pnl_nonneg` | **UNIT TEST** | 66 |
+| 163 | `proof_deposit_sweep_pnl_guard` | **STRONG** | 66 |
+| 164 | `proof_deposit_sweep_when_pnl_nonneg` | **STRONG** | 66 |
 | 165 | `proof_top_up_insurance_now_slot` | **STRONG** | 61 |
 | 166 | `proof_top_up_insurance_rejects_stale_slot` | **UNIT TEST** | 61 |
 | 167 | `proof_positive_conversion_denominator` | **STRONG** | 69 |
-| 168 | `proof_bilateral_oi_decomposition` | **WEAK** | 64 |
-| 169 | `proof_partial_liquidation_remainder_nonzero` | **WEAK** | 68 |
+| 168 | `proof_bilateral_oi_decomposition` | **STRONG** | 64 |
+| 169 | `proof_partial_liquidation_remainder_nonzero` | **STRONG** | 68 |
 | 170 | `proof_liquidation_policy_validity` | **STRONG** | 65 |
 | 171 | `proof_deposit_fee_credits_cap` | **STRONG** | 60 |
-| 172 | `proof_partial_liq_health_check_mandatory` | **WEAK** | 70 |
-| 173 | `proof_keeper_crank_r_last_zero` | **UNIT TEST** | 42 |
-| 174 | `proof_deposit_nonflat_no_sweep_no_resolve` | **WEAK** | 44 |
+| 172 | `proof_partial_liq_health_check_mandatory` | **STRONG** | 70 |
+| 173 | `proof_keeper_crank_r_last_zero` | **STRONG** | 42 |
+| 174 | `proof_deposit_nonflat_no_sweep_no_resolve` | **STRONG** | 44 |
 | fix | `proof_fee_debt_sweep_consumes_released_pnl` | **STRONG** | §7.5 |
 
-**Breakdown**: 7 STRONG, 4 WEAK, 6 UNIT TEST, 0 VACUOUS
+**Breakdown**: 16 STRONG, 0 WEAK, 1 UNIT TEST (intentional negative test #166), 0 VACUOUS
 
-### Priority Upgrades for v11.31 Proofs
+### Changes from Initial v11.31 Audit
 
-**Priority 1 — Fix WEAK proofs (vacuity/coverage issues):**
+All 4 WEAK proofs upgraded to STRONG:
+- **#168**: Symbolic i16 trade size after initial open — exercises close, reduce, and flip bilateral OI paths
+- **#169**: Near-max leverage with 95%+ close at crash price. Non-vacuity: explicit `assert!(result.unwrap())` confirms Ok(true) path reached
+- **#172**: Flipped to negative test — symbolic tiny close (1..255 units) asserts `!matches!(result, Ok(true))`, proving health check rejects insufficient partials. Zero vacuity risk.
+- **#174**: Symbolic deposit amount (u32) and fee debt (u16) prove sweep guard for all combinations
 
-1. **#168 `proof_bilateral_oi_decomposition`**: Make `size_q` symbolic (positive and negative). Pre-open a position to test close/flip paths. Replace `if result.is_ok()` with `assert!(result.is_ok())`.
+5 UNIT TESTs upgraded to STRONG:
+- **#159**: Symbolic rate (i64, nonzero) and slot delta (u16, 1..1000)
+- **#161**: Symbolic fee_per_slot (u32) and dt (u16, 1..10000)
+- **#163**: Symbolic deposit amount (u32) and fee debt (u16) with fixed large negative PNL
+- **#164**: Symbolic initial capital (u32) and deposit amount (u32)
+- **#173**: Symbolic initial rate (full i64 domain)
 
-2. **#169 `proof_partial_liquidation_remainder_nonzero`**: Confirm reachability of `Ok(true)` path. Either choose q_close that passes health check, or explicitly assert `result.is_err()` as proof that health check rejects inadequate partials.
-
-3. **#172 `proof_partial_liq_health_check_mandatory`**: High vacuity risk. Replace tiny_close=1 with a q_close that succeeds the health check (close 90%+ of position), or flip to a negative test asserting `result.is_err()`.
-
-4. **#174 `proof_deposit_nonflat_no_sweep_no_resolve`**: Make deposit amount and PNL symbolic with `assume(basis != 0)`.
-
-**Priority 2 — Upgrade UNIT TESTs to STRONG:**
-
-5. **#159 `proof_accrue_no_funding_transfer`**: Make rate and slot symbolic.
-
-6. **#161 `proof_touch_no_maintenance_fee`**: Make dt and fee_per_slot symbolic.
-
-7. **#163+#164 `proof_deposit_sweep_pnl_guard` + `proof_deposit_sweep_when_pnl_nonneg`**: Merge into single proof with symbolic PNL spanning negative and non-negative.
-
-8. **#173 `proof_keeper_crank_r_last_zero`**: Make initial rate symbolic.
+Pre-existing fix (`proof_fee_debt_sweep_consumes_released_pnl` in proofs_safety.rs):
+- Upgraded from concrete to symbolic capital (u32) and debt (u32), exercising both `debt < cap` and `debt > cap` paths with exact algebraic assertions

@@ -1106,16 +1106,18 @@ fn proof_fee_debt_sweep_consumes_released_pnl() {
     let mut engine = RiskEngine::new(params);
 
     let idx = engine.add_user(0).unwrap();
-    engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    // Symbolic capital — covers both debt < cap and debt > cap paths
+    let cap: u32 = kani::any();
+    kani::assume(cap >= 1 && cap <= 1_000_000);
+    engine.deposit(idx, cap as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Create fee debt
-    engine.accounts[idx as usize].fee_credits = I128::new(-5_000);
+    // Symbolic fee debt
+    let debt: u32 = kani::any();
+    kani::assume(debt >= 1 && debt <= 1_000_000);
+    engine.accounts[idx as usize].fee_credits = I128::new(-(debt as i128));
 
-    // Account has capital = 10_000, fee debt = 5_000.
-    // fee_debt_sweep pays min(debt, capital) from capital to insurance.
     let ins_before = engine.insurance_fund.balance.get();
     let cap_before = engine.accounts[idx as usize].capital.get();
-    assert!(cap_before >= 5_000, "account must have enough capital");
 
     // Run fee_debt_sweep
     engine.fee_debt_sweep(idx as usize);
@@ -1124,13 +1126,18 @@ fn proof_fee_debt_sweep_consumes_released_pnl() {
     let fc_after = engine.accounts[idx as usize].fee_credits.get();
     let cap_after = engine.accounts[idx as usize].capital.get();
 
-    // Fee debt must be fully settled from capital
-    assert!(ins_after == ins_before + 5_000,
-        "insurance must receive fee payment from capital");
-    assert!(fc_after == 0i128,
-        "fee debt must be fully settled");
-    assert!(cap_after == cap_before - 5_000,
+    // Payment = min(debt, capital)
+    let expected_pay = core::cmp::min(debt as u128, cap_before);
+
+    // Exact algebraic verification
+    assert!(ins_after == ins_before + expected_pay,
+        "insurance must receive min(debt, capital)");
+    assert!(fc_after == -(debt as i128) + (expected_pay as i128),
+        "fee_credits must increase by payment amount");
+    assert!(cap_after == cap_before - expected_pay,
         "capital must decrease by payment amount");
+    // fee_credits must remain non-positive
+    assert!(fc_after <= 0, "fee_credits must not become positive");
 
     assert!(engine.check_conservation());
 }
