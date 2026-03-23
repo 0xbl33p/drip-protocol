@@ -1330,7 +1330,7 @@ fn proof_property_31_missing_account_safety() {
     assert!(trade_result_b.is_err(), "execute_trade must reject missing account (party b)");
 
     // liquidate_at_oracle on missing account — returns Ok(false) (no-op)
-    let liq_result = engine.liquidate_at_oracle(missing, DEFAULT_SLOT, DEFAULT_ORACLE);
+    let liq_result = engine.liquidate_at_oracle(missing, DEFAULT_SLOT, DEFAULT_ORACLE, LiquidationPolicy::FullClose);
     assert!(liq_result.is_ok(), "liquidate must not error on missing");
     assert!(!liq_result.unwrap(), "liquidate must return false (no-op) for missing account");
 
@@ -1414,11 +1414,11 @@ fn proof_property_49_profit_conversion_reserve_preservation() {
     // Oracle up — a gets profit
     let high_oracle = 1_100u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+    engine.keeper_crank(slot2, high_oracle, &[(a, None), (b, None)], 64).unwrap();
 
     // Wait for warmup to partially release
     let slot3 = slot2 + 60; // 60 of 100 slots
-    engine.keeper_crank(slot3, high_oracle, &[a], 64).unwrap();
+    engine.keeper_crank(slot3, high_oracle, &[(a, None)], 64).unwrap();
 
     let released = engine.released_pos(a as usize);
     if released == 0 {
@@ -1472,11 +1472,11 @@ fn proof_property_50_flat_only_auto_conversion() {
     // Oracle up, then wait for full warmup
     let high_oracle = 1_100u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+    engine.keeper_crank(slot2, high_oracle, &[(a, None), (b, None)], 64).unwrap();
 
     // Full warmup elapsed
     let slot3 = slot2 + 200; // well past warmup_period_slots=100
-    engine.keeper_crank(slot3, high_oracle, &[a], 64).unwrap();
+    engine.keeper_crank(slot3, high_oracle, &[(a, None)], 64).unwrap();
 
     // a still has position, so should have released profit but NOT auto-converted
     assert!(engine.accounts[a as usize].position_basis_q != 0,
@@ -1523,11 +1523,11 @@ fn proof_property_52_convert_released_pnl_instruction() {
     // Oracle up
     let high_oracle = 1_200u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+    engine.keeper_crank(slot2, high_oracle, &[(a, None), (b, None)], 64).unwrap();
 
     // Wait for warmup to fully release
     let slot3 = slot2 + 200;
-    engine.keeper_crank(slot3, high_oracle, &[a], 64).unwrap();
+    engine.keeper_crank(slot3, high_oracle, &[(a, None)], 64).unwrap();
 
     // Check released amount
     let released_before = engine.released_pos(a as usize);

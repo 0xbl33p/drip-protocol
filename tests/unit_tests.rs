@@ -60,7 +60,7 @@ fn setup_two_users(deposit_a: u128, deposit_b: u128) -> (RiskEngine, u16, u16) {
     }
 
     // Initial crank so trades/withdrawals pass freshness check
-    engine.keeper_crank(slot, oracle, &[], 64).expect("initial crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("initial crank");
 
     (engine, a, b)
 }
@@ -176,7 +176,7 @@ fn test_withdraw_no_position() {
     engine.deposit(idx, 10_000, oracle, slot).expect("deposit");
 
     // Initial crank needed for freshness
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     engine.withdraw(idx, 5_000, oracle, slot).expect("withdraw");
     assert_eq!(engine.accounts[idx as usize].capital.get(), 5_000);
@@ -191,7 +191,7 @@ fn test_withdraw_exceeds_balance() {
     engine.current_slot = slot;
     let idx = engine.add_user(1000).expect("add_user");
     engine.deposit(idx, 5_000, oracle, slot).expect("deposit");
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     let result = engine.withdraw(idx, 10_000, oracle, slot);
     assert_eq!(result, Err(RiskError::InsufficientBalance));
@@ -386,7 +386,7 @@ fn test_liquidation_eligible_account() {
 
     // Call liquidate_at_oracle directly - it calls touch_account_full internally
     // which runs accrue_market_to
-    let result = engine.liquidate_at_oracle(a, slot2, new_oracle).expect("liquidate");
+    let result = engine.liquidate_at_oracle(a, slot2, new_oracle, LiquidationPolicy::FullClose).expect("liquidate");
     assert!(result, "account a should have been liquidated");
     // Position should be closed
     let eff = engine.effective_pos_q(a as usize);
@@ -404,7 +404,7 @@ fn test_liquidation_healthy_account() {
     engine.execute_trade(a, b, oracle, slot, size_q, oracle).expect("trade");
 
     // Account is well collateralized, liquidation should return false
-    let result = engine.liquidate_at_oracle(a, slot, oracle).expect("liquidate attempt");
+    let result = engine.liquidate_at_oracle(a, slot, oracle, LiquidationPolicy::FullClose).expect("liquidate attempt");
     assert!(!result, "healthy account should not be liquidated");
 }
 
@@ -415,7 +415,7 @@ fn test_liquidation_flat_account() {
     let slot = 1u64;
 
     // No position open, liquidation should return false
-    let result = engine.liquidate_at_oracle(a, slot, oracle).expect("liquidate flat");
+    let result = engine.liquidate_at_oracle(a, slot, oracle, LiquidationPolicy::FullClose).expect("liquidate flat");
     assert!(!result);
 }
 
@@ -435,7 +435,7 @@ fn test_warmup_slope_set_on_new_profit() {
     // Advance and accrue at higher price so long (a) gets positive PnL
     let slot2 = 10u64;
     let new_oracle = 1100u64;
-    engine.keeper_crank(slot2, new_oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
     engine.touch_account_full(a as usize, new_oracle, slot2).expect("touch");
 
     // If PnL is positive and warmup_period > 0, slope should be set
@@ -457,7 +457,7 @@ fn test_warmup_full_conversion_after_period() {
     // Move price up to give account a profit
     let slot2 = 10u64;
     let new_oracle = 1200u64;
-    engine.keeper_crank(slot2, new_oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot2, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
     engine.touch_account_full(a as usize, new_oracle, slot2).expect("touch");
 
     // Close position so profit conversion can happen (only for flat accounts)
@@ -468,7 +468,7 @@ fn test_warmup_full_conversion_after_period() {
 
     // Wait beyond warmup period (100 slots) and touch again
     let slot3 = slot2 + 200;
-    engine.keeper_crank(slot3, new_oracle, &[], 64).expect("crank2");
+    engine.keeper_crank(slot3, new_oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank2");
     engine.touch_account_full(a as usize, new_oracle, slot3).expect("touch2");
 
     let capital_after = engine.accounts[a as usize].capital.get();
@@ -488,29 +488,13 @@ fn test_top_up_insurance_fund() {
     let before_vault = engine.vault.get();
     let before_ins = engine.insurance_fund.balance.get();
 
-    let result = engine.top_up_insurance_fund(5000).expect("top_up");
+    let result = engine.top_up_insurance_fund(5000, 0).expect("top_up");
     assert_eq!(engine.vault.get(), before_vault + 5000);
     assert_eq!(engine.insurance_fund.balance.get(), before_ins + 5000);
     assert!(result); // above floor (floor = 0)
     assert!(engine.check_conservation());
 }
 
-#[test]
-fn test_insurance_floor() {
-    let mut engine = RiskEngine::new(default_params());
-    engine.set_insurance_floor(10000);
-    assert_eq!(engine.insurance_floor, 10000);
-
-    engine.top_up_insurance_fund(5000).expect("top_up");
-    // balance 5000 < floor 10000
-    let result = engine.top_up_insurance_fund(0).expect("check");
-    assert!(!result, "should be below insurance floor");
-
-    engine.top_up_insurance_fund(6000).expect("top_up2");
-    // balance 11000 > floor 10000
-    let result2 = engine.top_up_insurance_fund(0).expect("check2");
-    assert!(result2, "should be above insurance floor");
-}
 
 // ============================================================================
 // 10. Fee operations
@@ -586,7 +570,7 @@ fn test_lp_fees_earned_tracking() {
     // Deposit before crank so accounts are not GC'd
     engine.deposit(a, 100_000, oracle, slot).expect("deposit a");
     engine.deposit(lp, 100_000, oracle, slot).expect("deposit lp");
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     let size_q = make_size_q(100);
     engine.execute_trade(a, lp, oracle, slot, size_q, oracle).expect("trade");
@@ -647,7 +631,7 @@ fn test_keeper_crank_advances_slot() {
     let slot = 10u64;
     let _caller = engine.add_user(1000).expect("add_user");
 
-    let outcome = engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    let outcome = engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
     assert!(outcome.advanced);
     assert_eq!(engine.last_crank_slot, slot);
 }
@@ -659,13 +643,14 @@ fn test_keeper_crank_same_slot_not_advanced() {
     let slot = 10u64;
     let _caller = engine.add_user(1000).expect("add_user");
 
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank1");
-    let outcome = engine.keeper_crank(slot, oracle, &[], 64).expect("crank2");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank1");
+    let outcome = engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank2");
     assert!(!outcome.advanced);
 }
 
 #[test]
-fn test_keeper_crank_caller_fee_discount() {
+fn test_keeper_crank_caller_touch_no_fee() {
+    // Spec §8.2: maintenance fees disabled — keeper crank touch does not reduce capital.
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 1u64;
@@ -676,14 +661,14 @@ fn test_keeper_crank_caller_fee_discount() {
 
     let capital_before = engine.accounts[caller as usize].capital.get();
 
-    // Advance some slots to accumulate maintenance fees
+    // Advance some slots and crank
     let slot2 = 200u64;
-    let outcome = engine.keeper_crank(slot2, oracle, &[caller], 64).expect("crank");
+    let outcome = engine.keeper_crank(slot2, oracle, &[(caller, None)], 64).expect("crank");
     assert!(outcome.advanced);
 
     let capital_after = engine.accounts[caller as usize].capital.get();
-    assert!(capital_after < capital_before,
-        "maintenance fee must reduce capital: before={}, after={}", capital_before, capital_after);
+    assert_eq!(capital_after, capital_before,
+        "maintenance fee disabled: capital must not change");
 }
 
 // ============================================================================
@@ -762,7 +747,7 @@ fn test_adl_triggered_by_liquidation() {
     let slot2 = 2u64;
     let crash_oracle = 870u64;
 
-    let result = engine.liquidate_at_oracle(a, slot2, crash_oracle).expect("liquidate");
+    let result = engine.liquidate_at_oracle(a, slot2, crash_oracle, LiquidationPolicy::FullClose).expect("liquidate");
     assert!(result, "account a should be liquidated");
     assert!(engine.check_conservation());
 
@@ -955,7 +940,7 @@ fn test_close_account_after_trade_and_unwind() {
 
     // Wait beyond warmup to let PnL settle
     let slot2 = slot + 200;
-    engine.keeper_crank(slot2, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot2, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
     engine.touch_account_full(a as usize, oracle, slot2).expect("touch");
 
     // PnL should be zero or converted by now
@@ -983,9 +968,9 @@ fn test_insurance_absorbs_loss_on_liquidation() {
     engine.deposit(b, 100_000, oracle, slot).expect("deposit b");
 
     // Top up insurance fund
-    engine.top_up_insurance_fund(50_000).expect("top up");
+    engine.top_up_insurance_fund(50_000, slot).expect("top up");
 
-    engine.keeper_crank(slot, oracle, &[], 64).expect("initial crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("initial crank");
 
     // Open near-max position
     let size_q = make_size_q(180);
@@ -994,14 +979,15 @@ fn test_insurance_absorbs_loss_on_liquidation() {
     // Crash price to make a deeply underwater
     let slot2 = 2u64;
     let crash = 850u64;
-    engine.keeper_crank(slot2, crash, &[], 64).expect("crank");
+    engine.keeper_crank(slot2, crash, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
-    engine.liquidate_at_oracle(a, slot2, crash).expect("liquidate");
+    engine.liquidate_at_oracle(a, slot2, crash, LiquidationPolicy::FullClose).expect("liquidate");
     assert!(engine.check_conservation());
 }
 
 #[test]
-fn test_maintenance_fee_accumulates() {
+fn test_maintenance_fee_disabled() {
+    // Spec §8.2: Recurring account-local maintenance fees are disabled in this revision.
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 1u64;
@@ -1011,15 +997,18 @@ fn test_maintenance_fee_accumulates() {
     engine.deposit(idx, 10_000, oracle, slot).expect("deposit");
 
     let capital_before = engine.accounts[idx as usize].capital.get();
+    let fc_before = engine.accounts[idx as usize].fee_credits.get();
 
     // Advance 500 slots and touch
     let slot2 = 501u64;
-    engine.keeper_crank(slot2, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot2, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
     engine.touch_account_full(idx as usize, oracle, slot2).expect("touch");
 
     let capital_after = engine.accounts[idx as usize].capital.get();
-    // maintenance_fee_per_slot = 1, over ~500 slots = ~500 fee
-    assert!(capital_after < capital_before, "maintenance fees should reduce capital");
+    let fc_after = engine.accounts[idx as usize].fee_credits.get();
+    // No fees charged — capital and fee_credits unchanged
+    assert_eq!(capital_after, capital_before, "maintenance fees disabled: capital must not change");
+    assert_eq!(fc_after, fc_before, "maintenance fees disabled: fee_credits must not change");
 }
 
 #[test]
@@ -1035,7 +1024,7 @@ fn test_keeper_crank_liquidates_underwater_accounts() {
     // Crash price
     let slot2 = 2u64;
     let crash = 870u64;
-    let outcome = engine.keeper_crank(slot2, crash, &[a, b], 64).expect("crank");
+    let outcome = engine.keeper_crank(slot2, crash, &[(a, None), (b, None)], 64).expect("crank");
     // The crank should have liquidated the underwater account
     assert!(outcome.num_liquidations > 0, "crank must liquidate underwater account");
     assert!(engine.check_conservation());
@@ -1129,7 +1118,7 @@ fn test_conservation_maintained_through_lifecycle() {
     engine.deposit(b, 100_000, oracle, slot).expect("dep b");
     assert!(engine.check_conservation());
 
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
     assert!(engine.check_conservation());
 
     let size_q = make_size_q(50);
@@ -1138,7 +1127,7 @@ fn test_conservation_maintained_through_lifecycle() {
 
     // Price move
     let slot2 = 10u64;
-    engine.keeper_crank(slot2, 1050, &[], 64).expect("crank2");
+    engine.keeper_crank(slot2, 1050, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank2");
     assert!(engine.check_conservation());
 
     // Close positions
@@ -1179,7 +1168,7 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
     engine.deposit(a, 1_000_000, oracle, slot).expect("dep a");
     engine.deposit(b, 1_000_000, oracle, slot).expect("dep b");
 
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     // Open position: a buys 10 from b
     let size_q = make_size_q(10);
@@ -1189,7 +1178,7 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
     // Price rises: a now has positive PnL (profit)
     let slot2 = 50u64;
     let oracle2 = 1100u64;
-    engine.keeper_crank(slot2, oracle2, &[], 64).expect("crank2");
+    engine.keeper_crank(slot2, oracle2, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank2");
     assert!(engine.check_conservation());
 
     // Inject fee debt on account a: fee_credits = -5000
@@ -1226,7 +1215,8 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
 // ============================================================================
 
 #[test]
-fn test_maintenance_fee_does_not_reach_i128_min() {
+fn test_maintenance_fee_disabled_extreme_params() {
+    // Spec §8.2: maintenance fees disabled — even extreme params don't charge fees.
     let mut params = default_params();
     params.maintenance_fee_per_slot = U128::new(i128::MAX as u128);
     let mut engine = RiskEngine::new(params);
@@ -1236,16 +1226,15 @@ fn test_maintenance_fee_does_not_reach_i128_min() {
     let idx = engine.add_user(1000).expect("add user");
     engine.deposit(idx, 100_000, 1000, slot).expect("deposit");
 
-    // Set fee_credits very negative, close to i128::MIN
-    engine.accounts[idx as usize].fee_credits = I128::new(i128::MIN + 2);
-    engine.accounts[idx as usize].last_fee_slot = 0;
-
-    // Touch must return Err — fee_per_slot * dt overflows u128 with checked math.
-    // This is the correct "fail conservatively" behavior per §1.5 Rule 9.
+    // With fees disabled, touch must succeed even with extreme fee params
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 100;
+    let fc_before = engine.accounts[idx as usize].fee_credits.get();
     let result = engine.touch_account_full(idx as usize, 1000, 100);
-    assert!(result.is_err(), "touch must fail on extreme fee overflow");
+    assert!(result.is_ok(), "touch must succeed — maintenance fees disabled");
+    // fee_credits unchanged (no fee charge) — only last_fee_slot stamped
+    assert_eq!(engine.accounts[idx as usize].fee_credits.get(), fc_before,
+        "fee_credits must not change with maintenance fees disabled");
 }
 
 // ============================================================================
@@ -1269,7 +1258,7 @@ fn test_charge_fee_safe_does_not_panic_on_extreme_pnl() {
     engine.deposit(a, 1, oracle, slot).expect("dep a");
     engine.deposit(b, 10_000_000, oracle, slot).expect("dep b");
 
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     // Set account a's PnL to near i128::MIN so fee subtraction would overflow.
     // The charge_fee_safe path: if capital < fee, shortfall = fee - capital,
@@ -1298,7 +1287,7 @@ fn test_keeper_crank_propagates_corruption() {
 
     let a = engine.add_user(1000).expect("add a");
     engine.deposit(a, 100_000, oracle, slot).expect("dep a");
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     // Set up a corrupt state: a_basis = 0 triggers CorruptState error
     // in settle_side_effects (called by touch_account_full)
@@ -1309,7 +1298,7 @@ fn test_keeper_crank_propagates_corruption() {
     engine.oi_eff_short_q = POS_SCALE;
 
     // keeper_crank must propagate the CorruptState error, not swallow it
-    let result = engine.keeper_crank(2, oracle, &[a], 64);
+    let result = engine.keeper_crank(2, oracle, &[(a, None)], 64);
     assert!(result.is_err(), "keeper_crank must propagate corruption errors");
 }
 
@@ -1326,7 +1315,7 @@ fn test_self_trade_rejected() {
 
     let a = engine.add_user(1000).expect("add a");
     engine.deposit(a, 100_000, oracle, slot).expect("dep a");
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     let size_q = make_size_q(1);
     let result = engine.execute_trade(a, a, oracle, slot, size_q, oracle);
@@ -1381,7 +1370,7 @@ fn test_schedule_reset_error_propagated_in_withdraw() {
 
     let a = engine.add_user(1000).expect("add a");
     engine.deposit(a, 100_000, oracle, slot).expect("dep a");
-    engine.keeper_crank(slot, oracle, &[], 64).expect("crank");
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).expect("crank");
 
     // Corrupt state: stored_pos_count says 0 but OI is non-zero and unequal.
     // This makes schedule_end_of_instruction_resets return CorruptState.
@@ -1523,7 +1512,8 @@ fn test_accrue_market_funding_rate_zero_no_funding_applied() {
 }
 
 #[test]
-fn test_accrue_market_negative_funding_rate() {
+fn test_accrue_market_no_funding_transfer() {
+    // Spec §4.12 / §5.4: zero-rate core profile — no funding transfer in this revision.
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
@@ -1533,7 +1523,7 @@ fn test_accrue_market_negative_funding_rate() {
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
 
-    // Negative rate: shorts pay, longs receive
+    // Even with a nonzero stored rate, no funding transfer occurs
     engine.funding_rate_bps_per_slot_last = -1000;
 
     let k_long_before = engine.adl_coeff_long;
@@ -1541,11 +1531,11 @@ fn test_accrue_market_negative_funding_rate() {
 
     engine.accrue_market_to(10, 1000).unwrap(); // same price, time passes
 
-    // Shorts pay → K_short decreases; Longs receive → K_long increases
-    assert!(engine.adl_coeff_short < k_short_before,
-        "negative rate: short K must decrease (payer)");
-    assert!(engine.adl_coeff_long > k_long_before,
-        "negative rate: long K must increase (receiver)");
+    // Zero-rate core profile: K coefficients must NOT change from funding
+    assert_eq!(engine.adl_coeff_short, k_short_before,
+        "zero-rate: short K must not change from funding");
+    assert_eq!(engine.adl_coeff_long, k_long_before,
+        "zero-rate: long K must not change from funding");
 }
 
 // ============================================================================
@@ -1557,7 +1547,7 @@ fn test_keeper_crank_processes_candidates() {
     let (mut engine, a, b) = setup_two_users(10_000_000, 10_000_000);
 
     // Crank with explicit candidates processes them
-    let outcome = engine.keeper_crank(5, 1000, &[a, b], 64).unwrap();
+    let outcome = engine.keeper_crank(5, 1000, &[(a, None), (b, None)], 64).unwrap();
     assert!(outcome.advanced, "crank must advance slot");
 }
 
@@ -1570,14 +1560,14 @@ fn test_keeper_crank_caller_fee_discount_multi_slot() {
 
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 10_000_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
     // Advance many slots to accumulate maintenance fee debt
     let far_slot = 1000u64;
     engine.accounts[a as usize].last_fee_slot = slot;
 
     // Run crank at far_slot with account a as candidate
-    engine.keeper_crank(far_slot, oracle, &[a], 64).unwrap();
+    engine.keeper_crank(far_slot, oracle, &[(a, None)], 64).unwrap();
 
     // Account's last_fee_slot should be updated to far_slot (post-settlement)
     assert_eq!(engine.accounts[a as usize].last_fee_slot, far_slot,
@@ -1605,7 +1595,7 @@ fn test_liquidation_triggers_on_underwater_account() {
     let slot2 = 3;
 
     // Crank at crash price — accrues market internally then liquidates
-    let outcome = engine.keeper_crank(slot2, crash_price, &[a, b], 64).unwrap();
+    let outcome = engine.keeper_crank(slot2, crash_price, &[(a, None), (b, None)], 64).unwrap();
     assert!(outcome.num_liquidations > 0, "crank must liquidate underwater account after 50% price drop");
 }
 
@@ -1623,7 +1613,7 @@ fn test_direct_liquidation_returns_to_insurance() {
     // Price crashes — a (long) underwater
     let crash_price = 100u64;
     let slot2 = 3;
-    engine.liquidate_at_oracle(a, slot2, crash_price).unwrap();
+    engine.liquidate_at_oracle(a, slot2, crash_price, LiquidationPolicy::FullClose).unwrap();
 
     let ins_after = engine.insurance_fund.balance.get();
     // Insurance should receive liquidation fee (or absorb loss)
@@ -1649,7 +1639,7 @@ fn test_conservation_full_lifecycle() {
 
     // Price change + crank
     let slot2 = 3;
-    engine.keeper_crank(slot2, 1200, &[], 64).unwrap();
+    engine.keeper_crank(slot2, 1200, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
     assert!(engine.check_conservation(), "conservation must hold after crank with price change");
 
     // Withdraw
@@ -1658,7 +1648,7 @@ fn test_conservation_full_lifecycle() {
 
     // Another crank at different price
     let slot3 = 4;
-    engine.keeper_crank(slot3, 800, &[], 64).unwrap();
+    engine.keeper_crank(slot3, 800, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
     assert!(engine.check_conservation(), "conservation must hold after second crank");
 }
 
@@ -1684,7 +1674,8 @@ fn test_trade_at_reasonable_size_succeeds() {
 // ============================================================================
 
 #[test]
-fn test_maintenance_fee_large_dt_overflow_returns_error() {
+fn test_maintenance_fee_disabled_large_dt_succeeds() {
+    // Spec §8.2: maintenance fees disabled — even extreme fee params with large dt succeed.
     let mut params = default_params();
     params.maintenance_fee_per_slot = U128::new(u128::MAX / 2);
     let mut engine = RiskEngine::new(params);
@@ -1694,18 +1685,16 @@ fn test_maintenance_fee_large_dt_overflow_returns_error() {
 
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 10_000_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
-    // Use a moderate slot gap (not u64::MAX which loops forever in accrue_market_to).
-    // fee_per_slot = u128::MAX/2, dt = 200_000 → product overflows u128.
     let far_slot = slot + 200_000;
-    // Set last_market_slot close to far_slot so accrue_market_to is fast
     engine.last_market_slot = far_slot - 1;
     engine.last_oracle_price = oracle;
     engine.funding_price_sample_last = oracle;
 
-    let result = engine.keeper_crank(far_slot, oracle, &[a], 64);
-    assert!(result.is_err(), "huge maintenance fee must return Err, not panic");
+    // With fees disabled, this must succeed (no overflow from fee calculation)
+    let result = engine.keeper_crank(far_slot, oracle, &[(a, None)], 64);
+    assert!(result.is_ok(), "maintenance fees disabled — large dt must not fail");
 }
 
 // ============================================================================
@@ -1746,7 +1735,7 @@ fn test_charge_fee_safe_rejects_pnl_at_i256_min() {
     engine.funding_price_sample_last = oracle;
 
     // Liquidation should handle this gracefully (return Err or succeed without i128::MIN)
-    let result = engine.liquidate_at_oracle(a, slot, oracle);
+    let result = engine.liquidate_at_oracle(a, slot, oracle, LiquidationPolicy::FullClose);
     // Either it errors out or it succeeds but PnL is not i128::MIN
     if result.is_ok() {
         assert!(engine.accounts[a as usize].pnl != i128::MIN,
@@ -1833,13 +1822,13 @@ fn test_double_crank_same_slot_is_safe() {
     let oracle = 1000u64;
     let slot = 2u64;
 
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
     let cap_a = engine.accounts[a as usize].capital.get();
     let cap_b = engine.accounts[b as usize].capital.get();
 
     // Second crank same slot — should be a no-op (no double fee charges etc.)
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
     // Capital shouldn't change from a redundant crank
     // (small tolerance for rounding if any fees apply)
@@ -1901,10 +1890,10 @@ fn test_multiple_cranks_do_not_brick_protocol() {
     let (mut engine, _a, _b) = setup_two_users(10_000_000, 10_000_000);
 
     // Run crank at slot 2
-    let _ = engine.keeper_crank(2, 1000, &[], 64);
+    let _ = engine.keeper_crank(2, 1000, &[] as &[(u16, Option<LiquidationPolicy>)], 64);
 
     // Protocol must not be bricked — next crank must succeed
-    let result = engine.keeper_crank(3, 1000, &[], 64);
+    let result = engine.keeper_crank(3, 1000, &[] as &[(u16, Option<LiquidationPolicy>)], 64);
     assert!(result.is_ok(),
         "protocol must not be bricked by a previous crank");
 }
@@ -1922,7 +1911,7 @@ fn test_gc_dust_preserves_fee_credits() {
 
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 10_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
     // Set up dust-like state: 0 capital, 0 position, but positive fee_credits
     engine.set_capital(a as usize, 0);
@@ -1957,7 +1946,7 @@ fn test_gc_collects_dead_account_with_negative_fee_credits() {
 
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 10_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
     // Simulate abandoned account: zero everything
     engine.set_capital(a as usize, 0);
@@ -1990,7 +1979,7 @@ fn test_gc_still_protects_positive_fee_credits() {
 
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 10_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 64).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64).unwrap();
 
     engine.set_capital(a as usize, 0);
     engine.accounts[a as usize].position_basis_q = 0i128;
@@ -2010,18 +1999,9 @@ fn test_gc_still_protects_positive_fee_credits() {
 // ============================================================================
 
 #[test]
-fn test_maintenance_fee_does_not_eagerly_sweep_capital() {
-    // Verify trading loss seniority: settle_maintenance_fee_internal only extends
-    // fee debt (decrements fee_credits), does NOT sweep capital. Capital remains
-    // available for settle_losses (Step 9) which has first claim.
-    //
-    // With proper seniority (deferred sweep):
-    //   Step 8: fee_credits goes negative (debt), capital untouched
-    //   Step 9: settle_losses pays from capital
-    //   Step 12: fee_debt_sweep — only then capital pays fee debt
-    //
-    // Without fix (eager sweep at Step 8):
-    //   Step 8: capital consumed for fee → nothing left for Step 9
+fn test_maintenance_fee_disabled_no_capital_sweep() {
+    // Spec §8.2: maintenance fees disabled — touch_account_full does NOT
+    // charge fees or sweep capital for fee debt.
     let mut params = default_params();
     params.maintenance_fee_per_slot = U128::new(100);
     params.new_account_fee = U128::ZERO;
@@ -2036,24 +2016,17 @@ fn test_maintenance_fee_does_not_eagerly_sweep_capital() {
     engine.last_market_slot = slot;
     engine.accounts[a as usize].last_fee_slot = slot;
 
-    // Advance 50 slots → fee due = 100 * 50 = 5_000
+    // Advance 50 slots — no fee charge
     let touch_slot = slot + 50;
     let _ = engine.touch_account_full(a as usize, oracle, touch_slot);
 
-    // After touch: fee_credits should be negative (debt extended, not capital swept)
     let fc = engine.accounts[a as usize].fee_credits.get();
-    // fee_credits starts at 0, subtract 5000 → -5000
-    // Then fee_debt_sweep at Step 12 pays from capital: cap 10k - 5k = 5k, fc → 0
-    // So fc after full pipeline = 0, cap = 5000
-    // Key invariant: capital was NOT consumed at Step 8 — it was consumed at Step 12
-    // after settle_losses had first claim. With a flat position and no PnL, there's
-    // no trading loss to settle, so all capital survives to Step 12.
     let cap_after = engine.accounts[a as usize].capital.get();
 
-    // Capital should be 10k - 5k(fee) = 5k (fee paid at Step 12, not Step 8)
-    assert_eq!(cap_after, 5_000, "capital = {} (expected 5000: fee paid at Step 12)", cap_after);
-    // fee_credits should be 0 after Step 12 sweep
-    assert_eq!(fc, 0, "fee_credits = {} (expected 0 after debt sweep)", fc);
+    // Capital unchanged — no fees charged
+    assert_eq!(cap_after, 10_000, "capital unchanged: fees disabled");
+    // fee_credits unchanged
+    assert_eq!(fc, 0, "fee_credits unchanged: fees disabled");
 }
 
 // ============================================================================
@@ -2098,7 +2071,7 @@ fn test_min_liquidation_fee_enforced() {
     let ins_before = engine.insurance_fund.balance.get();
 
     let slot2 = 2;
-    let result = engine.liquidate_at_oracle(a, slot2, oracle);
+    let result = engine.liquidate_at_oracle(a, slot2, oracle, LiquidationPolicy::FullClose);
     assert!(result.is_ok(), "liquidation must succeed: {:?}", result);
     assert!(result.unwrap(), "account must be liquidated");
 
@@ -2144,7 +2117,7 @@ fn test_min_liquidation_fee_does_not_exceed_cap() {
 
     // Record insurance before. Trading fee from execute_trade already credited.
     let ins_before = engine.insurance_fund.balance.get();
-    let result = engine.liquidate_at_oracle(a, slot2, crash_price);
+    let result = engine.liquidate_at_oracle(a, slot2, crash_price, LiquidationPolicy::FullClose);
     assert!(result.is_ok(), "liquidation must succeed: {:?}", result);
 
     let ins_after = engine.insurance_fund.balance.get();
@@ -2168,7 +2141,7 @@ fn test_property_49_consume_released_pnl_preserves_reserve() {
     let mut engine = RiskEngine::new(default_params());
     let a = engine.add_user(1000).unwrap();
     engine.deposit(a, 100_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 0).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0).unwrap();
 
     // Give account positive PnL with some matured (released) portion
     let idx = a as usize;
@@ -2215,7 +2188,7 @@ fn test_property_50_flat_only_auto_conversion() {
     let b = engine.add_user(0).unwrap();
     engine.deposit(a, 100_000, oracle, slot).unwrap();
     engine.deposit(b, 100_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 0).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0).unwrap();
 
     // Give 'a' an open position
     let size_q = make_size_q(1);
@@ -2270,7 +2243,7 @@ fn test_property_51_universal_withdrawal_dust_guard() {
 
     let a = engine.add_user(0).unwrap();
     engine.deposit(a, 5_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 0).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0).unwrap();
 
     let cap = engine.accounts[a as usize].capital.get();
     assert_eq!(cap, 5_000);
@@ -2307,7 +2280,7 @@ fn test_property_52_convert_released_pnl_explicit() {
     let b = engine.add_user(1000).unwrap();
     engine.deposit(a, 100_000, oracle, slot).unwrap();
     engine.deposit(b, 100_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 0).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0).unwrap();
 
     // Give 'a' an open position
     let size_q = make_size_q(1);
@@ -2359,7 +2332,7 @@ fn test_property_53_phantom_dust_adl_ordering() {
     // Give 'a' small capital so it goes bankrupt on crash; give 'b' large capital
     engine.deposit(a, 50_000, oracle, slot).unwrap();
     engine.deposit(b, 1_000_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 0).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0).unwrap();
 
     // Open near-maximum-leverage position for 'a':
     // 50k capital, 10% IM => max notional ~500k => ~480 units at price 1000
@@ -2376,7 +2349,7 @@ fn test_property_53_phantom_dust_adl_ordering() {
     // phantom dust on the long side.
     let crash_price = 870u64;
     let slot2 = slot + 1;
-    let result = engine.liquidate_at_oracle(a, slot2, crash_price);
+    let result = engine.liquidate_at_oracle(a, slot2, crash_price, LiquidationPolicy::FullClose);
     assert!(result.is_ok(), "liquidation must succeed: {:?}", result);
     assert!(result.unwrap(), "account a must be liquidated");
 
@@ -2409,7 +2382,7 @@ fn test_property_54_unilateral_exact_drain_reset() {
     let b = engine.add_user(0).unwrap();
     engine.deposit(a, 100_000, oracle, slot).unwrap();
     engine.deposit(b, 100_000, oracle, slot).unwrap();
-    engine.keeper_crank(slot, oracle, &[], 0).unwrap();
+    engine.keeper_crank(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 0).unwrap();
 
     // a long, b short
     let size_q = make_size_q(1);
@@ -2420,7 +2393,7 @@ fn test_property_54_unilateral_exact_drain_reset() {
     let slot2 = slot + 1;
 
     // Liquidate 'a' — the long position is closed, ADL may drain the long side
-    let result = engine.liquidate_at_oracle(a, slot2, crash_price);
+    let result = engine.liquidate_at_oracle(a, slot2, crash_price, LiquidationPolicy::FullClose);
     assert!(result.is_ok(), "liquidation must succeed: {:?}", result);
 
     // After liquidation, the long side should be drained (only long was 'a').

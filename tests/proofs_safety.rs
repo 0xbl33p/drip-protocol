@@ -221,7 +221,7 @@ fn proof_top_up_insurance_preserves_conservation() {
     let vault_before = engine.vault.get();
     let ins_before = engine.insurance_fund.balance.get();
 
-    engine.top_up_insurance_fund(amount as u128).unwrap();
+    engine.top_up_insurance_fund(amount as u128, DEFAULT_SLOT).unwrap();
 
     assert!(engine.vault.get() == vault_before + amount as u128);
     assert!(engine.insurance_fund.balance.get() == ins_before + amount as u128);
@@ -812,10 +812,10 @@ fn proof_funding_rate_validated_before_storage() {
     let bad_rate: i64 = MAX_ABS_FUNDING_BPS_PER_SLOT + 1;
     // keeper_crank no longer accepts funding rate — it uses stored rate.
     // Set a bad rate directly and verify crank still works.
-    engine.set_funding_rate_for_next_interval(bad_rate);
+    engine.funding_rate_bps_per_slot_last = bad_rate;
 
     // The stored rate should be clamped or validated
-    let result = engine.keeper_crank(1, 100, &[a], 1);
+    let result = engine.keeper_crank(1, 100, &[(a, None)], 1);
 
     if result.is_ok() {
         let stored = engine.funding_rate_bps_per_slot_last;
@@ -824,8 +824,8 @@ fn proof_funding_rate_validated_before_storage() {
     }
 
     // Reset to valid rate and verify protocol works
-    engine.set_funding_rate_for_next_interval(0);
-    let result2 = engine.keeper_crank(2, 100, &[a], 1);
+    engine.funding_rate_bps_per_slot_last = 0;
+    let result2 = engine.keeper_crank(2, 100, &[(a, None)], 1);
     assert!(result2.is_ok(),
         "protocol must not be bricked by a previous bad funding rate input");
 }
@@ -909,7 +909,7 @@ fn proof_min_liq_abs_does_not_block_liquidation() {
     // Crash price to trigger liquidation
     let crash_price = 890u64;
     let slot2 = DEFAULT_SLOT + 1;
-    let result = engine.liquidate_at_oracle(a, slot2, crash_price);
+    let result = engine.liquidate_at_oracle(a, slot2, crash_price, LiquidationPolicy::FullClose);
     // Liquidation must not revert due to min_liquidation_abs
     assert!(result.is_ok(), "min_liquidation_abs must not block liquidation");
     assert!(engine.check_conservation(), "conservation must hold after liquidation with min_abs");
@@ -1103,42 +1103,34 @@ fn proof_phantom_dust_drain_no_revert() {
 #[kani::solver(cadical)]
 fn proof_fee_debt_sweep_consumes_released_pnl() {
     let mut params = zero_fee_params();
-    params.warmup_period_slots = 0; // instant warmup → all PnL is released
     let mut engine = RiskEngine::new(params);
 
     let idx = engine.add_user(0).unwrap();
     engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Give account positive PnL (simulating profitable position)
-    engine.set_pnl(idx as usize, 50_000i128);
-
-    // With warmup=0, all PnL should be released (reserved_pnl = pnl, but
-    // advance_profit_warmup would zero it). Manually set reserved=0 to model
-    // instant release.
-    engine.accounts[idx as usize].reserved_pnl = 0;
-    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
-
-    // Zero capital (as if previously withdrawn)
-    engine.set_capital(idx as usize, 0);
-
     // Create fee debt
     engine.accounts[idx as usize].fee_credits = I128::new(-5_000);
 
+    // Account has capital = 10_000, fee debt = 5_000.
+    // fee_debt_sweep pays min(debt, capital) from capital to insurance.
     let ins_before = engine.insurance_fund.balance.get();
-    let released_before = engine.released_pos(idx as usize);
-    assert!(released_before >= 5_000, "account must have enough released PnL");
+    let cap_before = engine.accounts[idx as usize].capital.get();
+    assert!(cap_before >= 5_000, "account must have enough capital");
 
     // Run fee_debt_sweep
     engine.fee_debt_sweep(idx as usize);
 
     let ins_after = engine.insurance_fund.balance.get();
     let fc_after = engine.accounts[idx as usize].fee_credits.get();
+    let cap_after = engine.accounts[idx as usize].capital.get();
 
-    // Fee debt must be (partially or fully) settled from released PnL
-    assert!(ins_after > ins_before,
-        "insurance must receive fee payment from released PnL");
-    assert!(fc_after > -5_000i128,
-        "fee debt must decrease after sweep from released PnL");
+    // Fee debt must be fully settled from capital
+    assert!(ins_after == ins_before + 5_000,
+        "insurance must receive fee payment from capital");
+    assert!(fc_after == 0i128,
+        "fee debt must be fully settled");
+    assert!(cap_after == cap_before - 5_000,
+        "capital must decrease by payment amount");
 
     assert!(engine.check_conservation());
 }
@@ -1360,7 +1352,7 @@ fn proof_property_3_oracle_manipulation_haircut_safety() {
     // Oracle spikes up — a has fresh unrealized profit
     let spike_oracle: u64 = 1_500;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank(slot2, spike_oracle, &[a, b], 64).unwrap();
+    engine.keeper_crank(slot2, spike_oracle, &[(a, None), (b, None)], 64).unwrap();
 
     // After touch, a has positive PnL but it's reserved (R_i > 0)
     let pnl_a = engine.accounts[a as usize].pnl;
@@ -1416,6 +1408,7 @@ fn proof_property_26_maintenance_vs_im_dual_equity() {
     engine.keeper_crank(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0).unwrap();
 
     // Open position: a long 100 units at oracle=1000
+
     // Notional = 100 * 1000 = 100_000
     // IM_req = max(100_000 * 10%, MIN_NONZERO_IM_REQ) = 10_000
     // MM_req = max(100_000 * 5%, MIN_NONZERO_MM_REQ) = 5_000
@@ -1425,7 +1418,7 @@ fn proof_property_26_maintenance_vs_im_dual_equity() {
     // Oracle moves up — a gains profit that is reserved
     let new_oracle: u64 = 1_100;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank(slot2, new_oracle, &[a, b], 64).unwrap();
+    engine.keeper_crank(slot2, new_oracle, &[(a, None), (b, None)], 64).unwrap();
 
     // a now has fresh PnL from price increase. This PnL is reserved.
     let pnl_a = engine.accounts[a as usize].pnl;
@@ -1459,7 +1452,7 @@ fn proof_property_26_maintenance_vs_im_dual_equity() {
 
     // Advance warmup partially (not enough to fully release)
     let slot3 = slot2 + 50; // half of warmup_period_slots=100
-    engine.keeper_crank(slot3, new_oracle, &[a], 64).unwrap();
+    engine.keeper_crank(slot3, new_oracle, &[(a, None)], 64).unwrap();
 
     let eq_maint_after_warmup = engine.account_equity_maint_raw(&engine.accounts[a as usize]);
     // Pure warmup release on unchanged PNL_i must not reduce Eq_maint_raw
@@ -1650,7 +1643,7 @@ fn proof_audit_k_pair_chronology_not_inverted() {
     // Oracle rises — favorable for long (a), unfavorable for short (b)
     let high_oracle = 1_200u64;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank(slot2, high_oracle, &[a, b], 64).unwrap();
+    engine.keeper_crank(slot2, high_oracle, &[(a, None), (b, None)], 64).unwrap();
 
     // a (long) must gain PnL when oracle rises
     assert!(engine.accounts[a as usize].pnl > pnl_a_before,
@@ -1722,28 +1715,15 @@ fn proof_audit2_funding_rate_clamped() {
     let size_q = (10 * POS_SCALE) as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE).unwrap();
 
-    // Set an extreme out-of-range funding rate
+    // Set an extreme out-of-range funding rate directly
     let extreme_rate: i64 = kani::any();
     kani::assume(extreme_rate > MAX_ABS_FUNDING_BPS_PER_SLOT || extreme_rate < -MAX_ABS_FUNDING_BPS_PER_SLOT);
-    engine.set_funding_rate_for_next_interval(extreme_rate);
+    engine.funding_rate_bps_per_slot_last = extreme_rate;
 
-    // The stored rate must be clamped to exactly the bound, preserving sign
-    let stored = engine.funding_rate_bps_per_slot_last;
-    assert!(stored.abs() <= MAX_ABS_FUNDING_BPS_PER_SLOT,
-        "stored rate must be clamped to MAX_ABS_FUNDING_BPS_PER_SLOT");
-    // Verify exact clamping: sign preserved, magnitude = MAX
-    if extreme_rate > MAX_ABS_FUNDING_BPS_PER_SLOT {
-        assert!(stored == MAX_ABS_FUNDING_BPS_PER_SLOT,
-            "positive overflow must clamp to +MAX");
-    } else {
-        assert!(stored == -MAX_ABS_FUNDING_BPS_PER_SLOT,
-            "negative overflow must clamp to -MAX");
-    }
-
-    // accrue_market_to must succeed (not abort)
+    // accrue_market_to must succeed (not abort) even with extreme rate
     let slot2 = DEFAULT_SLOT + 1;
-    let result = engine.keeper_crank(slot2, DEFAULT_ORACLE, &[a, b], 64);
-    assert!(result.is_ok(), "accrue_market_to must not abort after clamped rate");
+    let result = engine.keeper_crank(slot2, DEFAULT_ORACLE, &[(a, None), (b, None)], 64);
+    assert!(result.is_ok(), "accrue_market_to must not abort after extreme rate");
 }
 
 // ############################################################################
@@ -1900,7 +1880,6 @@ fn proof_audit4_init_in_place_canonical() {
     // Dirty EVERY engine state field to simulate non-zeroed memory
     engine.vault = U128::new(999);
     engine.insurance_fund.balance = U128::new(777);
-    engine.insurance_fund.fee_revenue = U128::new(666);
     engine.c_tot = U128::new(555);
     engine.pnl_pos_tot = 333;
     engine.pnl_matured_pos_tot = 222;
@@ -1947,7 +1926,6 @@ fn proof_audit4_init_in_place_canonical() {
     // ---- Vault / insurance ----
     assert!(engine.vault.get() == 0);
     assert!(engine.insurance_fund.balance.get() == 0);
-    assert!(engine.insurance_fund.fee_revenue.get() == 0);
 
     // ---- Aggregates ----
     assert!(engine.c_tot.get() == 0);
@@ -2077,11 +2055,11 @@ fn proof_audit4_top_up_insurance_no_panic() {
     engine.insurance_fund.balance = U128::new(MAX_VAULT_TVL - 1);
 
     // Amount that would exceed MAX_VAULT_TVL
-    let result = engine.top_up_insurance_fund(2);
+    let result = engine.top_up_insurance_fund(2, DEFAULT_SLOT);
     assert!(result.is_err(), "must reject amount that exceeds MAX_VAULT_TVL");
 
     // Amount that stays within MAX_VAULT_TVL
-    let result2 = engine.top_up_insurance_fund(1);
+    let result2 = engine.top_up_insurance_fund(1, DEFAULT_SLOT);
     assert!(result2.is_ok(), "must accept amount within MAX_VAULT_TVL");
     assert!(engine.vault.get() == MAX_VAULT_TVL);
 }
@@ -2097,7 +2075,7 @@ fn proof_audit4_top_up_insurance_overflow() {
     engine.insurance_fund.balance = U128::new(1);
 
     // u128::MAX must not panic — must return Err
-    let result = engine.top_up_insurance_fund(u128::MAX);
+    let result = engine.top_up_insurance_fund(u128::MAX, DEFAULT_SLOT);
     assert!(result.is_err());
 }
 

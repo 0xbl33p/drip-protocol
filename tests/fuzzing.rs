@@ -160,6 +160,9 @@ fn params_regime_a() -> RiskParams {
         liquidation_fee_cap: U128::new(100_000),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(100_000),
+        min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 0,
+        min_nonzero_im_req: 1,
     }
 }
 
@@ -178,6 +181,9 @@ fn params_regime_b() -> RiskParams {
         liquidation_fee_cap: U128::new(100_000),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(100_000),
+        min_initial_deposit: U128::new(0),
+        min_nonzero_mm_req: 0,
+        min_nonzero_im_req: 1,
     }
 }
 
@@ -607,7 +613,8 @@ impl FuzzState {
                 let before = (*self.engine).clone();
                 let vault_before = self.engine.vault;
 
-                let result = self.engine.top_up_insurance_fund(*amount);
+                let now_slot = self.engine.current_slot;
+                let result = self.engine.top_up_insurance_fund(*amount, now_slot);
 
                 match result {
                     Ok(_above_threshold) => {
@@ -675,7 +682,8 @@ proptest! {
         // Top up insurance using proper API (maintains conservation)
         let current_insurance = state.engine.insurance_fund.balance.get();
         if initial_insurance > current_insurance {
-            let _ = state.engine.top_up_insurance_fund(initial_insurance - current_insurance);
+            let now_slot = state.engine.current_slot;
+            let _ = state.engine.top_up_insurance_fund(initial_insurance - current_insurance, now_slot);
         }
 
         // Execute actions - selectors resolved at runtime against live state
@@ -716,7 +724,8 @@ proptest! {
         let target_insurance = initial_insurance.max(floor + 100);
         let current_insurance = state.engine.insurance_fund.balance.get();
         if target_insurance > current_insurance {
-            let _ = state.engine.top_up_insurance_fund(target_insurance - current_insurance);
+            let now_slot = state.engine.current_slot;
+            let _ = state.engine.top_up_insurance_fund(target_insurance - current_insurance, now_slot);
         }
 
         // Execute actions
@@ -931,7 +940,8 @@ fn run_deterministic_fuzzer(
         let target_ins = floor + rng.u128(5_000, 100_000);
         let current_ins = state.engine.insurance_fund.balance.get();
         if target_ins > current_ins {
-            let _ = state.engine.top_up_insurance_fund(target_ins - current_ins);
+            let now_slot = state.engine.current_slot;
+            let _ = state.engine.top_up_insurance_fund(target_ins - current_ins, now_slot);
         }
 
         // Verify conservation after setup

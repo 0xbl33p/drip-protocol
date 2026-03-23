@@ -255,7 +255,7 @@ fn t11_53_keeper_crank_quiesces_after_pending_reset() {
     let c_cap_before = engine.accounts[c as usize].capital.get();
     let c_pnl_before = engine.accounts[c as usize].pnl;
 
-    let result = engine.keeper_crank(1, 100, &[a], 1);
+    let result = engine.keeper_crank(1, 100, &[(a, None)], 1);
     assert!(result.is_ok());
 
     assert!(engine.accounts[c as usize].capital.get() == c_cap_before,
@@ -336,7 +336,7 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
 
     assert!(engine.side_mode_long == SideMode::ResetPending);
 
-    let result = engine.keeper_crank(1, 100, &[a, b], 2);
+    let result = engine.keeper_crank(1, 100, &[(a, None), (b, None)], 2);
     assert!(result.is_ok());
 
     assert!(engine.side_mode_long == SideMode::Normal,
@@ -413,7 +413,7 @@ fn proof_adl_pipeline_trade_liquidate_reopen() {
 
     // Step 3: liquidate a via keeper_crank
     let slot2 = DEFAULT_SLOT + 1;
-    let candidates = [a, b, c];
+    let candidates = [(a, None), (b, None), (c, None)];
     let result = engine.keeper_crank(slot2, DEFAULT_ORACLE, &candidates, 10);
     assert!(result.is_ok());
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q, "OI must balance after liquidation+ADL");

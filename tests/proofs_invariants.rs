@@ -122,7 +122,7 @@ fn inductive_top_up_insurance_preserves_accounting() {
 
     let ins_amt: u32 = kani::any();
     kani::assume(ins_amt <= 1_000_000);
-    engine.top_up_insurance_fund(ins_amt as u128).unwrap();
+    engine.top_up_insurance_fund(ins_amt as u128, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 }
 
@@ -265,7 +265,7 @@ fn prop_conservation_holds_after_all_ops() {
 
     let ins_amt: u32 = kani::any();
     kani::assume(ins_amt <= 1_000_000);
-    engine.top_up_insurance_fund(ins_amt as u128).unwrap();
+    engine.top_up_insurance_fund(ins_amt as u128, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 
     let loss: u32 = kani::any();

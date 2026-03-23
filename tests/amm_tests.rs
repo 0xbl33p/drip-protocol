@@ -57,7 +57,7 @@ fn test_e2e_complete_user_journey() {
     let mut engine = Box::new(RiskEngine::new(default_params()));
 
     // Initialize insurance fund
-    let _ = engine.top_up_insurance_fund(50_000);
+    let _ = engine.top_up_insurance_fund(50_000, 0);
 
     // Add two users with capital
     let alice = engine.add_user(0).unwrap();
@@ -158,7 +158,7 @@ fn test_e2e_funding_complete_cycle() {
     // Scenario: Users trade, funding accrues over time, positions flip
 
     let mut engine = Box::new(RiskEngine::new(default_params()));
-    let _ = engine.top_up_insurance_fund(50_000);
+    let _ = engine.top_up_insurance_fund(50_000, 0);
 
     let alice = engine.add_user(0).unwrap();
     let bob = engine.add_user(0).unwrap();
