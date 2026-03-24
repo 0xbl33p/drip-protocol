@@ -198,15 +198,16 @@ fn test_withdraw_exceeds_balance() {
 }
 
 #[test]
-fn test_withdraw_requires_fresh_crank() {
+fn test_withdraw_succeeds_without_fresh_crank() {
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let idx = engine.add_user(1000).expect("add_user");
     engine.deposit(idx, 10_000, oracle, 1).expect("deposit");
 
-    // Advance far beyond staleness window without cranking
+    // Spec §10.4 + §0 goal 6: withdraw must not require a recent keeper crank.
+    // touch_account_full accrues market state directly from the caller's oracle.
     let result = engine.withdraw(idx, 1_000, oracle, 5000);
-    assert_eq!(result, Err(RiskError::Unauthorized));
+    assert!(result.is_ok(), "withdraw must succeed without fresh crank (spec §0 goal 6)");
 }
 
 // ============================================================================
@@ -233,7 +234,7 @@ fn test_basic_trade() {
 }
 
 #[test]
-fn test_trade_requires_fresh_crank() {
+fn test_trade_succeeds_without_fresh_crank() {
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let a = engine.add_user(1000).expect("add user a");
@@ -241,10 +242,10 @@ fn test_trade_requires_fresh_crank() {
     engine.deposit(a, 100_000, oracle, 1).expect("deposit a");
     engine.deposit(b, 100_000, oracle, 1).expect("deposit b");
 
-    // No crank, advance way past staleness
+    // Spec §10.5 + §0 goal 6: execute_trade must not require a recent keeper crank.
     let size_q = make_size_q(10);
     let result = engine.execute_trade(a, b, oracle, 5000, size_q, oracle);
-    assert_eq!(result, Err(RiskError::Unauthorized));
+    assert!(result.is_ok(), "trade must succeed without fresh crank (spec §0 goal 6)");
 }
 
 #[test]

@@ -622,3 +622,75 @@ fn proof_touch_oob_returns_error() {
     let result = engine.touch_account_full(MAX_ACCOUNTS, DEFAULT_ORACLE, DEFAULT_SLOT);
     assert!(result.is_err(), "touch on OOB index must fail");
 }
+
+// ############################################################################
+// FIX 13: withdraw and execute_trade do not require fresh crank (spec §0 goal 6)
+// ############################################################################
+
+/// Withdraw must succeed even when no keeper_crank has ever run.
+/// Spec §10.4 does not gate withdraw on keeper liveness.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_withdraw_no_crank_gate() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 10_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // last_crank_slot is 0, now_slot is far ahead. Must still succeed.
+    let far_slot = DEFAULT_SLOT + 100_000;
+    let result = engine.withdraw(idx, 1_000, DEFAULT_ORACLE, far_slot);
+    assert!(result.is_ok(), "withdraw must not require fresh crank (spec §0 goal 6)");
+}
+
+/// execute_trade must succeed even when no keeper_crank has ever run.
+/// Spec §10.5 does not gate execute_trade on keeper liveness.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_trade_no_crank_gate() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // last_crank_slot is 0, now_slot is far ahead. Must still succeed.
+    let far_slot = DEFAULT_SLOT + 100_000;
+    let size: i128 = POS_SCALE as i128;
+    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, far_slot, size, DEFAULT_ORACLE);
+    assert!(result.is_ok(), "trade must not require fresh crank (spec §0 goal 6)");
+}
+
+// ############################################################################
+// FIX 14: GC skips accounts with negative PnL (spec §2.6 precondition)
+// ############################################################################
+
+/// garbage_collect_dust must NOT free an account with PNL < 0.
+/// Spec §2.6 requires PNL_i == 0 as a precondition for reclamation.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_gc_skips_negative_pnl() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let idx = engine.add_user(0).unwrap();
+    // Deposit 1 token (below min_initial_deposit=2), making it a dust candidate
+    engine.deposit(idx, 1, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Directly set negative PnL to simulate a flat account with unresolved loss.
+    // In production this arises when a position is closed at a loss but
+    // touch_account_full → §7.3 hasn't run yet.
+    engine.set_pnl(idx as usize, -100i128);
+
+    let ins_before = engine.insurance_fund.balance.get();
+
+    engine.gc_cursor = 0;
+    let num_freed = engine.garbage_collect_dust();
+
+    // GC must skip the account (PNL != 0 per §2.6 precondition)
+    assert_eq!(num_freed, 0, "GC must not free account with PNL < 0");
+    assert!(engine.is_used(idx as usize), "account must remain used");
+    assert_eq!(engine.insurance_fund.balance.get(), ins_before,
+        "GC must not draw from insurance for negative-PnL accounts");
+}

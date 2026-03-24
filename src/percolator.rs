@@ -2261,7 +2261,9 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        self.require_fresh_crank(now_slot)?;
+        // No require_fresh_crank: spec §10.4 does not gate withdraw on keeper
+        // liveness. touch_account_full calls accrue_market_to with the caller's
+        // oracle and slot, satisfying spec §0 goal 6 (liveness without external action).
 
         if !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
@@ -2382,7 +2384,9 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        self.require_fresh_crank(now_slot)?;
+        // No require_fresh_crank: spec §10.5 does not gate execute_trade on
+        // keeper liveness. touch_account_full calls accrue_market_to with the
+        // caller's oracle and slot, satisfying spec §0 goal 6.
 
         if !self.is_used(a as usize) || !self.is_used(b as usize) {
             return Err(RiskError::AccountNotFound);
@@ -3346,7 +3350,9 @@ impl RiskEngine {
             if account.reserved_pnl != 0 {
                 continue;
             }
-            if account.pnl > 0 {
+            // Spec §2.6 requires PNL_i == 0 as a precondition.
+            // Accounts with PNL != 0 need touch_account_full → §7.3 first.
+            if account.pnl != 0 {
                 continue;
             }
             if account.fee_credits.get() > 0 {
@@ -3360,15 +3366,7 @@ impl RiskEngine {
                 self.insurance_fund.balance = self.insurance_fund.balance + dust_cap;
             }
 
-            // Write off negative PnL
-            if self.accounts[idx].pnl < 0 {
-                assert!(self.accounts[idx].pnl != i128::MIN, "gc: i128::MIN pnl");
-                let loss = self.accounts[idx].pnl.unsigned_abs();
-                self.absorb_protocol_loss(loss);
-                self.set_pnl(idx, 0i128);
-            }
-
-            // Write off negative fee_credits (uncollectible debt from dead account)
+            // Forgive uncollectible fee debt (spec §2.6)
             if self.accounts[idx].fee_credits.get() < 0 {
                 self.accounts[idx].fee_credits = I128::new(0);
             }
