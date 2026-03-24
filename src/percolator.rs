@@ -16,6 +16,33 @@
 extern crate kani;
 
 // ============================================================================
+// Conditional visibility macro
+// ============================================================================
+
+// ============================================================================
+// Conditional visibility macro
+// ============================================================================
+
+/// Internal methods that proof harnesses and integration tests need direct
+/// access to. Private in production builds, `pub` under test/kani.
+/// Each invocation emits two mutually-exclusive cfg-gated copies of the same
+/// function: one `pub`, one private.
+macro_rules! test_visible {
+    (
+        $(#[$meta:meta])*
+        fn $name:ident($($args:tt)*) $(-> $ret:ty)? $body:block
+    ) => {
+        $(#[$meta])*
+        #[cfg(any(feature = "test", kani))]
+        pub fn $name($($args)*) $(-> $ret)? $body
+
+        $(#[$meta])*
+        #[cfg(not(any(feature = "test", kani)))]
+        fn $name($($args)*) $(-> $ret)? $body
+    };
+}
+
+// ============================================================================
 // Constants
 // ============================================================================
 
@@ -231,6 +258,8 @@ pub struct RiskParams {
     /// Absolute nonzero-position margin floors (spec §9.1)
     pub min_nonzero_mm_req: u128,
     pub min_nonzero_im_req: u128,
+    /// Insurance fund floor (spec §1.4: 0 <= I_floor <= MAX_VAULT_TVL)
+    pub insurance_floor: U128,
 }
 
 /// Main risk engine state (spec §2.2)
@@ -472,6 +501,12 @@ impl RiskEngine {
             params.liquidation_fee_cap.get() <= MAX_PROTOCOL_FEE_ABS,
             "liquidation_fee_cap must be <= MAX_PROTOCOL_FEE_ABS (spec §1.4)"
         );
+
+        // Insurance floor (spec §1.4: 0 <= I_floor <= MAX_VAULT_TVL)
+        assert!(
+            params.insurance_floor.get() <= MAX_VAULT_TVL,
+            "insurance_floor must be <= MAX_VAULT_TVL (spec §1.4)"
+        );
     }
 
     /// Create a new risk engine
@@ -519,7 +554,7 @@ impl RiskEngine {
             last_oracle_price: 0,
             last_market_slot: 0,
             funding_price_sample_last: 0,
-            insurance_floor: 0,
+            insurance_floor: params.insurance_floor.get(),
             used: [0; BITMAP_WORDS],
             num_used_accounts: 0,
             next_account_id: 0,
@@ -579,7 +614,7 @@ impl RiskEngine {
         self.last_oracle_price = 0;
         self.last_market_slot = 0;
         self.funding_price_sample_last = 0;
-        self.insurance_floor = 0;
+        self.insurance_floor = params.insurance_floor.get();
         self.used = [0; BITMAP_WORDS];
         self.num_used_accounts = 0;
         self.next_account_id = 0;
@@ -662,7 +697,8 @@ impl RiskEngine {
         Ok(idx)
     }
 
-    pub fn free_slot(&mut self, idx: u16) {
+    test_visible! {
+    fn free_slot(&mut self, idx: u16) {
         self.accounts[idx as usize] = empty_account();
         self.clear_used(idx as usize);
         self.next_free[idx as usize] = self.free_head;
@@ -670,6 +706,7 @@ impl RiskEngine {
         self.num_used_accounts = self.num_used_accounts.saturating_sub(1);
         // Decrement materialized_account_count (spec §2.1.2)
         self.materialized_account_count = self.materialized_account_count.saturating_sub(1);
+    }
     }
 
     /// materialize_account(i, slot_anchor) — spec §2.5.
@@ -754,7 +791,8 @@ impl RiskEngine {
 
     /// set_pnl (spec §4.4): Update PNL and maintain pnl_pos_tot + pnl_matured_pos_tot
     /// with proper reserve handling. Forbids i128::MIN.
-    pub fn set_pnl(&mut self, idx: usize, new_pnl: i128) {
+    test_visible! {
+    fn set_pnl(&mut self, idx: usize, new_pnl: i128) {
         // Step 1: forbid i128::MIN
         assert!(new_pnl != i128::MIN, "set_pnl: i128::MIN forbidden");
 
@@ -814,9 +852,11 @@ impl RiskEngine {
         self.accounts[idx].pnl = new_pnl;
         self.accounts[idx].reserved_pnl = new_r;
     }
+    }
 
     /// set_reserved_pnl (spec §4.3): update R_i and maintain pnl_matured_pos_tot.
-    pub fn set_reserved_pnl(&mut self, idx: usize, new_r: u128) {
+    test_visible! {
+    fn set_reserved_pnl(&mut self, idx: usize, new_r: u128) {
         let pos = i128_clamp_pos(self.accounts[idx].pnl);
         assert!(new_r <= pos, "set_reserved_pnl: new_R > max(PNL_i, 0)");
 
@@ -839,10 +879,12 @@ impl RiskEngine {
 
         self.accounts[idx].reserved_pnl = new_r;
     }
+    }
 
     /// consume_released_pnl (spec §4.4.1): remove only matured released positive PnL,
     /// leaving R_i unchanged.
-    pub fn consume_released_pnl(&mut self, idx: usize, x: u128) {
+    test_visible! {
+    fn consume_released_pnl(&mut self, idx: usize, x: u128) {
         assert!(x > 0, "consume_released_pnl: x must be > 0");
 
         let old_pos = i128_clamp_pos(self.accounts[idx].pnl);
@@ -872,9 +914,11 @@ impl RiskEngine {
         self.accounts[idx].pnl = new_pnl;
         // R_i remains unchanged
     }
+    }
 
     /// set_capital (spec §4.2): checked signed-delta update of C_tot
-    pub fn set_capital(&mut self, idx: usize, new_capital: u128) {
+    test_visible! {
+    fn set_capital(&mut self, idx: usize, new_capital: u128) {
         let old = self.accounts[idx].capital.get();
         if new_capital >= old {
             let delta = new_capital - old;
@@ -887,9 +931,11 @@ impl RiskEngine {
         }
         self.accounts[idx].capital = U128::new(new_capital);
     }
+    }
 
     /// set_position_basis_q (spec §4.4): update stored pos counts based on sign changes
-    pub fn set_position_basis_q(&mut self, idx: usize, new_basis: i128) {
+    test_visible! {
+    fn set_position_basis_q(&mut self, idx: usize, new_basis: i128) {
         let old = self.accounts[idx].position_basis_q;
         let old_side = side_of_i128(old);
         let new_side = side_of_i128(new_basis);
@@ -924,9 +970,11 @@ impl RiskEngine {
 
         self.accounts[idx].position_basis_q = new_basis;
     }
+    }
 
     /// attach_effective_position (spec §4.5)
-    pub fn attach_effective_position(&mut self, idx: usize, new_eff_pos_q: i128) {
+    test_visible! {
+    fn attach_effective_position(&mut self, idx: usize, new_eff_pos_q: i128) {
         // Before replacing a nonzero same-epoch basis, account for the fractional
         // remainder that will be orphaned (dynamic dust accounting).
         let old_basis = self.accounts[idx].position_basis_q;
@@ -978,6 +1026,7 @@ impl RiskEngine {
                 }
             }
         }
+    }
     }
 
     // ========================================================================
@@ -1076,7 +1125,7 @@ impl RiskEngine {
     }
 
     /// Spec §4.6: increment phantom dust bound by 1 q-unit (checked).
-    pub fn inc_phantom_dust_bound(&mut self, s: Side) {
+    fn inc_phantom_dust_bound(&mut self, s: Side) {
         match s {
             Side::Long => {
                 self.phantom_dust_bound_long_q = self.phantom_dust_bound_long_q
@@ -1092,7 +1141,7 @@ impl RiskEngine {
     }
 
     /// Spec §4.6.1: increment phantom dust bound by amount_q (checked).
-    pub fn inc_phantom_dust_bound_by(&mut self, s: Side, amount_q: u128) {
+    fn inc_phantom_dust_bound_by(&mut self, s: Side, amount_q: u128) {
         match s {
             Side::Long => {
                 self.phantom_dust_bound_long_q = self.phantom_dust_bound_long_q
@@ -1155,7 +1204,8 @@ impl RiskEngine {
     // settle_side_effects (spec §5.3)
     // ========================================================================
 
-    pub fn settle_side_effects(&mut self, idx: usize) -> Result<()> {
+    test_visible! {
+    fn settle_side_effects(&mut self, idx: usize) -> Result<()> {
         let basis = self.accounts[idx].position_basis_q;
         if basis == 0 {
             return Ok(());
@@ -1259,12 +1309,14 @@ impl RiskEngine {
 
         Ok(())
     }
+    }
 
     // ========================================================================
     // accrue_market_to (spec §5.4)
     // ========================================================================
 
-    pub fn accrue_market_to(&mut self, now_slot: u64, oracle_price: u64) -> Result<()> {
+    test_visible! {
+    fn accrue_market_to(&mut self, now_slot: u64, oracle_price: u64) -> Result<()> {
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -1314,14 +1366,17 @@ impl RiskEngine {
 
         Ok(())
     }
+    }
 
     /// recompute_r_last_from_final_state (spec §4.12).
     /// Recomputes funding rate from final post-reset state.
     /// Must clamp to MAX_ABS_FUNDING_BPS_PER_SLOT.
-    pub fn recompute_r_last_from_final_state(&mut self) {
+    test_visible! {
+    fn recompute_r_last_from_final_state(&mut self) {
         // Zero-rate core profile (spec §4.12): always store r_last = 0.
         // No other result is compliant in this revision.
         self.funding_rate_bps_per_slot_last = 0;
+    }
     }
 
     // ========================================================================
@@ -1330,7 +1385,7 @@ impl RiskEngine {
 
     /// use_insurance_buffer (spec §4.11): deduct loss from insurance down to floor,
     /// return the remaining uninsured loss.
-    pub fn use_insurance_buffer(&mut self, loss: u128) -> u128 {
+    fn use_insurance_buffer(&mut self, loss: u128) -> u128 {
         if loss == 0 {
             return 0;
         }
@@ -1345,19 +1400,22 @@ impl RiskEngine {
 
     /// absorb_protocol_loss (spec §4.11): use_insurance_buffer then record
     /// any remaining uninsured loss as implicit haircut.
-    pub fn absorb_protocol_loss(&mut self, loss: u128) {
+    test_visible! {
+    fn absorb_protocol_loss(&mut self, loss: u128) {
         if loss == 0 {
             return;
         }
         let _rem = self.use_insurance_buffer(loss);
         // Remaining loss is implicit haircut through h
     }
+    }
 
     // ========================================================================
     // enqueue_adl (spec §5.6)
     // ========================================================================
 
-    pub fn enqueue_adl(&mut self, ctx: &mut InstructionContext, liq_side: Side, q_close_q: u128, d: u128) -> Result<()> {
+    test_visible! {
+    fn enqueue_adl(&mut self, ctx: &mut InstructionContext, liq_side: Side, q_close_q: u128, d: u128) -> Result<()> {
         let opp = opposite_side(liq_side);
 
         // Step 1: decrease liquidated side OI (checked — underflow is corrupt state)
@@ -1487,12 +1545,14 @@ impl RiskEngine {
 
         Ok(())
     }
+    }
 
     // ========================================================================
     // begin_full_drain_reset / finalize_side_reset (spec §2.5, §2.7)
     // ========================================================================
 
-    pub fn begin_full_drain_reset(&mut self, side: Side) {
+    test_visible! {
+    fn begin_full_drain_reset(&mut self, side: Side) {
         // Require OI_eff_side == 0
         assert!(self.get_oi_eff(side) == 0, "begin_full_drain_reset: OI not zero");
 
@@ -1527,8 +1587,10 @@ impl RiskEngine {
         // mode = ResetPending
         self.set_side_mode(side, SideMode::ResetPending);
     }
+    }
 
-    pub fn finalize_side_reset(&mut self, side: Side) -> Result<()> {
+    test_visible! {
+    fn finalize_side_reset(&mut self, side: Side) -> Result<()> {
         if self.get_side_mode(side) != SideMode::ResetPending {
             return Err(RiskError::CorruptState);
         }
@@ -1544,12 +1606,14 @@ impl RiskEngine {
         self.set_side_mode(side, SideMode::Normal);
         Ok(())
     }
+    }
 
     // ========================================================================
     // schedule_end_of_instruction_resets / finalize (spec §5.7-5.8)
     // ========================================================================
 
-    pub fn schedule_end_of_instruction_resets(&mut self, ctx: &mut InstructionContext) -> Result<()> {
+    test_visible! {
+    fn schedule_end_of_instruction_resets(&mut self, ctx: &mut InstructionContext) -> Result<()> {
         // §5.7.A: Bilateral-empty dust clearance
         if self.stored_pos_count_long == 0 && self.stored_pos_count_short == 0 {
             let clear_bound_q = self.phantom_dust_bound_long_q
@@ -1622,8 +1686,10 @@ impl RiskEngine {
 
         Ok(())
     }
+    }
 
-    pub fn finalize_end_of_instruction_resets(&mut self, ctx: &InstructionContext) {
+    test_visible! {
+    fn finalize_end_of_instruction_resets(&mut self, ctx: &InstructionContext) {
         if ctx.pending_reset_long && self.side_mode_long != SideMode::ResetPending {
             self.begin_full_drain_reset(Side::Long);
         }
@@ -1633,11 +1699,12 @@ impl RiskEngine {
         // Auto-finalize sides that are fully ready for reopening
         self.maybe_finalize_ready_reset_sides();
     }
+    }
 
     /// Preflight finalize: if a side is ResetPending with OI=0, stale=0, pos_count=0,
     /// transition it back to Normal so fresh OI can be added.
     /// Called before OI-increase gating and at end-of-instruction.
-    pub fn maybe_finalize_ready_reset_sides(&mut self) {
+    fn maybe_finalize_ready_reset_sides(&mut self) {
         if self.side_mode_long == SideMode::ResetPending
             && self.get_oi_eff(Side::Long) == 0
             && self.get_stale_count(Side::Long) == 0
@@ -1827,7 +1894,8 @@ impl RiskEngine {
 
     /// restart_warmup_after_reserve_increase (spec §4.9)
     /// Caller obligation: MUST be called after set_pnl increases R_i.
-    pub fn restart_warmup_after_reserve_increase(&mut self, idx: usize) {
+    test_visible! {
+    fn restart_warmup_after_reserve_increase(&mut self, idx: usize) {
         let t = self.params.warmup_period_slots;
         if t == 0 {
             // Instantaneous warmup: release all reserve immediately
@@ -1848,9 +1916,11 @@ impl RiskEngine {
         self.accounts[idx].warmup_slope_per_step = slope;
         self.accounts[idx].warmup_started_at_slot = self.current_slot;
     }
+    }
 
     /// advance_profit_warmup (spec §4.9)
-    pub fn advance_profit_warmup(&mut self, idx: usize) {
+    test_visible! {
+    fn advance_profit_warmup(&mut self, idx: usize) {
         let r = self.accounts[idx].reserved_pnl;
         if r == 0 {
             self.accounts[idx].warmup_slope_per_step = 0;
@@ -1874,6 +1944,7 @@ impl RiskEngine {
             self.accounts[idx].warmup_slope_per_step = 0;
         }
         self.accounts[idx].warmup_started_at_slot = self.current_slot;
+    }
     }
 
     // ========================================================================
@@ -1948,7 +2019,8 @@ impl RiskEngine {
     }
 
     /// fee_debt_sweep (spec §7.5): after any capital increase, sweep fee debt
-    pub fn fee_debt_sweep(&mut self, idx: usize) {
+    test_visible! {
+    fn fee_debt_sweep(&mut self, idx: usize) {
         let fc = self.accounts[idx].fee_credits.get();
         let debt = fee_debt_u128_checked(fc);
         if debt == 0 {
@@ -1967,6 +2039,7 @@ impl RiskEngine {
         // Per spec §7.5: unpaid fee debt remains as local fee_credits until
         // physical capital becomes available or manual profit conversion occurs.
         // MUST NOT consume junior PnL claims to mint senior insurance capital.
+    }
     }
 
     // ========================================================================
@@ -3076,7 +3149,8 @@ impl RiskEngine {
     /// Pre-flight correctness: settle_losses preserves C + PNL (spec §7.1),
     /// and the synthetic close at oracle generates zero additional PnL delta,
     /// so Eq_maint_raw after partial = Eq_maint_raw_before - liq_fee.
-    pub fn validate_keeper_hint(
+    test_visible! {
+    fn validate_keeper_hint(
         &self,
         idx: u16,
         eff: i128,
@@ -3130,6 +3204,7 @@ impl RiskEngine {
                 Some(LiquidationPolicy::ExactPartial(*q_close_q))
             }
         }
+    }
     }
 
     // ========================================================================
@@ -3309,7 +3384,8 @@ impl RiskEngine {
     // Garbage collection
     // ========================================================================
 
-    pub fn garbage_collect_dust(&mut self) -> u32 {
+    test_visible! {
+    fn garbage_collect_dust(&mut self) -> u32 {
         let mut to_free: [u16; GC_CLOSE_BUDGET as usize] = [0; GC_CLOSE_BUDGET as usize];
         let mut num_to_free = 0usize;
 
@@ -3385,19 +3461,20 @@ impl RiskEngine {
 
         num_to_free as u32
     }
+    }
 
     // ========================================================================
     // Crank freshness
     // ========================================================================
 
-    pub fn require_fresh_crank(&self, now_slot: u64) -> Result<()> {
+    fn require_fresh_crank(&self, now_slot: u64) -> Result<()> {
         if now_slot.saturating_sub(self.last_crank_slot) > self.max_crank_staleness_slots {
             return Err(RiskError::Unauthorized);
         }
         Ok(())
     }
 
-    pub fn require_recent_full_sweep(&self, now_slot: u64) -> Result<()> {
+    fn require_recent_full_sweep(&self, now_slot: u64) -> Result<()> {
         if now_slot.saturating_sub(self.last_full_sweep_start_slot) > self.max_crank_staleness_slots {
             return Err(RiskError::Unauthorized);
         }
@@ -3468,7 +3545,8 @@ impl RiskEngine {
     }
 
     #[cfg(any(test, feature = "test", kani))]
-    pub fn add_fee_credits(&mut self, idx: u16, amount: u128) -> Result<()> {
+    test_visible! {
+    fn add_fee_credits(&mut self, idx: u16, amount: u128) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::Unauthorized);
         }
@@ -3476,12 +3554,14 @@ impl RiskEngine {
             .fee_credits.saturating_add(amount as i128);
         Ok(())
     }
+    }
 
     // ========================================================================
     // Recompute aggregates (test helper)
     // ========================================================================
 
-    pub fn recompute_aggregates(&mut self) {
+    test_visible! {
+    fn recompute_aggregates(&mut self) {
         let mut c_tot = 0u128;
         let mut pnl_pos_tot = 0u128;
         self.for_each_used(|_idx, account| {
@@ -3493,22 +3573,27 @@ impl RiskEngine {
         self.c_tot = U128::new(c_tot);
         self.pnl_pos_tot = pnl_pos_tot;
     }
+    }
 
     // ========================================================================
     // Utilities
     // ========================================================================
 
-    pub fn advance_slot(&mut self, slots: u64) {
+    test_visible! {
+    fn advance_slot(&mut self, slots: u64) {
         self.current_slot = self.current_slot.saturating_add(slots);
+    }
     }
 
     /// Count used accounts
-    pub fn count_used(&self) -> u64 {
+    test_visible! {
+    fn count_used(&self) -> u64 {
         let mut count = 0u64;
         self.for_each_used(|_, _| {
             count += 1;
         });
         count
+    }
     }
 }
 
@@ -3599,4 +3684,5 @@ pub fn compute_trade_pnl(size_q: i128, price_diff: i128) -> Result<i128> {
         }
     }
 }
+
 

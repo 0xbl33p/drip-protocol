@@ -118,6 +118,7 @@ pub fn zero_fee_params() -> RiskParams {
         min_initial_deposit: U128::new(2),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::ZERO,
     }
 }
 
@@ -138,5 +139,6 @@ pub fn default_params() -> RiskParams {
         min_initial_deposit: U128::new(1000),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::ZERO,
     }
 }

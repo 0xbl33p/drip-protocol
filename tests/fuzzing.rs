@@ -163,6 +163,7 @@ fn params_regime_a() -> RiskParams {
         min_initial_deposit: U128::new(2),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::ZERO,
     }
 }
 
@@ -184,6 +185,7 @@ fn params_regime_b() -> RiskParams {
         min_initial_deposit: U128::new(1000),
         min_nonzero_mm_req: 1,
         min_nonzero_im_req: 2,
+        insurance_floor: U128::ZERO,
     }
 }
 
