@@ -145,7 +145,7 @@ fn assert_global_invariants(engine: &RiskEngine, context: &str) {
 // SECTION 3: PARAMETER REGIMES
 // ============================================================================
 
-/// Regime A: Normal mode (floor = 0 or small)
+/// Regime A: Normal mode (small floors)
 fn params_regime_a() -> RiskParams {
     RiskParams {
         warmup_period_slots: 100,
@@ -160,9 +160,9 @@ fn params_regime_a() -> RiskParams {
         liquidation_fee_cap: U128::new(100_000),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(100_000),
-        min_initial_deposit: U128::new(0),
-        min_nonzero_mm_req: 0,
-        min_nonzero_im_req: 1,
+        min_initial_deposit: U128::new(2),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     }
 }
 
@@ -181,9 +181,9 @@ fn params_regime_b() -> RiskParams {
         liquidation_fee_cap: U128::new(100_000),
         liquidation_buffer_bps: 100,
         min_liquidation_abs: U128::new(100_000),
-        min_initial_deposit: U128::new(0),
-        min_nonzero_mm_req: 0,
-        min_nonzero_im_req: 1,
+        min_initial_deposit: U128::new(1000),
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
     }
 }
 

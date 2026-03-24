@@ -410,29 +410,26 @@ fn i128_clamp_pos(v: i128) -> u128 {
 // ============================================================================
 
 impl RiskEngine {
-    /// Validate configuration parameters (spec §2.2.1).
+    /// Validate configuration parameters (spec §1.4, §2.2.1).
     /// Panics on invalid configuration to prevent deployment with unsafe params.
     fn validate_params(params: &RiskParams) {
+        // Capacity: max_accounts within compile-time slab (spec §1.4)
+        assert!(
+            (params.max_accounts as usize) <= MAX_ACCOUNTS && params.max_accounts > 0,
+            "max_accounts must be in 1..=MAX_ACCOUNTS"
+        );
+
+        // Margin ordering: 0 < maintenance_bps < initial_bps <= 10_000 (spec §1.4)
         assert!(
             params.maintenance_margin_bps < params.initial_margin_bps,
             "maintenance_margin_bps must be strictly less than initial_margin_bps"
         );
         assert!(
-            params.min_nonzero_mm_req < params.min_nonzero_im_req,
-            "min_nonzero_mm_req must be strictly less than min_nonzero_im_req"
-        );
-        assert!(
-            (params.max_accounts as usize) <= MAX_ACCOUNTS && params.max_accounts > 0,
-            "max_accounts must be in 1..=MAX_ACCOUNTS"
-        );
-        assert!(
             params.initial_margin_bps <= 10_000,
             "initial_margin_bps must be <= 10_000"
         );
-        assert!(
-            params.maintenance_margin_bps <= 10_000,
-            "maintenance_margin_bps must be <= 10_000"
-        );
+
+        // BPS bounds (spec §1.4)
         assert!(
             params.trading_fee_bps <= 10_000,
             "trading_fee_bps must be <= 10_000"
@@ -440,6 +437,30 @@ impl RiskEngine {
         assert!(
             params.liquidation_fee_bps <= 10_000,
             "liquidation_fee_bps must be <= 10_000"
+        );
+
+        // Nonzero margin floor ordering: 0 < mm < im <= min_initial_deposit (spec §1.4)
+        assert!(
+            params.min_nonzero_mm_req > 0,
+            "min_nonzero_mm_req must be > 0"
+        );
+        assert!(
+            params.min_nonzero_mm_req < params.min_nonzero_im_req,
+            "min_nonzero_mm_req must be strictly less than min_nonzero_im_req"
+        );
+        assert!(
+            params.min_nonzero_im_req <= params.min_initial_deposit.get(),
+            "min_nonzero_im_req must be <= min_initial_deposit (spec §1.4)"
+        );
+
+        // MIN_INITIAL_DEPOSIT bounds: 0 < min_initial_deposit <= MAX_VAULT_TVL (spec §1.4)
+        assert!(
+            params.min_initial_deposit.get() > 0,
+            "min_initial_deposit must be > 0 (spec §1.4)"
+        );
+        assert!(
+            params.min_initial_deposit.get() <= MAX_VAULT_TVL,
+            "min_initial_deposit must be <= MAX_VAULT_TVL"
         );
     }
 
@@ -1171,11 +1192,12 @@ impl RiskEngine {
 
             if q_eff_new == 0 {
                 // Position effectively zeroed (spec §5.3 step 4)
+                // Reset to canonical zero-position defaults (spec §2.4)
                 self.inc_phantom_dust_bound(side);
                 self.set_position_basis_q(idx, 0i128);
                 self.accounts[idx].adl_a_basis = ADL_ONE;
                 self.accounts[idx].adl_k_snap = 0i128;
-                self.accounts[idx].adl_epoch_snap = epoch_side;
+                self.accounts[idx].adl_epoch_snap = 0;
             } else {
                 // Update k_snap only; do NOT change basis or a_basis (non-compounding)
                 self.accounts[idx].adl_k_snap = k_side;
@@ -1219,10 +1241,10 @@ impl RiskEngine {
             let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
             self.set_stale_count(side, new_stale);
 
-            // Reset to canonical zero-position defaults
+            // Reset to canonical zero-position defaults (spec §2.4)
             self.accounts[idx].adl_a_basis = ADL_ONE;
             self.accounts[idx].adl_k_snap = 0i128;
-            self.accounts[idx].adl_epoch_snap = epoch_side;
+            self.accounts[idx].adl_epoch_snap = 0;
         }
 
         Ok(())
@@ -2985,13 +3007,12 @@ impl RiskEngine {
                 let eff = self.effective_pos_q(cidx);
                 if eff != 0 {
                     if !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price) {
-                        // Keeper hints are untrusted advisory. An ExactPartial hint
-                        // that fails the post-partial health check (spec §9.4 step 14)
-                        // would return Err after mutating state, reverting the entire
-                        // crank. To prevent griefing, keeper_crank always uses FullClose.
-                        // External callers wanting partial liquidation use
-                        // liquidate_at_oracle() directly.
-                        match self.liquidate_at_oracle_internal(candidate_idx, now_slot, oracle_price, LiquidationPolicy::FullClose, &mut ctx) {
+                        // Validate hint via stateless pre-flight (spec §11.1 rule 3).
+                        // If the hint is an ExactPartial that would fail the §9.4 step 14
+                        // post-partial health check, the pre-flight rejects it and we
+                        // fall back to FullClose to preserve crank liveness.
+                        let policy = self.validate_keeper_hint(candidate_idx, eff, hint, oracle_price);
+                        match self.liquidate_at_oracle_internal(candidate_idx, now_slot, oracle_price, policy, &mut ctx) {
                             Ok(true) => { num_liquidations += 1; }
                             Ok(false) => {}
                             Err(e) => return Err(e),
@@ -3029,25 +3050,64 @@ impl RiskEngine {
     }
 
     /// Validate a keeper-supplied liquidation-policy hint (spec §11.1 rule 3).
-    /// Returns Some(policy) if the hint is valid on current state, None otherwise.
-    /// An absent hint defaults to FullClose. Invalid hints cause no liquidation.
+    /// Returns a safe LiquidationPolicy. ExactPartial hints are validated via a
+    /// stateless pre-flight check that predicts whether the post-partial health
+    /// check (§9.4 step 14) would pass. If it wouldn't, falls back to FullClose
+    /// to preserve crank liveness.
+    ///
+    /// Pre-flight correctness: settle_losses preserves C + PNL (spec §7.1),
+    /// and the synthetic close at oracle generates zero additional PnL delta,
+    /// so Eq_maint_raw after partial = Eq_maint_raw_before - liq_fee.
     fn validate_keeper_hint(
         &self,
         idx: u16,
         eff: i128,
         hint: &Option<LiquidationPolicy>,
-    ) -> Option<LiquidationPolicy> {
+        oracle_price: u64,
+    ) -> LiquidationPolicy {
         match hint {
-            None => Some(LiquidationPolicy::FullClose),
-            Some(LiquidationPolicy::FullClose) => Some(LiquidationPolicy::FullClose),
+            None | Some(LiquidationPolicy::FullClose) => LiquidationPolicy::FullClose,
             Some(LiquidationPolicy::ExactPartial(q_close_q)) => {
                 let abs_eff = eff.unsigned_abs();
-                // Validate: 0 < q_close_q < abs(eff)
+                // Bounds check: 0 < q_close_q < abs(eff)
                 if *q_close_q == 0 || *q_close_q >= abs_eff {
-                    None // Invalid hint — no liquidation action
-                } else {
-                    Some(LiquidationPolicy::ExactPartial(*q_close_q))
+                    return LiquidationPolicy::FullClose;
                 }
+
+                // Stateless pre-flight: predict post-partial maintenance health.
+                let account = &self.accounts[idx as usize];
+
+                // 1. Predict liquidation fee
+                let notional_closed = mul_div_floor_u128(*q_close_q, oracle_price as u128, POS_SCALE);
+                let liq_fee_raw = mul_div_ceil_u128(notional_closed, self.params.liquidation_fee_bps as u128, 10_000);
+                let liq_fee = core::cmp::min(
+                    core::cmp::max(liq_fee_raw, self.params.min_liquidation_abs.get()),
+                    self.params.liquidation_fee_cap.get(),
+                );
+
+                // 2. Predict post-partial Eq_maint_raw (settle_losses preserves C + PNL sum)
+                let eq_raw_wide = self.account_equity_maint_raw_wide(account);
+                let predicted_eq = match eq_raw_wide.checked_sub(I256::from_u128(liq_fee)) {
+                    Some(v) => v,
+                    None => return LiquidationPolicy::FullClose,
+                };
+
+                // 3. Predict post-partial MM_req
+                let rem_eff = abs_eff - *q_close_q;
+                let rem_notional = mul_div_floor_u128(rem_eff, oracle_price as u128, POS_SCALE);
+                let proportional_mm = mul_div_floor_u128(rem_notional, self.params.maintenance_margin_bps as u128, 10_000);
+                let predicted_mm_req = if rem_eff == 0 {
+                    0u128
+                } else {
+                    core::cmp::max(proportional_mm, self.params.min_nonzero_mm_req)
+                };
+
+                // 4. Health check: predicted_eq > predicted_mm_req
+                if predicted_eq <= I256::from_u128(predicted_mm_req) {
+                    return LiquidationPolicy::FullClose;
+                }
+
+                LiquidationPolicy::ExactPartial(*q_close_q)
             }
         }
     }
@@ -3141,17 +3201,18 @@ impl RiskEngine {
             return Err(RiskError::Undercollateralized);
         }
 
-        // Forgive fee debt
-        if self.accounts[idx as usize].fee_credits.get() < 0 {
-            self.accounts[idx as usize].fee_credits = I128::ZERO;
-        }
-
-        // PnL must be zero
+        // PnL must be zero (check BEFORE fee forgiveness to avoid
+        // mutating fee_credits on a path that returns Err)
         if self.accounts[idx as usize].pnl > 0 {
             return Err(RiskError::PnlNotWarmedUp);
         }
         if self.accounts[idx as usize].pnl < 0 {
             return Err(RiskError::Undercollateralized);
+        }
+
+        // Forgive fee debt (safe: position is zero, PnL is zero)
+        if self.accounts[idx as usize].fee_credits.get() < 0 {
+            self.accounts[idx as usize].fee_credits = I128::ZERO;
         }
 
         let capital = self.accounts[idx as usize].capital;

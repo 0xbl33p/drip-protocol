@@ -267,39 +267,37 @@ fn proof_fee_debt_sweep_checked_arithmetic() {
 }
 
 // ############################################################################
-// FIX 5: keeper_crank always uses FullClose (no partial hint griefing)
+// FIX 5: keeper_crank pre-flight validates partial hints (no griefing)
 // ############################################################################
 
-/// keeper_crank with a syntactically valid ExactPartial hint must not revert.
-/// The hint is ignored — keeper_crank always uses FullClose internally.
+/// keeper_crank with a bad partial hint (too small to restore health) must NOT
+/// revert — the pre-flight rejects it and falls back to FullClose.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_keeper_crank_ignores_partial_hint() {
+fn proof_keeper_crank_bad_partial_falls_back_to_full() {
     let mut engine = RiskEngine::new(default_params());
 
-    // Create two accounts for a trade
     let a = engine.add_user(1000).unwrap();
     let b = engine.add_user(1000).unwrap();
 
     engine.deposit(a, 50_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit(b, 50_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
-    // Open a position: a long, b short
     let size = 100 * POS_SCALE as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE).unwrap();
 
     // Crash oracle to make 'a' liquidatable
     let crash_oracle = 500u64;
 
-    // Submit a syntactically valid but economically invalid partial hint
-    // (tiny close that won't restore health)
+    // Tiny partial — won't restore health, pre-flight should reject → FullClose
     let bad_hint = Some(LiquidationPolicy::ExactPartial(POS_SCALE as u128));
-
-    // keeper_crank must NOT revert — it ignores the partial hint and uses FullClose
     let candidates = [(a, bad_hint)];
     let result = engine.keeper_crank(DEFAULT_SLOT + 1, crash_oracle, &candidates, 10);
     assert!(result.is_ok(), "keeper_crank must not revert on bad partial hint");
+
+    // Account should have been fully closed (FullClose fallback)
+    assert!(engine.effective_pos_q(a as usize) == 0, "bad partial must fall back to FullClose");
 }
 
 // ############################################################################
@@ -361,4 +359,101 @@ fn proof_config_rejects_invalid_bps() {
     let mut params = zero_fee_params();
     params.initial_margin_bps = 10_001;
     let _engine = RiskEngine::new(params);
+}
+
+/// new() with min_nonzero_im_req > min_initial_deposit must panic (spec §1.4).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+#[kani::should_panic]
+fn proof_config_rejects_im_gt_deposit() {
+    let mut params = zero_fee_params();
+    params.min_nonzero_im_req = 100;
+    params.min_initial_deposit = U128::new(50); // im > deposit violates §1.4
+    let _engine = RiskEngine::new(params);
+}
+
+// ############################################################################
+// FIX 8: close_account checks PnL before forgiving fee debt
+// ############################################################################
+
+/// close_account must not forgive fee debt if PnL > 0 (warmup not complete).
+/// The PnL check must come BEFORE fee forgiveness.
+///
+/// Setup: flat account with positive reserved PnL (warmup incomplete),
+/// zero capital (so fee_debt_sweep is a no-op), and fee debt.
+/// After the failed close, fee_credits must remain negative (not forgiven).
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_close_account_pnl_check_before_fee_forgive() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let idx = engine.add_user(0).unwrap();
+
+    // Set up consistent state: flat, PnL > 0 (fully reserved), capital = 0, fee debt
+    // Use set_pnl to keep pnl_pos_tot in sync
+    engine.set_pnl(idx as usize, 5000i128);
+    // All PnL is reserved (warmup not complete)
+    engine.accounts[idx as usize].reserved_pnl = 5000;
+    // Zero capital — fee_debt_sweep will be a no-op
+    // (capital is already 0 from add_user with fee=0)
+
+    // Fee debt
+    engine.accounts[idx as usize].fee_credits = I128::new(-1000);
+    let fc_before = engine.accounts[idx as usize].fee_credits.get();
+
+    // close_account: touch will be no-op for fees (capital=0),
+    // do_profit_conversion: released = max(5000,0) - 5000 = 0, so skip.
+    // PnL check: pnl > 0 → Err(PnlNotWarmedUp)
+    let result = engine.close_account(idx, DEFAULT_SLOT, DEFAULT_ORACLE);
+    assert!(result.is_err(), "close_account must reject when pnl > 0");
+
+    // fee_credits must NOT have been zeroed by forgiveness (PnL check is first)
+    assert!(
+        engine.accounts[idx as usize].fee_credits.get() == fc_before,
+        "fee_credits must not be forgiven on Err path"
+    );
+}
+
+// ############################################################################
+// FIX 9: settle_side_effects epoch_snap = 0 on zero-out (spec §2.4)
+// ############################################################################
+
+/// When settle_side_effects zeroes a position (same-epoch truncation),
+/// epoch_snap must be set to 0, not epoch_side.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_settle_epoch_snap_zero_on_truncation() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+
+    engine.deposit(a, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Set non-trivial ADL epoch
+    engine.adl_epoch_long = 5;
+    engine.adl_epoch_short = 5;
+
+    // Open a tiny position (1 unit of basis)
+    let tiny = 1i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, tiny, DEFAULT_ORACLE).unwrap();
+
+    // Trigger an ADL that sets a_long to a value that would truncate the position to 0.
+    // The simplest way: directly manipulate adl_mult_long to 0 (below MIN_A_SIDE).
+    // But that's invalid. Instead, set a very small a_mult to make floor(basis * a / a_basis) = 0.
+    // With basis=1, a_basis=ADL_ONE=1_000_000, if a_mult < 1_000_000 the floor gives 0.
+    engine.adl_mult_long = 1; // Very small — floor(1 * 1 / 1_000_000) = 0
+
+    // Now touch the account — settle_side_effects should zero the position
+    let _ = engine.touch_account_full(a as usize, DEFAULT_ORACLE, DEFAULT_SLOT);
+
+    // If position was zeroed, epoch_snap must be 0 per §2.4
+    if engine.accounts[a as usize].position_basis_q == 0 {
+        assert!(
+            engine.accounts[a as usize].adl_epoch_snap == 0,
+            "epoch_snap must be 0 on settle zero-out per §2.4"
+        );
+    }
 }
