@@ -1160,7 +1160,9 @@ fn proof_settle_fee_rejects_i128_min() {
     engine.last_market_slot = DEFAULT_SLOT;
 
     // Set fee_credits to -(i128::MAX), the lowest valid value.
-    // Advancing 1 slot with fee_per_slot=1 would produce i128::MIN.
+    // Zero capital so fee shortfall goes entirely to fee_credits.
+    // Advancing 1 slot with fee_per_slot=1 would push fee_credits to i128::MIN.
+    engine.set_capital(a as usize, 0);
     engine.accounts[a as usize].fee_credits = I128::new(-(i128::MAX));
     engine.accounts[a as usize].last_fee_slot = DEFAULT_SLOT;
 

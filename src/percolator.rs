@@ -502,6 +502,12 @@ impl RiskEngine {
             "liquidation_fee_cap must be <= MAX_PROTOCOL_FEE_ABS (spec §1.4)"
         );
 
+        // Maintenance fee bound (spec §8.2)
+        assert!(
+            params.maintenance_fee_per_slot.get() <= MAX_PROTOCOL_FEE_ABS,
+            "maintenance_fee_per_slot must be <= MAX_PROTOCOL_FEE_ABS"
+        );
+
         // Insurance floor (spec §1.4: 0 <= I_floor <= MAX_VAULT_TVL)
         assert!(
             params.insurance_floor.get() <= MAX_VAULT_TVL,
@@ -2098,9 +2104,30 @@ impl RiskEngine {
 
     /// Internal maintenance fee settle — checked arithmetic, no margin check.
     fn settle_maintenance_fee_internal(&mut self, idx: usize, now_slot: u64) -> Result<()> {
-        // Recurring account-local maintenance fees are disabled in this revision (spec §8.2).
-        // Just stamp last_fee_slot for slot-tracking consistency.
+        let fee_per_slot = self.params.maintenance_fee_per_slot.get();
+        if fee_per_slot == 0 {
+            self.accounts[idx].last_fee_slot = now_slot;
+            return Ok(());
+        }
+
+        let last = self.accounts[idx].last_fee_slot;
+        let dt = now_slot.saturating_sub(last);
+        if dt == 0 {
+            return Ok(());
+        }
+
+        // fee = dt * fee_per_slot, clamped to MAX_PROTOCOL_FEE_ABS
+        let fee = (dt as u128)
+            .checked_mul(fee_per_slot)
+            .map(|f| core::cmp::min(f, MAX_PROTOCOL_FEE_ABS))
+            .unwrap_or(MAX_PROTOCOL_FEE_ABS);
+
         self.accounts[idx].last_fee_slot = now_slot;
+
+        if fee > 0 {
+            self.charge_fee_to_insurance(idx, fee)?;
+        }
+
         Ok(())
     }
 

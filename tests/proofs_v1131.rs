@@ -113,16 +113,16 @@ fn proof_accrue_mark_still_works() {
 // PROPERTY: maintenance fees disabled (spec §8.2)
 // ############################################################################
 
-/// touch_account_full must NOT charge maintenance fees for any fee param or time delta.
-/// Symbolic fee_per_slot and dt prove fee_credits invariance structurally.
+/// touch_account_full charges maintenance fees proportional to dt * fee_per_slot.
+/// Symbolic fee_per_slot and dt prove conservation holds with fee charges.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_touch_no_maintenance_fee() {
+fn proof_touch_maintenance_fee_conservation() {
     let mut params = zero_fee_params();
-    // Symbolic fee parameter — even extreme values must not produce charges
+    // Symbolic fee parameter
     let fee_per_slot: u32 = kani::any();
-    kani::assume(fee_per_slot >= 1);
+    kani::assume(fee_per_slot >= 1 && fee_per_slot <= 1000);
     params.maintenance_fee_per_slot = U128::new(fee_per_slot as u128);
     let mut engine = RiskEngine::new(params);
 
@@ -131,18 +131,22 @@ fn proof_touch_no_maintenance_fee() {
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
 
-    let fc_before = engine.accounts[idx as usize].fee_credits.get();
+    let cap_before = engine.accounts[idx as usize].capital.get();
 
-    // Symbolic time delta (1..10000 slots)
+    // Symbolic time delta (1..1000 slots)
     let dt: u16 = kani::any();
-    kani::assume(dt >= 1 && dt <= 10000);
+    kani::assume(dt >= 1 && dt <= 1000);
 
     let result = engine.touch_account_full(idx as usize, DEFAULT_ORACLE, dt as u64);
     assert!(result.is_ok());
 
-    // fee_credits must NOT change (fees disabled per §8.2)
-    assert!(engine.accounts[idx as usize].fee_credits.get() == fc_before,
-        "fee_credits must not change — maintenance fees disabled");
+    // Capital must decrease by the fee (dt * fee_per_slot, fully covered by 1M capital)
+    let expected_fee = (dt as u128) * (fee_per_slot as u128);
+    let cap_after = engine.accounts[idx as usize].capital.get();
+    assert_eq!(cap_before - cap_after, expected_fee,
+        "capital must decrease by exactly dt * fee_per_slot");
+
+    assert!(engine.check_conservation(), "conservation must hold after maintenance fee");
 }
 
 // ############################################################################
