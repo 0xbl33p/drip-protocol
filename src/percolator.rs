@@ -1364,36 +1364,11 @@ impl RiskEngine {
             }
         }
 
-        // Step 6: Funding transfer via K coefficients (spec §4.12)
-        // rate = funding_rate_bps_per_slot_last (anti-retroactivity: use STORED rate)
-        // Funding shifts K by rate * dt * price / 10_000 per unit OI
-        let rate = self.funding_rate_bps_per_slot_last;
-        if rate != 0 && total_dt > 0 {
-            // funding_delta = rate * dt * oracle_price / 10_000
-            // Positive rate: longs pay shorts (K_long decreases, K_short increases)
-            let rate_128 = rate as i128;
-            let dt_128 = total_dt as i128;
-            let price_128 = oracle_price as i128;
-            // Clamp dt to prevent overflow on long crank gaps
-            let capped_dt = dt_128.min(9_000); // ~1 hour
-            let funding_delta = rate_128
-                .saturating_mul(capped_dt)
-                .saturating_mul(price_128)
-                / 10_000i128;
-
-            if funding_delta != 0 {
-                if long_live {
-                    let fk_long = checked_u128_mul_i128(self.adl_mult_long, -funding_delta)?;
-                    self.adl_coeff_long = self.adl_coeff_long.checked_add(fk_long)
-                        .ok_or(RiskError::Overflow)?;
-                }
-                if short_live {
-                    let fk_short = checked_u128_mul_i128(self.adl_mult_short, -funding_delta)?;
-                    self.adl_coeff_short = self.adl_coeff_short.checked_sub(fk_short)
-                        .ok_or(RiskError::Overflow)?;
-                }
-            }
-        }
+        // Step 6: no funding transfer in this revision (zero-rate core profile §4.12).
+        // The funding rate is computed and stored by the wrapper for observability,
+        // but accrue_market_to does not apply K-coefficient funding transfers.
+        // Any future revision that re-enables nonzero funding MUST split dt into
+        // internal sub-steps per spec §1.6.2.
 
         // Synchronize slots and prices (spec §5.4 steps 7-9)
         self.current_slot = now_slot;
@@ -1406,13 +1381,13 @@ impl RiskEngine {
     }
 
     /// recompute_r_last_from_final_state (spec §4.12).
-    /// Clamps the stored funding rate to MAX_ABS_FUNDING_BPS_PER_SLOT.
-    /// The wrapper sets funding_rate_bps_per_slot_last before keeper_crank;
-    /// this function clamps it to the engine's safety bound.
+    /// Zero-rate core profile: always store r_last = 0.
+    /// The wrapper computes and stores a rate for observability, but
+    /// this function ensures the engine's internal rate stays zero
+    /// per spec v11.31 §4.12.
     test_visible! {
     fn recompute_r_last_from_final_state(&mut self) {
-        self.funding_rate_bps_per_slot_last = self.funding_rate_bps_per_slot_last
-            .clamp(-MAX_ABS_FUNDING_BPS_PER_SLOT, MAX_ABS_FUNDING_BPS_PER_SLOT);
+        self.funding_rate_bps_per_slot_last = 0;
     }
     }
 
