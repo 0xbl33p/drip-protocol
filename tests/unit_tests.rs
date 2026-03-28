@@ -463,8 +463,8 @@ fn test_warmup_full_conversion_after_period() {
     engine.touch_account_full(a as usize, new_oracle, slot2).expect("touch");
 
     // Close position so profit conversion can happen (only for flat accounts)
-    let close_q = make_size_q(-50);
-    engine.execute_trade(a, b, new_oracle, slot2, close_q, new_oracle, 0i64).expect("close");
+    let close_q = make_size_q(50);
+    engine.execute_trade(b, a, new_oracle, slot2, close_q, new_oracle, 0i64).expect("close");
 
     let capital_before = engine.accounts[a as usize].capital.get();
 
@@ -705,8 +705,8 @@ fn test_drain_only_allows_reducing_trade() {
     engine.side_mode_long = SideMode::DrainOnly;
 
     // Reducing trade (a goes short = reducing long) should work
-    let reduce_q = make_size_q(-50);
-    engine.execute_trade(a, b, oracle, slot, reduce_q, oracle, 0i64)
+    let reduce_q = make_size_q(50);
+    engine.execute_trade(b, a, oracle, slot, reduce_q, oracle, 0i64)
         .expect("reducing trade should succeed in DrainOnly");
 }
 
@@ -722,8 +722,8 @@ fn test_reset_pending_blocks_new_trades() {
     engine.stale_account_count_short = 1;
 
     // b would go long (opposite of short blocked), a goes short — short increase blocked
-    let size_q = make_size_q(-50); // a goes short
-    let result = engine.execute_trade(a, b, oracle, slot, size_q, oracle, 0i64);
+    let size_q = make_size_q(50); // b goes long, a goes short (swapped)
+    let result = engine.execute_trade(b, a, oracle, slot, size_q, oracle, 0i64);
     assert_eq!(result, Err(RiskError::SideBlocked));
 }
 
@@ -881,8 +881,8 @@ fn test_trade_then_close_round_trip() {
     engine.execute_trade(a, b, oracle, slot, size_q, oracle, 0i64).expect("open");
 
     // Close position (reverse trade)
-    let close_q = make_size_q(-50);
-    engine.execute_trade(a, b, oracle, slot, close_q, oracle, 0i64).expect("close");
+    let close_q = make_size_q(50);
+    engine.execute_trade(b, a, oracle, slot, close_q, oracle, 0i64).expect("close");
 
     let eff_a = engine.effective_pos_q(a as usize);
     let eff_b = engine.effective_pos_q(b as usize);
@@ -936,8 +936,8 @@ fn test_close_account_after_trade_and_unwind() {
     // Open and close position
     let size_q = make_size_q(50);
     engine.execute_trade(a, b, oracle, slot, size_q, oracle, 0i64).expect("open");
-    let close_q = make_size_q(-50);
-    engine.execute_trade(a, b, oracle, slot, close_q, oracle, 0i64).expect("close");
+    let close_q = make_size_q(50);
+    engine.execute_trade(b, a, oracle, slot, close_q, oracle, 0i64).expect("close");
 
     // Wait beyond warmup to let PnL settle
     let slot2 = slot + 200;
@@ -1155,8 +1155,8 @@ fn test_conservation_maintained_through_lifecycle() {
     assert!(engine.check_conservation());
 
     // Close positions
-    let close_q = make_size_q(-50);
-    engine.execute_trade(a, b, 1050, slot2, close_q, 1050, 0i64).expect("close");
+    let close_q = make_size_q(50);
+    engine.execute_trade(b, a, 1050, slot2, close_q, 1050, 0i64).expect("close");
     assert!(engine.check_conservation());
 }
 
@@ -2240,7 +2240,7 @@ fn test_property_50_flat_only_auto_conversion() {
     assert!(pnl_after > 0, "open-position touch must not zero out released profit via auto-convert");
 
     // Now test flat account: close the position first
-    engine.execute_trade(a, b, oracle, slot + 1, -size_q, oracle, 0i64).unwrap();
+    engine.execute_trade(b, a, oracle, slot + 1, size_q, oracle, 0i64).unwrap();
     // Give released profit and fund vault
     let idx_a = a as usize;
     engine.set_pnl(idx_a, 5_000);

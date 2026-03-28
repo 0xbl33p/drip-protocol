@@ -1149,8 +1149,8 @@ fn proof_fee_shortfall_routes_to_fee_credits() {
 
     // Close position: a sells back (trade fee will be charged).
     // Capital is 0, so the entire fee must be shortfall → fee_credits.
-    let neg_size = -(POS_SCALE as i128);
-    let result2 = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, neg_size, DEFAULT_ORACLE, 0i64);
+    let pos_size = POS_SCALE as i128;
+    let result2 = engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i64);
 
     match result2 {
         Ok(()) => {
@@ -1187,8 +1187,8 @@ fn proof_organic_close_bankruptcy_guard() {
     let crash_slot = DEFAULT_SLOT + 1;
     engine.last_crank_slot = crash_slot;
 
-    let neg_size = -(90 * POS_SCALE as i128);
-    let result2 = engine.execute_trade(a, b, crash_price, crash_slot, neg_size, crash_price, 0i64);
+    let pos_size = (90 * POS_SCALE) as i128;
+    let result2 = engine.execute_trade(b, a, crash_price, crash_slot, pos_size, crash_price, 0i64);
 
     assert!(result2.is_err(),
         "organic close that leaves uncovered negative PnL must be rejected");
@@ -1219,8 +1219,8 @@ fn proof_solvent_flat_close_succeeds() {
     engine.last_crank_slot = slot2;
 
     // Close to flat: a sells their long position
-    let neg_size = -(POS_SCALE as i128);
-    let result2 = engine.execute_trade(a, b, new_price, slot2, neg_size, new_price, 0i64);
+    let pos_size = POS_SCALE as i128;
+    let result2 = engine.execute_trade(b, a, new_price, slot2, pos_size, new_price, 0i64);
 
     assert!(result2.is_ok(),
         "solvent trader closing to flat must not be rejected");

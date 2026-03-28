@@ -298,7 +298,7 @@ fn t3_14_epoch_mismatch_forces_terminal_close() {
     // PnL assertion: the settlement must credit the correct amount
     let abs_basis = pos as u128;
     let den = ADL_ONE * POS_SCALE;
-    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
     assert!(engine.accounts[idx as usize].pnl == pnl_before + expected_pnl_delta,
         "epoch mismatch PnL must match wide_signed_mul_div_floor_from_k_pair");
 }
@@ -345,7 +345,7 @@ fn t3_14b_epoch_mismatch_with_nonzero_k_diff() {
     // PnL assertion: the settlement must credit the correct amount
     let abs_basis = pos as u128;
     let den = ADL_ONE * POS_SCALE;
-    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
     assert!(engine.accounts[idx as usize].pnl == pnl_before + expected_pnl_delta,
         "epoch mismatch PnL must match wide_signed_mul_div_floor_from_k_pair");
 }
@@ -549,7 +549,7 @@ fn t6_26_full_drain_reset_regression() {
     // PnL assertion: settlement must credit the correct amount
     let abs_basis = (POS_SCALE * (pos_mul as u128)) as u128;
     let den = ADL_ONE * POS_SCALE;
-    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+    let expected_pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
     assert!(engine.accounts[idx as usize].pnl == pnl_before + expected_pnl_delta,
         "full drain reset PnL must match wide_signed_mul_div_floor_from_k_pair");
 
@@ -598,20 +598,17 @@ fn proof_property_43_k_pair_chronology_correctness() {
     let pnl_after = engine.accounts[idx as usize].pnl;
     let pnl_delta = pnl_after - pnl_before;
 
-    // With k_side=500, k_snap=100, the correct chronological call is
-    // wide_signed_mul_div_floor_from_k_pair(abs_basis, k_side=500, k_snap=100, den)
-    // = floor(10*POS_SCALE * (500 - 100) / (ADL_ONE * POS_SCALE))
-    // = floor(10_000_000 * 400 / 1_000_000_000_000) = floor(4_000_000_000 / 1_000_000_000_000) = 0
-    // Actually with these small numbers... let me use larger K values.
-    // The key assertion: the PnL delta must match the reference computation
+    // With k_snap=100, k_side=500, the correct chronological call is
+    // wide_signed_mul_div_floor_from_k_pair(abs_basis, k_then=100, k_now=500, den)
+    // = floor(abs_basis * (500 - 100) / den) per spec §4.8
     let abs_basis = pos as u128;
     let den = ADL_ONE * POS_SCALE;
-    let expected = wide_signed_mul_div_floor_from_k_pair(abs_basis, 500i128, 100i128, den);
+    let expected = wide_signed_mul_div_floor_from_k_pair(abs_basis, 100i128, 500i128, den);
     assert!(pnl_delta == expected,
         "settle PnL must match chronological k_pair computation");
 
     // The WRONG order would give the negation:
-    let wrong = wide_signed_mul_div_floor_from_k_pair(abs_basis, 100i128, 500i128, den);
+    let wrong = wide_signed_mul_div_floor_from_k_pair(abs_basis, 500i128, 100i128, den);
     // If expected != 0, wrong must have opposite sign
     if expected != 0 {
         assert!(wrong == -expected || (expected > 0 && wrong < 0) || (expected < 0 && wrong > 0),

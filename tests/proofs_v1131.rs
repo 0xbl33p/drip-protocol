@@ -612,9 +612,15 @@ fn proof_bilateral_oi_decomposition() {
     let raw_size: i16 = kani::any();
     kani::assume(raw_size != 0);
     // Scale to position units — covers -32768..32767 * POS_SCALE
-    let size_q = (raw_size as i128) * (POS_SCALE as i128);
+    let abs_size_q = ((raw_size as i128).unsigned_abs()) * (POS_SCALE as u128);
+    let pos_size_q = abs_size_q as i128;
 
-    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i64);
+    // size_q > 0 required: when raw_size < 0, swap a and b
+    let result = if raw_size > 0 {
+        engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size_q, DEFAULT_ORACLE, 0i64)
+    } else {
+        engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size_q, DEFAULT_ORACLE, 0i64)
+    };
 
     if result.is_ok() {
         let eff_a = engine.effective_pos_q(a as usize);

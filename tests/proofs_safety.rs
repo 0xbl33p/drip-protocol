@@ -975,8 +975,8 @@ fn proof_risk_reducing_exemption_path() {
     // Account may or may not be below MM — the key test is the partial close
 
     // Risk-reducing trade: close half the position
-    let half_close = -(size / 2);
-    let reduce_result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE, 0i64);
+    let half_close = size / 2;
+    let reduce_result = engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE, 0i64);
 
     // Risk-increasing trade: double the position
     let increase = size;
@@ -1240,8 +1240,8 @@ fn proof_v1126_risk_reducing_fee_neutral() {
     engine.set_pnl(a as usize, -50_000i128);
 
     // Risk-reducing: close half at oracle price (no slippage)
-    let half_close = -(size / 2);
-    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE, 0i64);
+    let half_close = size / 2;
+    let result = engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE, 0i64);
 
     // v12.0.2: fee-neutral comparison means pure fee friction should not block
     // a genuine de-risking trade at oracle price.
@@ -2546,8 +2546,8 @@ fn proof_symbolic_margin_enforcement_on_reduce() {
     engine.set_pnl(a as usize, pnl_val as i128);
 
     // Risk-reducing trade: close half
-    let half_close = -(size / 2);
-    let result = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE, 0i64);
+    let half_close = size / 2;
+    let result = engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, half_close, DEFAULT_ORACLE, 0i64);
 
     // Conservation must always hold regardless of accept/reject
     assert!(engine.check_conservation(),

@@ -489,8 +489,8 @@ fn proof_side_mode_gating() {
     engine.side_mode_short = SideMode::ResetPending;
     engine.stale_account_count_short = 1;
 
-    let neg_size = -(POS_SCALE as i128);
-    let result2 = engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, neg_size, DEFAULT_ORACLE, 0i64);
+    let pos_size = POS_SCALE as i128;
+    let result2 = engine.execute_trade(b, a, DEFAULT_ORACLE, DEFAULT_SLOT, pos_size, DEFAULT_ORACLE, 0i64);
     assert!(result2 == Err(RiskError::SideBlocked));
 }
 

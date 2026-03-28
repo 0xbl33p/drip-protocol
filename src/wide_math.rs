@@ -1490,9 +1490,9 @@ pub fn wide_mul_div_floor_u128(a: u128, b: u128, d: u128) -> u128 {
 
 /// Safe K-difference settlement (spec §4.8 lines 720-732).
 /// Computes K-difference in wide intermediate, then multiplies and divides.
-pub fn wide_signed_mul_div_floor_from_k_pair(abs_basis: u128, k_now: i128, k_then: i128, den: u128) -> i128 {
+pub fn wide_signed_mul_div_floor_from_k_pair(abs_basis: u128, k_then: i128, k_now: i128, den: u128) -> i128 {
     assert!(den > 0, "wide_signed_mul_div_floor_from_k_pair: den == 0");
-    // Compute d = k_now - k_then in wide signed to avoid i128 overflow
+    // Compute d = k_now - k_then in wide signed to avoid i128 overflow (spec §4.8)
     let k_now_wide = I256::from_i128(k_now);
     let k_then_wide = I256::from_i128(k_then);
     let d = k_now_wide.checked_sub(k_then_wide).expect("K-diff overflow in wide");

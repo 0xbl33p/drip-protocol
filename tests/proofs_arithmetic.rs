@@ -468,7 +468,7 @@ fn proof_k_pair_variant_sign_and_rounding() {
     let k_then = k_then_val as i128;
     let den = denom as u128;
 
-    let result = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_now, k_then, den);
+    let result = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_then, k_now, den);
 
     // Reference: compute in i32 to avoid overflow at u8 scale
     let k_diff = (k_now_val as i32) - (k_then_val as i32);

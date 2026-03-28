@@ -125,10 +125,11 @@ fn test_e2e_complete_user_journey() {
     // Alice closes her position (sell)
     let alice_pos = engine.effective_pos_q(alice as usize);
     if alice_pos != 0 {
-        let neg_pos = alice_pos.checked_neg().unwrap();
+        let abs_pos = alice_pos.unsigned_abs() as i128;
         let slot = engine.current_slot;
+        // alice_pos > 0 (long), so closing means b buys from a (swap a,b with positive size)
         engine
-            .execute_trade(alice, bob, new_price, slot, neg_pos, new_price, 0i64)
+            .execute_trade(bob, alice, new_price, slot, abs_pos, new_price, 0i64)
             .unwrap();
     }
 
@@ -225,7 +226,7 @@ fn test_e2e_funding_complete_cycle() {
 
     // Alice closes long and opens short (total -200 base)
     engine
-        .execute_trade(alice, bob, oracle_price, slot, pos_q(-200), oracle_price, 0i64)
+        .execute_trade(bob, alice, oracle_price, slot, pos_q(200), oracle_price, 0i64)
         .unwrap();
 
     // Now Alice is short and Bob is long

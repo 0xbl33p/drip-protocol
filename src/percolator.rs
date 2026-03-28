@@ -1248,9 +1248,9 @@ impl RiskEngine {
             // Record old_R before set_pnl (spec §5.3)
             let old_r = self.accounts[idx].reserved_pnl;
 
-            // pnl_delta
+            // pnl_delta (spec §5.3 step 4: k_then=k_snap, k_now=K_s)
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_side, k_snap, den);
+            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_side, den);
 
             let old_pnl = self.accounts[idx].pnl;
             let new_pnl = old_pnl.checked_add(pnl_delta).ok_or(RiskError::Overflow)?;
@@ -1293,8 +1293,9 @@ impl RiskEngine {
             // Record old_R
             let old_r = self.accounts[idx].reserved_pnl;
 
+            // pnl_delta (spec §5.3 step 5: k_then=k_snap, k_now=K_epoch_start)
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_epoch_start, k_snap, den);
+            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
 
             let old_pnl = self.accounts[idx].pnl;
             let new_pnl = old_pnl.checked_add(pnl_delta).ok_or(RiskError::Overflow)?;
@@ -2520,18 +2521,16 @@ impl RiskEngine {
         if exec_price == 0 || exec_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
-        if size_q == 0 || size_q == i128::MIN {
+        // Spec §10.5 step 7: require 0 < size_q <= MAX_TRADE_SIZE_Q
+        if size_q <= 0 {
             return Err(RiskError::Overflow);
         }
-
-        // Validate size bounds (spec §10.4 steps 4-6)
-        let abs_size = size_q.unsigned_abs();
-        if abs_size > MAX_TRADE_SIZE_Q {
+        if size_q as u128 > MAX_TRADE_SIZE_Q {
             return Err(RiskError::Overflow);
         }
 
         // trade_notional check (spec §10.4 step 6)
-        let trade_notional_check = mul_div_floor_u128(abs_size, exec_price as u128, POS_SCALE);
+        let trade_notional_check = mul_div_floor_u128(size_q as u128, exec_price as u128, POS_SCALE);
         if trade_notional_check > MAX_ACCOUNT_NOTIONAL {
             return Err(RiskError::Overflow);
         }
@@ -2646,7 +2645,7 @@ impl RiskEngine {
         self.settle_losses(b as usize);
 
         // Step 11: charge trading fees (spec §10.4 step 19, §8.1)
-        let trade_notional = mul_div_floor_u128(abs_size, exec_price as u128, POS_SCALE);
+        let trade_notional = mul_div_floor_u128(size_q.unsigned_abs(), exec_price as u128, POS_SCALE);
         let fee = if trade_notional > 0 && self.params.trading_fee_bps > 0 {
             mul_div_ceil_u128(trade_notional, self.params.trading_fee_bps as u128, 10_000)
         } else {
