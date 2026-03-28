@@ -517,17 +517,11 @@ impl RiskEngine {
         );
     }
 
-    /// Create a new risk engine for testing only. Initializes with
-    /// last_oracle_price = 0 — the accrue_market_to fallback self-heals
-    /// on first call. Non-compliant with spec §2.7 but convenient for tests
-    /// that don't care about first-interval funding.
+    /// Create a new risk engine for testing. Initializes with
+    /// init_oracle_price = 1 (spec §2.7 compliant).
     #[cfg(any(feature = "test", kani))]
     pub fn new(params: RiskParams) -> Self {
-        // Use price=1 to pass validation, then override to 0 for legacy test compat
-        let mut engine = Self::new_with_market(params, 0, 1);
-        engine.last_oracle_price = 0;
-        engine.funding_price_sample_last = 0;
-        engine
+        Self::new_with_market(params, 0, 1)
     }
 
     /// Create a new risk engine with explicit market initialization (spec §2.7).
@@ -1377,7 +1371,7 @@ impl RiskEngine {
         }
 
         // Mark-once rule (spec §1.5 item 21): apply mark exactly once from P_last to oracle_price
-        let current_price = if self.last_oracle_price == 0 { oracle_price } else { self.last_oracle_price };
+        let current_price = self.last_oracle_price;
         let delta_p = (oracle_price as i128).checked_sub(current_price as i128)
             .ok_or(RiskError::Overflow)?;
         if delta_p != 0 {
@@ -1464,10 +1458,9 @@ impl RiskEngine {
     /// recompute_r_last_from_final_state in the canonical order.
     /// Callers that bypass `keeper_crank` (e.g. the resolved-market
     /// settlement crank) must invoke this before returning.
-    pub fn run_end_of_instruction_lifecycle(&mut self, funding_rate: i64) -> Result<()> {
-        let mut ctx = InstructionContext::new();
-        self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+    pub fn run_end_of_instruction_lifecycle(&mut self, ctx: &mut InstructionContext, funding_rate: i64) -> Result<()> {
+        self.schedule_end_of_instruction_resets(ctx)?;
+        self.finalize_end_of_instruction_resets(ctx);
         self.recompute_r_last_from_final_state(funding_rate);
         Ok(())
     }
@@ -3439,74 +3432,40 @@ impl RiskEngine {
     // close_account_resolved (resolved/frozen market path)
     // ========================================================================
 
-    /// Close an account in a resolved/frozen market where touch_account_full
-    /// would overflow (ADL state frozen, K may be at boundary values).
-    /// Skips accrue_market_to and settle_side_effects entirely.
-    /// Precondition: caller has verified market is in resolved state.
+    /// Close a flat, fully-settled account in a resolved/frozen market.
     ///
-    /// Unlike close_account, this handles accounts with open positions and
-    /// nonzero PnL by settling/absorbing them before returning capital.
+    /// Preconditions enforced:
+    /// - position_basis_q == 0 (account is flat — no unrealized K-pair effects)
+    /// - pnl == 0 (all PnL already settled/converted by the wrapper)
+    ///
+    /// The wrapper is responsible for settling positions and PnL before
+    /// calling this. This function only handles fee debt sweep, fee
+    /// forgiveness, capital return, and slot reclamation.
     pub fn close_account_resolved(&mut self, idx: u16) -> Result<u128> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
         }
 
-        // Step 1: Zero position with proper stored_pos_count tracking
+        // Require flat position — avoids discarding unrealized K-pair PnL
+        // and keeps OI/stored_pos_count consistent
         if self.accounts[idx as usize].position_basis_q != 0 {
-            // Decrement stale count if epoch_snap != epoch_side (defense-in-depth)
-            if let Some(side) = side_of_i128(self.accounts[idx as usize].position_basis_q) {
-                let epoch_snap = self.accounts[idx as usize].adl_epoch_snap;
-                if epoch_snap != self.get_epoch_side(side) {
-                    let old = self.get_stale_count(side);
-                    if old > 0 {
-                        self.set_stale_count(side, old - 1);
-                    }
-                }
-            }
-            self.set_position_basis_q(idx as usize, 0);
-            self.accounts[idx as usize].adl_a_basis = ADL_ONE;
-            self.accounts[idx as usize].adl_k_snap = 0;
-            self.accounts[idx as usize].adl_epoch_snap = 0;
+            return Err(RiskError::Unauthorized);
         }
 
-        // Step 2: Settle losses from principal (C covers negative PnL)
-        self.settle_losses(idx as usize);
-
-        // Step 3: Absorb any remaining negative PnL as protocol loss
-        if self.accounts[idx as usize].pnl < 0 {
-            assert!(self.accounts[idx as usize].pnl != i128::MIN,
-                "close_account_resolved: i128::MIN pnl");
-            let loss = self.accounts[idx as usize].pnl.unsigned_abs();
-            self.absorb_protocol_loss(loss);
-            self.set_pnl(idx as usize, 0);
+        // Require zero PnL — avoids skipping settle_losses / profit conversion
+        if self.accounts[idx as usize].pnl != 0 {
+            return Err(RiskError::Unauthorized);
         }
 
-        // Step 4: Convert any positive PnL to capital (unconditional — no warmup
-        // in resolved market). Uses haircut ratio so winners share any deficit.
-        if self.accounts[idx as usize].pnl > 0 {
-            let pos_pnl = self.accounts[idx as usize].pnl as u128;
-            // Release all reserves (bypass warmup — market is resolved)
-            self.set_reserved_pnl(idx as usize, 0);
-            // Compute haircutted payout before consuming
-            let (h_num, h_den) = self.haircut_ratio();
-            let y = if h_den == 0 { pos_pnl } else {
-                wide_mul_div_floor_u128(pos_pnl, h_num, h_den)
-            };
-            // Consume all released PnL (now fully released after set_reserved_pnl(0))
-            self.consume_released_pnl(idx as usize, pos_pnl);
-            let new_cap = add_u128(self.accounts[idx as usize].capital.get(), y);
-            self.set_capital(idx as usize, new_cap);
-        }
-
-        // Step 5: Sweep fee debt from capital first (spec §7.5 fee seniority)
+        // Sweep fee debt from capital (spec §7.5 fee seniority)
         self.fee_debt_sweep(idx as usize);
 
-        // Step 5b: Forgive any remaining fee debt after sweep
+        // Forgive any remaining fee debt after sweep
         if self.accounts[idx as usize].fee_credits.get() < 0 {
             self.accounts[idx as usize].fee_credits = I128::ZERO;
         }
 
-        // Step 6: Return capital
+        // Return capital
         let capital = self.accounts[idx as usize].capital;
         if capital > self.vault {
             return Err(RiskError::InsufficientBalance);

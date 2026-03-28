@@ -2460,50 +2460,32 @@ fn test_close_account_resolved_flat_no_pnl() {
 }
 
 #[test]
-fn test_close_account_resolved_with_position_and_loss() {
+fn test_close_account_resolved_rejects_open_position() {
     let mut engine = RiskEngine::new(default_params());
     let a = engine.add_user(1000).unwrap();
     let b = engine.add_user(1000).unwrap();
     engine.deposit(a, 500_000, 1000, 100).unwrap();
     engine.deposit(b, 500_000, 1000, 100).unwrap();
 
-    // Open position
     let size = (100 * POS_SCALE) as i128;
     engine.execute_trade(a, b, 1000, 100, size, 1000, 0i64).unwrap();
 
-    // Inject loss
-    engine.set_pnl(a as usize, -100_000i128);
-
-    let cap_before = engine.accounts[a as usize].capital.get();
-    let returned = engine.close_account_resolved(a).unwrap();
-
-    // Capital reduced by settled loss, rest returned
-    assert!(returned < cap_before);
-    assert!(!engine.is_used(a as usize));
-    assert!(engine.check_conservation());
+    // Account has open position — must be rejected
+    let result = engine.close_account_resolved(a);
+    assert_eq!(result, Err(RiskError::Unauthorized));
 }
 
 #[test]
-fn test_close_account_resolved_with_positive_pnl() {
+fn test_close_account_resolved_rejects_nonzero_pnl() {
     let mut engine = RiskEngine::new(default_params());
-    let a = engine.add_user(1000).unwrap();
-    let b = engine.add_user(1000).unwrap();
-    engine.deposit(a, 500_000, 1000, 100).unwrap();
-    engine.deposit(b, 500_000, 1000, 100).unwrap();
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 50_000, 1000, 100).unwrap();
 
-    let size = (100 * POS_SCALE) as i128;
-    engine.execute_trade(a, b, 1000, 100, size, 1000, 0i64).unwrap();
+    // Inject nonzero PnL on flat account
+    engine.set_pnl(idx as usize, 1000i128);
 
-    // Inject profit (with reserved PnL from set_pnl)
-    engine.set_pnl(a as usize, 50_000i128);
-
-    let cap_before = engine.accounts[a as usize].capital.get();
-    let returned = engine.close_account_resolved(a).unwrap();
-
-    // Capital should increase from converted profit (possibly haircutted)
-    assert!(returned >= cap_before, "capital must include converted profit");
-    assert!(!engine.is_used(a as usize));
-    assert!(engine.check_conservation());
+    let result = engine.close_account_resolved(idx);
+    assert_eq!(result, Err(RiskError::Unauthorized));
 }
 
 #[test]
