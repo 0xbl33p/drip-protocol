@@ -93,24 +93,57 @@ fn proof_funding_sign_and_floor() {
     }
 }
 
+/// Explicit floor-direction test: rate=-1, price=1000, dt=1 produces
+/// fund_num = -1000, fund_term = floor(-1000/10000) = floor(-0.1) = -1.
+/// Truncation toward zero would give 0 (wrong). Floor toward -∞ gives -1.
+/// This means longs gain and shorts lose even for tiny negative rates.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_funding_floor_not_truncation() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.oi_eff_long_q = POS_SCALE;
+    engine.oi_eff_short_q = POS_SCALE;
+    engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = DEFAULT_ORACLE; // 1000
+    engine.funding_rate_bps_per_slot_last = -1; // tiny negative rate
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    let result = engine.accrue_market_to(1, DEFAULT_ORACLE);
+    assert!(result.is_ok());
+
+    // fund_num = 1000 * (-1) * 1 = -1000
+    // floor(-1000 / 10000) = floor(-0.1) = -1 (NOT 0 from truncation)
+    // K_long -= A_long * (-1) = K_long + ADL_ONE → longs gain
+    // K_short += A_short * (-1) = K_short - ADL_ONE → shorts lose
+    assert_eq!(engine.adl_coeff_long, k_long_before + (ADL_ONE as i128),
+        "floor(-0.1) must be -1: longs must gain ADL_ONE");
+    assert_eq!(engine.adl_coeff_short, k_short_before - (ADL_ONE as i128),
+        "floor(-0.1) must be -1: shorts must lose ADL_ONE");
+}
+
 // ############################################################################
 // PROPERTY 73: Funding skip on zero OI
 // ############################################################################
 
-/// accrue_market_to applies no funding K delta when either side's OI is zero.
+/// accrue_market_to applies no funding K delta when short side OI is zero.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_funding_skip_zero_oi() {
+fn proof_funding_skip_zero_oi_short() {
     let mut engine = RiskEngine::new(zero_fee_params());
     engine.adl_mult_long = ADL_ONE;
     engine.adl_mult_short = ADL_ONE;
     engine.last_oracle_price = DEFAULT_ORACLE;
     engine.last_market_slot = 0;
     engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_bps_per_slot_last = 5000; // large nonzero rate
+    engine.funding_rate_bps_per_slot_last = 5000;
 
-    // Only longs have OI, shorts have zero
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = 0;
 
@@ -120,11 +153,66 @@ fn proof_funding_skip_zero_oi() {
     let result = engine.accrue_market_to(100, DEFAULT_ORACLE);
     assert!(result.is_ok());
 
-    // No funding when either side has zero OI
     assert_eq!(engine.adl_coeff_long, k_long_before,
         "K_long must not change when short OI is zero");
     assert_eq!(engine.adl_coeff_short, k_short_before,
         "K_short must not change when short OI is zero");
+}
+
+/// accrue_market_to applies no funding K delta when long side OI is zero.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_funding_skip_zero_oi_long() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = DEFAULT_ORACLE;
+    engine.funding_rate_bps_per_slot_last = -3000;
+
+    engine.oi_eff_long_q = 0;
+    engine.oi_eff_short_q = POS_SCALE;
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    let result = engine.accrue_market_to(100, DEFAULT_ORACLE);
+    assert!(result.is_ok());
+
+    assert_eq!(engine.adl_coeff_long, k_long_before,
+        "K_long must not change when long OI is zero");
+    assert_eq!(engine.adl_coeff_short, k_short_before,
+        "K_short must not change when long OI is zero");
+}
+
+/// accrue_market_to applies no funding K delta when both sides have zero OI.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_funding_skip_zero_oi_both() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    engine.adl_mult_long = ADL_ONE;
+    engine.adl_mult_short = ADL_ONE;
+    engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.last_market_slot = 0;
+    engine.funding_price_sample_last = DEFAULT_ORACLE;
+    engine.funding_rate_bps_per_slot_last = 10000;
+
+    engine.oi_eff_long_q = 0;
+    engine.oi_eff_short_q = 0;
+
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+
+    let result = engine.accrue_market_to(100, DEFAULT_ORACLE);
+    assert!(result.is_ok());
+
+    assert_eq!(engine.adl_coeff_long, k_long_before,
+        "K_long must not change when both OI zero");
+    assert_eq!(engine.adl_coeff_short, k_short_before,
+        "K_short must not change when both OI zero");
 }
 
 // ############################################################################
