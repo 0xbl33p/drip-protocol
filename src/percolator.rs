@@ -93,7 +93,7 @@ pub const MAX_PNL_POS_TOT: u128 = 100_000_000_000_000_000_000_000_000_000_000_00
 pub const MAX_TRADING_FEE_BPS: u64 = 10_000;
 pub const MAX_MARGIN_BPS: u64 = 10_000;
 pub const MAX_LIQUIDATION_FEE_BPS: u64 = 10_000;
-pub const MAX_PROTOCOL_FEE_ABS: u128 = MAX_ACCOUNT_NOTIONAL;
+pub const MAX_PROTOCOL_FEE_ABS: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36, spec §1.4
 pub const MAX_MAINTENANCE_FEE_PER_SLOT: u128 = 10_000_000_000_000_000; // spec §1.4
 
 // ============================================================================
@@ -2701,7 +2701,9 @@ impl RiskEngine {
 
         // Charge fee from both accounts (spec §10.5 step 28)
         if fee > 0 {
-            assert!(fee <= MAX_PROTOCOL_FEE_ABS, "execute_trade: fee exceeds MAX_PROTOCOL_FEE_ABS");
+            if fee > MAX_PROTOCOL_FEE_ABS {
+                return Err(RiskError::Overflow);
+            }
             self.charge_fee_to_insurance(a as usize, fee)?;
             self.charge_fee_to_insurance(b as usize, fee)?;
         }
@@ -2741,7 +2743,9 @@ impl RiskEngine {
     /// Charge fee per spec §8.1 — route shortfall through fee_credits instead of PNL.
     /// Adds MAX_PROTOCOL_FEE_ABS bound.
     fn charge_fee_to_insurance(&mut self, idx: usize, fee: u128) -> Result<()> {
-        assert!(fee <= MAX_PROTOCOL_FEE_ABS, "charge_fee_to_insurance: fee exceeds MAX_PROTOCOL_FEE_ABS");
+        if fee > MAX_PROTOCOL_FEE_ABS {
+            return Err(RiskError::Overflow);
+        }
         let cap = self.accounts[idx].capital.get();
         let fee_paid = core::cmp::min(fee, cap);
         if fee_paid > 0 {

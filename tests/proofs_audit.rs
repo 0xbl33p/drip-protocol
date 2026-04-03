@@ -1055,3 +1055,28 @@ fn proof_maintenance_fee_conservation() {
         "capital must decrease by dt * fee_per_slot");
     assert!(engine.check_conservation());
 }
+
+/// Liveness: maintenance fee realization must NOT revert for large dt
+/// with max fee_per_slot. With MAX_MAINTENANCE_FEE_PER_SLOT = 10^16 and
+/// dt up to ~10^20 slots, fee_due can reach ~10^36 which must stay under
+/// MAX_PROTOCOL_FEE_ABS = 10^36.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_maintenance_fee_large_dt_no_revert() {
+    let mut params = zero_fee_params();
+    params.maintenance_fee_per_slot = U128::new(MAX_MAINTENANCE_FEE_PER_SLOT);
+    let mut engine = RiskEngine::new(params);
+
+    let a = engine.add_user(0).unwrap();
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.last_oracle_price = DEFAULT_ORACLE;
+    engine.last_market_slot = DEFAULT_SLOT;
+
+    // 100_000 slots of inactivity — would have bricked under old 10^20 cap
+    let large_dt = 100_000u64;
+    let slot2 = DEFAULT_SLOT + large_dt;
+    let result = engine.touch_account_full(a as usize, DEFAULT_ORACLE, slot2);
+    assert!(result.is_ok(), "large dt must not revert with correct MAX_PROTOCOL_FEE_ABS");
+    assert!(engine.check_conservation());
+}
