@@ -941,6 +941,86 @@ fn proof_force_close_resolved_flat_returns_capital() {
     assert!(engine.check_conservation());
 }
 
+/// force_close_resolved with open position: conservation must hold.
+/// Symbolic loss on position-holder exercises K-pair settlement + loss path.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_force_close_resolved_position_conservation() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let size = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i64).unwrap();
+
+    // Advance K via price movement
+    engine.keeper_crank(DEFAULT_SLOT + 1, 1500, &[], 64, 0i64).unwrap();
+
+    let result = engine.force_close_resolved(a);
+    assert!(result.is_ok());
+    assert!(!engine.is_used(a as usize));
+    assert!(engine.accounts[a as usize].position_basis_q == 0);
+    assert!(engine.check_conservation(),
+        "V >= C_tot + I must hold after force_close with position");
+}
+
+/// force_close_resolved: stored_pos_count decrements correctly
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_force_close_resolved_pos_count_decrements() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+
+    let a = engine.add_user(0).unwrap();
+    let b = engine.add_user(0).unwrap();
+    engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    let size = (100 * POS_SCALE) as i128;
+    engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i64).unwrap();
+
+    let long_before = engine.stored_pos_count_long;
+    let short_before = engine.stored_pos_count_short;
+
+    engine.force_close_resolved(a).unwrap(); // a was long
+    assert_eq!(engine.stored_pos_count_long, long_before - 1);
+    assert_eq!(engine.stored_pos_count_short, short_before);
+
+    engine.force_close_resolved(b).unwrap(); // b was short
+    assert_eq!(engine.stored_pos_count_short, short_before - 1);
+}
+
+/// force_close_resolved with fee debt: insurance receives swept amount
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_force_close_resolved_fee_sweep_conservation() {
+    let mut engine = RiskEngine::new(zero_fee_params());
+    let _ = engine.top_up_insurance_fund(100_000, 0);
+    let idx = engine.add_user(0).unwrap();
+    engine.deposit(idx, 50_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+
+    // Symbolic fee debt
+    let debt: u16 = kani::any();
+    kani::assume(debt >= 1 && debt <= 40000);
+    engine.accounts[idx as usize].fee_credits = I128::new(-(debt as i128));
+
+    let ins_before = engine.insurance_fund.balance.get();
+    let result = engine.force_close_resolved(idx);
+    assert!(result.is_ok());
+
+    // Insurance must have increased by swept amount
+    let ins_after = engine.insurance_fund.balance.get();
+    let swept = core::cmp::min(debt as u128, 50_000);
+    assert_eq!(ins_after, ins_before + swept,
+        "insurance must increase by exactly the swept fee debt");
+    assert!(engine.check_conservation());
+}
+
 // ############################################################################
 // Maintenance fee: conservation, fee debt, validate_params
 // ############################################################################

@@ -2539,3 +2539,149 @@ fn test_force_close_resolved_unused_slot_rejected() {
     assert_eq!(result, Err(RiskError::AccountNotFound));
 }
 
+#[test]
+fn test_force_close_same_epoch_positive_k_pair_pnl() {
+    // Account opened long, price moved up → unrealized profit from K-pair
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    engine.execute_trade(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i64).unwrap();
+
+    // Advance K via price movement (mark-to-market)
+    engine.keeper_crank(200, 1500, &[], 64, 0i64).unwrap();
+
+    // a (long) has unrealized profit from K-pair (K_long increased)
+    let cap_before = engine.accounts[a as usize].capital.get();
+    let returned = engine.force_close_resolved(a).unwrap();
+
+    // Returned should include settled K-pair profit (haircutted)
+    assert!(returned >= cap_before, "K-pair profit must increase returned capital");
+    assert!(!engine.is_used(a as usize));
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_same_epoch_negative_k_pair_pnl() {
+    // Account opened long, price moved down → unrealized loss from K-pair
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    engine.execute_trade(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i64).unwrap();
+
+    // Price drops → a (long) has unrealized loss
+    engine.keeper_crank(200, 500, &[], 64, 0i64).unwrap();
+
+    let cap_before = engine.accounts[a as usize].capital.get();
+    let returned = engine.force_close_resolved(a).unwrap();
+
+    // Loss settled from capital
+    assert!(returned < cap_before, "K-pair loss must reduce returned capital");
+    assert!(!engine.is_used(a as usize));
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_with_fee_debt_exceeding_capital() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 10_000, 1000, 100).unwrap();
+
+    // Fee debt >> capital
+    engine.accounts[idx as usize].fee_credits = I128::new(-50_000);
+
+    let returned = engine.force_close_resolved(idx).unwrap();
+    // Capital (10k) fully swept to insurance, remaining debt forgiven
+    assert_eq!(returned, 0, "all capital swept for fee debt");
+    assert!(!engine.is_used(idx as usize));
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_zero_capital_zero_pnl() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    // No deposit — capital = 0 (new_account_fee consumed all)
+
+    let returned = engine.force_close_resolved(idx).unwrap();
+    assert_eq!(returned, 0);
+    assert!(!engine.is_used(idx as usize));
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_c_tot_tracks_exactly() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    let c = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100_000, 1000, 100).unwrap();
+    engine.deposit(b, 200_000, 1000, 100).unwrap();
+    engine.deposit(c, 300_000, 1000, 100).unwrap();
+
+    let c_tot_before = engine.c_tot.get();
+
+    let ret_a = engine.force_close_resolved(a).unwrap();
+    assert_eq!(engine.c_tot.get(), c_tot_before - ret_a);
+
+    let c_tot_mid = engine.c_tot.get();
+    let ret_b = engine.force_close_resolved(b).unwrap();
+    assert_eq!(engine.c_tot.get(), c_tot_mid - ret_b);
+
+    let c_tot_mid2 = engine.c_tot.get();
+    let ret_c = engine.force_close_resolved(c).unwrap();
+    assert_eq!(engine.c_tot.get(), c_tot_mid2 - ret_c);
+
+    assert_eq!(engine.c_tot.get(), 0, "all accounts closed → C_tot must be 0");
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_stored_pos_count_tracks() {
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    engine.execute_trade(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i64).unwrap();
+    assert_eq!(engine.stored_pos_count_long, 1);
+    assert_eq!(engine.stored_pos_count_short, 1);
+
+    engine.force_close_resolved(a).unwrap();
+    assert_eq!(engine.stored_pos_count_long, 0, "long count must decrement");
+    // Short count unchanged — b still has position
+    assert_eq!(engine.stored_pos_count_short, 1);
+
+    engine.force_close_resolved(b).unwrap();
+    assert_eq!(engine.stored_pos_count_short, 0, "short count must decrement");
+}
+
+#[test]
+fn test_force_close_multiple_sequential_no_aggregate_drift() {
+    let mut engine = RiskEngine::new(default_params());
+    let mut accounts = Vec::new();
+    for _ in 0..4 {
+        let idx = engine.add_user(1000).unwrap();
+        engine.deposit(idx, 100_000, 1000, 100).unwrap();
+        accounts.push(idx);
+    }
+
+    for &idx in &accounts {
+        engine.force_close_resolved(idx).unwrap();
+    }
+
+    assert_eq!(engine.c_tot.get(), 0);
+    assert_eq!(engine.pnl_pos_tot, 0);
+    assert_eq!(engine.pnl_matured_pos_tot, 0);
+    assert_eq!(engine.stored_pos_count_long, 0);
+    assert_eq!(engine.stored_pos_count_short, 0);
+    assert_eq!(engine.num_used_accounts, 0);
+    assert!(engine.check_conservation());
+}
+
