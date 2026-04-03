@@ -451,7 +451,7 @@ impl RiskEngine {
             "max_accounts must be in 1..=MAX_ACCOUNTS"
         );
 
-        // Margin ordering: 0 < maintenance_bps < initial_bps <= 10_000 (spec §1.4)
+        // Margin ordering: 0 <= maintenance_bps <= initial_bps <= 10_000 (spec §1.4)
         assert!(
             params.maintenance_margin_bps <= params.initial_margin_bps,
             "maintenance_margin_bps must be <= initial_margin_bps (spec §1.4)"
@@ -2724,10 +2724,13 @@ impl RiskEngine {
         }
 
         // Step 29: post-trade margin enforcement (spec §10.5)
+        // Use actual collected fee per side for fee-neutral comparison,
+        // not the nominal fee (which may exceed what was actually applied
+        // when charge_fee_to_insurance caps at collectible headroom).
         self.enforce_post_trade_margin(
             a as usize, b as usize, oracle_price,
             &old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b,
-            buffer_pre_a, buffer_pre_b, fee,
+            buffer_pre_a, buffer_pre_b, fee_collected_a, fee_collected_b,
         )?;
 
         // Steps 16-17: end-of-instruction resets
@@ -2850,10 +2853,11 @@ impl RiskEngine {
         new_eff_b: &i128,
         buffer_pre_a: I256,
         buffer_pre_b: I256,
-        fee: u128,
+        fee_a: u128,
+        fee_b: u128,
     ) -> Result<()> {
-        self.enforce_one_side_margin(a, oracle_price, old_eff_a, new_eff_a, buffer_pre_a, fee)?;
-        self.enforce_one_side_margin(b, oracle_price, old_eff_b, new_eff_b, buffer_pre_b, fee)?;
+        self.enforce_one_side_margin(a, oracle_price, old_eff_a, new_eff_a, buffer_pre_a, fee_a)?;
+        self.enforce_one_side_margin(b, oracle_price, old_eff_b, new_eff_b, buffer_pre_b, fee_b)?;
         Ok(())
     }
 
@@ -3573,12 +3577,16 @@ impl RiskEngine {
         // Step 3: Absorb any remaining flat negative PnL
         self.resolve_flat_negative(i);
 
-        // Step 4: Convert positive PnL to capital (bypass warmup for resolved market)
+        // Step 4: Convert positive PnL to capital (bypass warmup for resolved market).
+        // Uses the same release-then-haircut order as do_profit_conversion and
+        // convert_released_pnl. Sequential closers see progressively larger
+        // pnl_matured_pos_tot denominators, which is the same behavior as normal
+        // sequential profit conversion — this is inherent to the haircut model,
+        // not a force_close-specific issue.
         if self.accounts[i].pnl > 0 {
-            // Release all reserves unconditionally
+            // Release all reserves unconditionally (bypass warmup)
             self.set_reserved_pnl(i, 0);
-            // Convert using haircut
-            let pos_pnl = self.accounts[i].pnl as u128;
+            // Convert using post-release haircut
             let released = self.released_pos(i);
             if released > 0 {
                 let (h_num, h_den) = self.haircut_ratio();
@@ -3589,9 +3597,6 @@ impl RiskEngine {
                 let new_cap = add_u128(self.accounts[i].capital.get(), y);
                 self.set_capital(i, new_cap);
             }
-            // Any remaining positive PnL after consumption (shouldn't happen
-            // since we released all reserves and consumed all released)
-            // is left as-is — close_account_resolved will reject if pnl != 0
         }
 
         // Step 5: Sweep fee debt from capital
