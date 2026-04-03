@@ -63,7 +63,7 @@ fn is_account_used(engine: &RiskEngine, idx: u16) -> bool {
 /// Helper to get the safe upper bound for account iteration
 #[inline]
 fn account_count(engine: &RiskEngine) -> usize {
-    core::cmp::min(engine.params.max_accounts as usize, engine.accounts.len())
+    engine.accounts.len()
 }
 
 // ============================================================================
