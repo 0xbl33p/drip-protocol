@@ -1295,6 +1295,7 @@ impl RiskEngine {
             }
         } else {
             // Epoch mismatch (spec §5.3 step 5)
+            // Validate-then-mutate: all fallible checks before any mutation.
             let side_mode = self.get_side_mode(side);
             if side_mode != SideMode::ResetPending {
                 return Err(RiskError::CorruptState);
@@ -1306,30 +1307,27 @@ impl RiskEngine {
             let k_epoch_start = self.get_k_epoch_start(side);
             let k_snap = self.accounts[idx].adl_k_snap;
 
-            // Record old_R
-            let old_r = self.accounts[idx].reserved_pnl;
-
-            // pnl_delta (spec §5.3 step 5: k_then=k_snap, k_now=K_epoch_start)
+            // Phase 1: COMPUTE + VALIDATE (no mutations)
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
             let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
 
-            let old_pnl = self.accounts[idx].pnl;
-            let new_pnl = old_pnl.checked_add(pnl_delta).ok_or(RiskError::Overflow)?;
+            let new_pnl = self.accounts[idx].pnl.checked_add(pnl_delta).ok_or(RiskError::Overflow)?;
             if new_pnl == i128::MIN {
                 return Err(RiskError::Overflow);
             }
+
+            let old_stale = self.get_stale_count(side);
+            let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
+
+            // Phase 2: MUTATE (all validated)
+            let old_r = self.accounts[idx].reserved_pnl;
             self.set_pnl(idx, new_pnl);
 
-            // Caller obligation: if R_i increased, restart warmup
             if self.accounts[idx].reserved_pnl > old_r {
                 self.restart_warmup_after_reserve_increase(idx);
             }
 
             self.set_position_basis_q(idx, 0i128);
-
-            // Decrement stale count
-            let old_stale = self.get_stale_count(side);
-            let new_stale = old_stale.checked_sub(1).ok_or(RiskError::CorruptState)?;
             self.set_stale_count(side, new_stale);
 
             // Reset to canonical zero-position defaults (spec §2.4)
@@ -1370,20 +1368,30 @@ impl RiskEngine {
             return Ok(());
         }
 
-        // Mark-once rule (spec §1.5 item 21): apply mark exactly once from P_last to oracle_price
+        // Mark-once rule (spec §1.5 item 21): apply mark exactly once from P_last to oracle_price.
+        // Validate-then-mutate: compute both deltas before applying either.
         let current_price = self.last_oracle_price;
         let delta_p = (oracle_price as i128).checked_sub(current_price as i128)
             .ok_or(RiskError::Overflow)?;
         if delta_p != 0 {
+            // Phase 1: COMPUTE + VALIDATE
+            let delta_k_long = if long_live {
+                let dk = checked_u128_mul_i128(self.adl_mult_long, delta_p)?;
+                self.adl_coeff_long.checked_add(dk).ok_or(RiskError::Overflow)?;
+                dk
+            } else { 0i128 };
+            let delta_k_short = if short_live {
+                let dk = checked_u128_mul_i128(self.adl_mult_short, delta_p)?;
+                self.adl_coeff_short.checked_sub(dk).ok_or(RiskError::Overflow)?;
+                dk
+            } else { 0i128 };
+
+            // Phase 2: MUTATE (both validated)
             if long_live {
-                let delta_k = checked_u128_mul_i128(self.adl_mult_long, delta_p)?;
-                self.adl_coeff_long = self.adl_coeff_long.checked_add(delta_k)
-                    .ok_or(RiskError::Overflow)?;
+                self.adl_coeff_long = self.adl_coeff_long.checked_add(delta_k_long).unwrap();
             }
             if short_live {
-                let delta_k = checked_u128_mul_i128(self.adl_mult_short, delta_p)?;
-                self.adl_coeff_short = self.adl_coeff_short.checked_sub(delta_k)
-                    .ok_or(RiskError::Overflow)?;
+                self.adl_coeff_short = self.adl_coeff_short.checked_sub(delta_k_short).unwrap();
             }
         }
 
@@ -1412,17 +1420,16 @@ impl RiskEngine {
                     let fund_term = floor_div_signed_conservative_i128(fund_num, 10_000u128);
 
                     if fund_term != 0 {
-                        // K_long -= A_long * fund_term (longs pay when fund_term > 0)
-                        let delta_k_long = checked_u128_mul_i128(self.adl_mult_long, fund_term)?;
-                        self.adl_coeff_long = self.adl_coeff_long
-                            .checked_sub(delta_k_long)
+                        // Validate-then-mutate: compute both deltas first
+                        let dk_long = checked_u128_mul_i128(self.adl_mult_long, fund_term)?;
+                        let new_k_long = self.adl_coeff_long.checked_sub(dk_long)
                             .ok_or(RiskError::Overflow)?;
-
-                        // K_short += A_short * fund_term (shorts receive when fund_term > 0)
-                        let delta_k_short = checked_u128_mul_i128(self.adl_mult_short, fund_term)?;
-                        self.adl_coeff_short = self.adl_coeff_short
-                            .checked_add(delta_k_short)
+                        let dk_short = checked_u128_mul_i128(self.adl_mult_short, fund_term)?;
+                        let new_k_short = self.adl_coeff_short.checked_add(dk_short)
                             .ok_or(RiskError::Overflow)?;
+                        // Both validated — commit
+                        self.adl_coeff_long = new_k_long;
+                        self.adl_coeff_short = new_k_short;
                     }
                 }
             }
@@ -3543,7 +3550,23 @@ impl RiskEngine {
             if new_pnl == i128::MIN {
                 return Err(RiskError::Overflow);
             }
+            // Validate OI decrement (computed before any mutation)
+            let eff = self.effective_pos_q(i);
+            if eff > 0 {
+                self.oi_eff_long_q.checked_sub(eff as u128)
+                    .ok_or(RiskError::CorruptState)?;
+            } else if eff < 0 {
+                self.oi_eff_short_q.checked_sub(eff.unsigned_abs())
+                    .ok_or(RiskError::CorruptState)?;
+            }
+
             if epoch_snap != epoch_side {
+                // Validate epoch adjacency (same check as settle_side_effects
+                // minus the ResetPending mode check, which is relaxed for
+                // resolved markets where the side may be in any mode)
+                if epoch_snap.checked_add(1) != Some(epoch_side) {
+                    return Err(RiskError::CorruptState);
+                }
                 let old_stale = self.get_stale_count(side);
                 if old_stale == 0 {
                     return Err(RiskError::CorruptState);
@@ -3565,12 +3588,11 @@ impl RiskEngine {
                 self.set_stale_count(side, old_stale - 1);
             }
 
-            // Decrement OI by the account's effective position before zeroing
-            let eff = self.effective_pos_q(i);
+            // Decrement OI (pre-validated above)
             if eff > 0 {
-                self.oi_eff_long_q = self.oi_eff_long_q.saturating_sub(eff as u128);
+                self.oi_eff_long_q -= eff as u128;
             } else if eff < 0 {
-                self.oi_eff_short_q = self.oi_eff_short_q.saturating_sub(eff.unsigned_abs());
+                self.oi_eff_short_q -= eff.unsigned_abs();
             }
 
             // Zero position
@@ -3875,14 +3897,17 @@ impl RiskEngine {
     fn recompute_aggregates(&mut self) {
         let mut c_tot = 0u128;
         let mut pnl_pos_tot = 0u128;
+        let mut pnl_matured_pos_tot = 0u128;
         self.for_each_used(|_idx, account| {
             c_tot = c_tot.saturating_add(account.capital.get());
-            if account.pnl > 0 {
-                pnl_pos_tot = pnl_pos_tot.saturating_add(account.pnl as u128);
-            }
+            let pos_pnl = i128_clamp_pos(account.pnl);
+            pnl_pos_tot = pnl_pos_tot.saturating_add(pos_pnl);
+            let released = pos_pnl.saturating_sub(account.reserved_pnl);
+            pnl_matured_pos_tot = pnl_matured_pos_tot.saturating_add(released);
         });
         self.c_tot = U128::new(c_tot);
         self.pnl_pos_tot = pnl_pos_tot;
+        self.pnl_matured_pos_tot = pnl_matured_pos_tot;
     }
     }
 
