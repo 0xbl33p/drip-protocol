@@ -271,11 +271,12 @@ fn proof_fee_debt_sweep_checked_arithmetic() {
 // ############################################################################
 
 /// keeper_crank with a bad partial hint (too small to restore health) must NOT
-/// revert — the pre-flight rejects it and falls back to FullClose.
+/// Invalid partial hint → no liquidation action (spec §11.1 rule 3).
+/// The crank succeeds but the account retains its position.
 #[kani::proof]
 #[kani::unwind(34)]
 #[kani::solver(cadical)]
-fn proof_keeper_crank_bad_partial_falls_back_to_full() {
+fn proof_keeper_crank_invalid_partial_no_action() {
     let mut engine = RiskEngine::new(default_params());
 
     let a = engine.add_user(1000).unwrap();
@@ -287,17 +288,18 @@ fn proof_keeper_crank_bad_partial_falls_back_to_full() {
     let size = 100 * POS_SCALE as i128;
     engine.execute_trade(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size, DEFAULT_ORACLE, 0i64).unwrap();
 
-    // Crash oracle to make 'a' liquidatable
     let crash_oracle = 500u64;
 
-    // Tiny partial — won't restore health, pre-flight should reject → FullClose
+    // Tiny partial — won't restore health, pre-flight returns None → no action
     let bad_hint = Some(LiquidationPolicy::ExactPartial(POS_SCALE as u128));
     let candidates = [(a, bad_hint)];
     let result = engine.keeper_crank(DEFAULT_SLOT + 1, crash_oracle, &candidates, 10, 0i64);
-    assert!(result.is_ok(), "keeper_crank must not revert on bad partial hint");
+    assert!(result.is_ok(), "keeper_crank must not revert on invalid partial hint");
 
-    // Account should have been fully closed (FullClose fallback)
-    assert!(engine.effective_pos_q(a as usize) == 0, "bad partial must fall back to FullClose");
+    // Invalid hint means no liquidation — account still has position
+    assert!(engine.effective_pos_q(a as usize) != 0,
+        "invalid partial hint must cause no liquidation action");
+    assert!(engine.check_conservation());
 }
 
 // ############################################################################

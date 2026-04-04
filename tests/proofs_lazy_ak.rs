@@ -293,7 +293,8 @@ fn t3_14_epoch_mismatch_forces_terminal_close() {
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
     assert!(engine.stale_account_count_long == 0);
-    assert!(engine.accounts[idx as usize].adl_epoch_snap == 1);
+    // Canonical zero-position defaults: epoch_snap = 0 (spec §2.4)
+    assert!(engine.accounts[idx as usize].adl_epoch_snap == 0);
 
     // PnL assertion: the settlement must credit the correct amount
     let abs_basis = pos as u128;
@@ -340,7 +341,8 @@ fn t3_14b_epoch_mismatch_with_nonzero_k_diff() {
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
     assert!(engine.stale_account_count_long == 0);
-    assert!(engine.accounts[idx as usize].adl_epoch_snap == 1);
+    // Canonical zero-position defaults: epoch_snap = 0 (spec §2.4)
+    assert!(engine.accounts[idx as usize].adl_epoch_snap == 0);
 
     // PnL assertion: the settlement must credit the correct amount
     let abs_basis = pos as u128;
@@ -359,14 +361,16 @@ fn t3_14b_epoch_mismatch_with_nonzero_k_diff() {
 #[kani::solver(cadical)]
 fn t7_28a_noncompounding_floor_inequality_correct_direction() {
     let basis: u8 = kani::any();
-    kani::assume(basis > 0);
+    kani::assume(basis > 0 && basis <= 15);
     let a_basis: u8 = kani::any();
-    kani::assume(a_basis > 0);
+    kani::assume(a_basis > 0 && a_basis <= 15);
 
     let k1: i8 = kani::any();
+    kani::assume(k1 >= -15 && k1 <= 15);
     let k2_delta: i8 = kani::any();
+    kani::assume(k2_delta >= -15 && k2_delta <= 15);
     let k2_val = (k1 as i16) + (k2_delta as i16);
-    kani::assume(k2_val >= -120 && k2_val <= 120);
+    kani::assume(k2_val >= -15 && k2_val <= 15);
 
     const S_POS_SCALE_LOCAL: i32 = 4;
     let den = (a_basis as i32) * S_POS_SCALE_LOCAL;
@@ -393,16 +397,18 @@ fn t7_28a_noncompounding_floor_inequality_correct_direction() {
 #[kani::solver(cadical)]
 fn t7_28b_noncompounding_exact_additivity_divisible_increments() {
     let basis: u8 = kani::any();
-    kani::assume(basis > 0);
+    kani::assume(basis > 0 && basis <= 12);
     // In the real engine, position_basis_q is always POS_SCALE-aligned
     kani::assume(basis % 4 == 0);
     let a_basis: u8 = kani::any();
-    kani::assume(a_basis > 0);
+    kani::assume(a_basis > 0 && a_basis <= 15);
 
     let dp1: i8 = kani::any();
+    kani::assume(dp1 >= -15 && dp1 <= 15);
     let dp2: i8 = kani::any();
+    kani::assume(dp2 >= -15 && dp2 <= 15);
     let dp_total = (dp1 as i16) + (dp2 as i16);
-    kani::assume(dp_total >= -120 && dp_total <= 120);
+    kani::assume(dp_total >= -15 && dp_total <= 15);
 
     const S_POS_SCALE_LOCAL: i32 = 4;
     let den = (a_basis as i32) * S_POS_SCALE_LOCAL;

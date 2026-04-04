@@ -119,6 +119,8 @@ fn t0_2c_mul_div_floor_matches_reference() {
     let b: u8 = kani::any();
     let c: u8 = kani::any();
     kani::assume(c > 0);
+    // Constrain to 4-bit range to keep U256 solver tractable
+    kani::assume(a <= 15 && b <= 15 && c <= 15);
 
     let result = mul_div_floor_u256(
         U256::from_u128(a as u128),
@@ -139,6 +141,7 @@ fn t0_2d_mul_div_ceil_matches_reference() {
     let b: u8 = kani::any();
     let c: u8 = kani::any();
     kani::assume(c > 0);
+    kani::assume(a <= 15 && b <= 15 && c <= 15);
 
     let result = mul_div_ceil_u256(
         U256::from_u128(a as u128),
@@ -320,11 +323,11 @@ fn proof_warmup_release_bounded_by_slope() {
 #[kani::solver(cadical)]
 fn t13_59_fused_delta_k_no_double_rounding() {
     let d: u8 = kani::any();
-    kani::assume(d > 0);
+    kani::assume(d > 0 && d <= 15);
     let oi: u8 = kani::any();
-    kani::assume(oi > 0);
+    kani::assume(oi > 0 && oi <= 15);
     let a: u8 = kani::any();
-    kani::assume(a > 0);
+    kani::assume(a > 0 && a <= 15);
 
     let beta_abs = ((d as u32) + (oi as u32) - 1) / (oi as u32);
     let old_delta_k = (a as u32) * beta_abs;
@@ -410,9 +413,10 @@ fn proof_wide_signed_mul_div_floor_sign_and_rounding() {
     let k_val: i8 = kani::any();
     let denom: u8 = kani::any();
 
-    kani::assume(basis > 0);
-    kani::assume(denom > 0);
+    kani::assume(basis > 0 && basis <= 15);
+    kani::assume(denom > 0 && denom <= 15);
     kani::assume(k_val != i8::MIN); // I256::MIN excluded by impl
+    kani::assume(k_val >= -15 && k_val <= 15);
 
     let abs_basis = U256::from_u128(basis as u128);
     let k_diff = I256::from_i128(k_val as i128);

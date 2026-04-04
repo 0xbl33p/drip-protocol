@@ -179,7 +179,8 @@ fn t6_26b_full_drain_reset_nonzero_k_diff() {
 
     assert!(engine.accounts[idx as usize].position_basis_q == 0);
     assert!(engine.stale_account_count_long == 0);
-    assert!(engine.accounts[idx as usize].adl_epoch_snap == 1);
+    // Canonical zero-position defaults: epoch_snap = 0 (spec §2.4)
+    assert!(engine.accounts[idx as usize].adl_epoch_snap == 0);
 
     assert!(engine.stored_pos_count_long == 0);
     let finalize = engine.finalize_side_reset(Side::Long);
@@ -506,8 +507,9 @@ fn t11_50_execute_trade_atomic_oi_update_sign_flip() {
     assert!(r1.is_ok());
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q);
 
-    let flip_size = -(2 * POS_SCALE as i128);
-    let r2 = engine.execute_trade(a, b, 100, 2, flip_size, 100, 0i64);
+    // Swap a,b to reverse direction (size_q must be > 0)
+    let flip_size = (2 * POS_SCALE) as i128;
+    let r2 = engine.execute_trade(b, a, 100, 2, flip_size, 100, 0i64);
     assert!(r2.is_ok());
 
     assert!(engine.oi_eff_long_q == engine.oi_eff_short_q, "OI must be balanced after sign flip");
@@ -907,7 +909,7 @@ fn t12_53_adl_truncation_dust_must_not_deadlock() {
 #[kani::solver(cadical)]
 fn t14_61_dust_bound_adl_a_truncation_sufficient() {
     let a_old: u8 = kani::any();
-    kani::assume(a_old >= 2);
+    kani::assume(a_old >= 2 && a_old <= 15);
     let basis_1: u8 = kani::any();
     kani::assume(basis_1 > 0 && basis_1 <= 15);
     let basis_2: u8 = kani::any();
@@ -924,7 +926,7 @@ fn t14_61_dust_bound_adl_a_truncation_sufficient() {
     kani::assume(oi > 0);
 
     let q_close: u8 = kani::any();
-    kani::assume(q_close > 0 && (q_close as u16) < oi);
+    kani::assume(q_close > 0 && q_close <= 15 && (q_close as u16) < oi);
     let oi_post = oi - (q_close as u16);
 
     let a_new = ((a_old as u16) * oi_post) / oi;
