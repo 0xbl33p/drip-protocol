@@ -722,7 +722,7 @@ proptest! {
         }
 
         // Top up insurance using proper API (maintains conservation)
-        let floor = state.engine.insurance_floor;
+        let floor = state.engine.params.insurance_floor.get();
         let target_insurance = initial_insurance.max(floor + 100);
         let current_insurance = state.engine.insurance_fund.balance.get();
         if target_insurance > current_insurance {
@@ -938,7 +938,7 @@ fn run_deterministic_fuzzer(
         }
 
         // Top up insurance using proper API (maintains conservation)
-        let floor = state.engine.insurance_floor;
+        let floor = state.engine.params.insurance_floor.get();
         let target_ins = floor + rng.u128(5_000, 100_000);
         let current_ins = state.engine.insurance_fund.balance.get();
         if target_ins > current_ins {

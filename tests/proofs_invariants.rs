@@ -429,7 +429,7 @@ fn proof_absorb_protocol_loss_respects_floor() {
 
     let floor: u32 = kani::any();
     kani::assume(floor <= 10_000);
-    engine.insurance_floor = floor as u128;
+    engine.params.insurance_floor = U128::new(floor as u128);
 
     let balance: u32 = kani::any();
     kani::assume(balance >= floor && balance <= 100_000);

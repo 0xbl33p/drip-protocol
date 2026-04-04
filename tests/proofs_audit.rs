@@ -709,8 +709,8 @@ fn proof_insurance_floor_from_params() {
     let mut params = zero_fee_params();
     params.insurance_floor = U128::new(5000);
     let engine = RiskEngine::new(params);
-    assert_eq!(engine.insurance_floor, 5000,
-        "insurance_floor must come from RiskParams, not hardcoded zero");
+    assert_eq!(engine.params.insurance_floor.get(), 5000,
+        "insurance_floor must come from RiskParams");
 }
 
 /// insurance_floor > MAX_VAULT_TVL must be rejected.

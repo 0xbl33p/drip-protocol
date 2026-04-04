@@ -329,8 +329,7 @@ pub struct RiskEngine {
     /// Funding price sample (for anti-retroactivity)
     pub funding_price_sample_last: u64,
 
-    /// Insurance floor (spec §4.7)
-    pub insurance_floor: u128,
+    // Insurance floor is read from self.params.insurance_floor (no duplicate field)
 
     // Slab management
     pub used: [u64; BITMAP_WORDS],
@@ -575,7 +574,6 @@ impl RiskEngine {
             last_oracle_price: init_oracle_price,
             last_market_slot: init_slot,
             funding_price_sample_last: init_oracle_price,
-            insurance_floor: params.insurance_floor.get(),
             used: [0; BITMAP_WORDS],
             num_used_accounts: 0,
             next_account_id: 0,
@@ -639,7 +637,7 @@ impl RiskEngine {
         self.last_oracle_price = init_oracle_price;
         self.last_market_slot = init_slot;
         self.funding_price_sample_last = init_oracle_price;
-        self.insurance_floor = params.insurance_floor.get();
+        // insurance_floor is now read directly from self.params.insurance_floor
         self.used = [0; BITMAP_WORDS];
         self.num_used_accounts = 0;
         self.next_account_id = 0;
@@ -1480,7 +1478,7 @@ impl RiskEngine {
             return 0;
         }
         let ins_bal = self.insurance_fund.balance.get();
-        let available = ins_bal.saturating_sub(self.insurance_floor);
+        let available = ins_bal.saturating_sub(self.params.insurance_floor.get());
         let pay = core::cmp::min(loss, available);
         if pay > 0 {
             self.insurance_fund.balance = U128::new(ins_bal - pay);
@@ -3607,6 +3605,22 @@ impl RiskEngine {
                 self.oi_eff_short_q -= eff.unsigned_abs();
             }
 
+            // Account for same-epoch phantom dust before zeroing (same logic
+            // as attach_effective_position detach path, spec §4.5/§4.6)
+            if epoch_snap == epoch_side && a_basis != 0 {
+                let a_side_val = self.get_a_side(side);
+                let product = U256::from_u128(abs_basis)
+                    .checked_mul(U256::from_u128(a_side_val));
+                if let Some(p) = product {
+                    let rem = p.checked_rem(U256::from_u128(a_basis));
+                    if let Some(r) = rem {
+                        if !r.is_zero() {
+                            self.inc_phantom_dust_bound(side);
+                        }
+                    }
+                }
+            }
+
             // Zero position
             self.set_position_basis_q(i, 0);
             self.accounts[i].adl_a_basis = ADL_ONE;
@@ -3849,7 +3863,7 @@ impl RiskEngine {
             .ok_or(RiskError::Overflow)?;
         self.vault = U128::new(new_vault);
         self.insurance_fund.balance = U128::new(new_ins);
-        Ok(self.insurance_fund.balance.get() > self.insurance_floor)
+        Ok(self.insurance_fund.balance.get() > self.params.insurance_floor.get())
     }
 
     // set_insurance_floor removed — configuration immutability (spec §2.2.1).

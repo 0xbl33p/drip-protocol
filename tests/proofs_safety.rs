@@ -1943,7 +1943,7 @@ fn proof_audit4_init_in_place_canonical() {
     engine.last_oracle_price = 9999;
     engine.last_market_slot = 55;
     engine.funding_price_sample_last = 777;
-    engine.insurance_floor = 12345;
+    engine.params.insurance_floor = U128::new(12345);
     engine.next_account_id = 99;
     engine.free_head = u16::MAX; // break the freelist
 
@@ -1997,7 +1997,7 @@ fn proof_audit4_init_in_place_canonical() {
     assert!(engine.last_oracle_price == DEFAULT_ORACLE);
     assert!(engine.last_market_slot == 0);
     assert!(engine.funding_price_sample_last == DEFAULT_ORACLE);
-    assert!(engine.insurance_floor == 0);
+    assert!(engine.params.insurance_floor.get() == 0);
     assert!(engine.next_account_id == 0);
 
     // ---- Used bitmap: all zeroed ----
