@@ -733,7 +733,8 @@ impl RiskEngine {
         let idx = self.free_head;
         self.free_head = self.next_free[idx as usize];
         self.set_used(idx as usize);
-        self.num_used_accounts = self.num_used_accounts.saturating_add(1);
+        self.num_used_accounts = self.num_used_accounts.checked_add(1)
+            .expect("num_used_accounts overflow — slot leak corruption");
         Ok(idx)
     }
 
@@ -743,9 +744,11 @@ impl RiskEngine {
         self.clear_used(idx as usize);
         self.next_free[idx as usize] = self.free_head;
         self.free_head = idx;
-        self.num_used_accounts = self.num_used_accounts.saturating_sub(1);
+        self.num_used_accounts = self.num_used_accounts.checked_sub(1)
+            .expect("free_slot: num_used_accounts underflow — double-free corruption");
         // Decrement materialized_account_count (spec §2.1.2)
-        self.materialized_account_count = self.materialized_account_count.saturating_sub(1);
+        self.materialized_account_count = self.materialized_account_count.checked_sub(1)
+            .expect("free_slot: materialized_account_count underflow — double-free corruption");
     }
     }
 
@@ -796,7 +799,8 @@ impl RiskEngine {
         }
 
         self.set_used(idx as usize);
-        self.num_used_accounts = self.num_used_accounts.saturating_add(1);
+        self.num_used_accounts = self.num_used_accounts.checked_add(1)
+            .expect("num_used_accounts overflow — slot leak corruption");
 
         let account_id = self.next_account_id;
         self.next_account_id = self.next_account_id.saturating_add(1);
@@ -2069,7 +2073,8 @@ impl RiskEngine {
         if pay > 0 {
             self.set_capital(idx, cap - pay);
             let pay_i128 = pay as i128; // pay <= need = |pnl| <= i128::MAX, safe
-            let new_pnl = pnl.checked_add(pay_i128).unwrap_or(0i128);
+            let new_pnl = pnl.checked_add(pay_i128)
+                .expect("settle_losses: unreachable overflow (pay <= |pnl|)");
             if new_pnl == i128::MIN {
                 self.set_pnl(idx, 0i128);
             } else {
@@ -2226,13 +2231,13 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Step 7: stamp last_fee_slot BEFORE charge (prevents re-charge on retry)
-        self.accounts[idx].last_fee_slot = now_slot;
-
-        // Step 6: charge via charge_fee_to_insurance
+        // Step 6: charge via charge_fee_to_insurance (spec §8.2.2 ordering)
         if fee_due > 0 {
             self.charge_fee_to_insurance(idx, fee_due)?;
         }
+
+        // Step 7: stamp last_fee_slot after charge (matches spec ordering)
+        self.accounts[idx].last_fee_slot = now_slot;
 
         Ok(())
     }
@@ -2678,8 +2683,25 @@ impl RiskEngine {
         // so OI-increase gating doesn't block trades on reopenable sides.
         self.maybe_finalize_ready_reset_sides();
 
-        // Step 5: reject if trade would increase OI on a blocked side
-        self.check_side_mode_for_trade(&old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b)?;
+        // Step 5: compute bilateral OI once (spec §5.2.2) and use for both
+        // mode gating and later writeback. Avoids redundant checked arithmetic.
+        let (oi_long_after, oi_short_after) = self.bilateral_oi_after(
+            &old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b)?;
+
+        // Validate OI bounds
+        if oi_long_after > MAX_OI_SIDE_Q || oi_short_after > MAX_OI_SIDE_Q {
+            return Err(RiskError::Overflow);
+        }
+
+        // Reject if trade would increase OI on a blocked side
+        if (self.side_mode_long == SideMode::DrainOnly || self.side_mode_long == SideMode::ResetPending)
+            && oi_long_after > self.oi_eff_long_q {
+            return Err(RiskError::SideBlocked);
+        }
+        if (self.side_mode_short == SideMode::DrainOnly || self.side_mode_short == SideMode::ResetPending)
+            && oi_short_after > self.oi_eff_short_q {
+            return Err(RiskError::SideBlocked);
+        }
 
         // Step 21: trade PnL alignment (spec §10.5)
         let price_diff = (oracle_price as i128) - (exec_price as i128);
@@ -2709,8 +2731,9 @@ impl RiskEngine {
         self.attach_effective_position(a as usize, new_eff_a);
         self.attach_effective_position(b as usize, new_eff_b);
 
-        // Step 9: update OI
-        self.update_oi_from_positions(&old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b)?;
+        // Step 9: write pre-computed OI (same values from step 5, spec §5.2.2)
+        self.oi_eff_long_q = oi_long_after;
+        self.oi_eff_short_q = oi_short_after;
 
         // Step 10: settle post-trade losses from principal for both accounts (spec §10.4 step 18)
         // Loss seniority: losses MUST be settled before explicit fees (spec §0 item 14)
@@ -2758,11 +2781,21 @@ impl RiskEngine {
             );
         }
 
+        // Steps 25-26: flat-close PNL guard (spec §10.5)
+        if new_eff_a == 0 && self.accounts[a as usize].pnl < 0 {
+            return Err(RiskError::Undercollateralized);
+        }
+        if new_eff_b == 0 && self.accounts[b as usize].pnl < 0 {
+            return Err(RiskError::Undercollateralized);
+        }
+
         // Step 29: post-trade margin enforcement (spec §10.5)
-        // Use actual collected fee per side for fee-neutral comparison,
-        // not the nominal fee (which may exceed what was actually applied
-        // when charge_fee_to_insurance caps at collectible headroom).
-        // Use total equity impact for fee-neutral margin comparison
+        // The spec says "(Eq_maint_raw_i + fee)" using the nominal fee.
+        // We use fee_impact (capital_paid + collectible_debt) instead because:
+        // - charge_fee_to_insurance can drop excess beyond collectible headroom
+        // - Eq_maint_raw only decreased by impact, not the full nominal fee
+        // - Adding back impact correctly reverses the actual state change
+        // - Using nominal fee would over-compensate and admit invalid trades
         self.enforce_post_trade_margin(
             a as usize, b as usize, oracle_price,
             &old_eff_a, &new_eff_a, &old_eff_b, &new_eff_b,
@@ -3804,8 +3837,11 @@ impl RiskEngine {
                 continue;
             }
 
-            // Note: GC does NOT realize recurring maintenance fees. That is only
-            // allowed in touch_account_full_not_atomic and reclaim_empty_account_not_atomic per spec §8.2.3.
+            // Realize recurring maintenance fees on already-flat state (spec §8.2.3).
+            // Best-effort: skip on error (GC is non-critical).
+            if self.settle_maintenance_fee_internal(idx, self.current_slot).is_err() {
+                continue;
+            }
 
             // Dust predicate: zero position basis, zero capital, zero reserved,
             // non-positive pnl, AND zero fee_credits. Must not GC accounts
