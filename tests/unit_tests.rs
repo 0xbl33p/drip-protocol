@@ -2718,14 +2718,14 @@ fn test_force_close_decrements_oi() {
     assert!(engine.oi_eff_short_q > 0);
 
     engine.force_close_resolved_not_atomic(a, 100).unwrap();
-    // Single-side decrement: long OI goes to 0, short OI unchanged
-    assert_eq!(engine.oi_eff_long_q, 0, "OI long must be 0 after force-closing long");
+    // Bilateral decrement: both sides go to 0 together
+    assert_eq!(engine.oi_eff_long_q, 0);
+    assert_eq!(engine.oi_eff_short_q, 0);
+    assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q, "OI must stay symmetric");
 
     engine.force_close_resolved_not_atomic(b, 100).unwrap();
     assert_eq!(engine.oi_eff_long_q, 0);
     assert_eq!(engine.oi_eff_short_q, 0);
-    // After both sides closed, OI is symmetric again
-    assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q);
     assert_eq!(engine.stored_pos_count_long, 0);
     assert_eq!(engine.stored_pos_count_short, 0);
     assert!(engine.check_conservation());
@@ -2733,14 +2733,15 @@ fn test_force_close_decrements_oi() {
 
 #[test]
 fn test_force_close_oi_symmetry_after_one_side() {
-    // Critical liveness test: after force-closing all longs,
-    // OI_long == OI_short must still hold so subsequent withdrawals
-    // by short-side users don't hit CorruptState.
+    // Critical liveness test: after force-closing long-side account,
+    // short-side user must be able to close_account without CorruptState.
     let mut engine = RiskEngine::new(default_params());
     let a = engine.add_user(1000).unwrap();
     let b = engine.add_user(1000).unwrap();
     engine.deposit(a, 500_000, 1000, 100).unwrap();
     engine.deposit(b, 500_000, 1000, 100).unwrap();
+    engine.accounts[a as usize].last_fee_slot = 100;
+    engine.accounts[b as usize].last_fee_slot = 100;
 
     engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i64).unwrap();
     assert!(engine.oi_eff_long_q > 0);
@@ -2749,15 +2750,16 @@ fn test_force_close_oi_symmetry_after_one_side() {
     // Force-close only account a (the long side)
     engine.force_close_resolved_not_atomic(a, 100).unwrap();
 
-    // Single-side decrement: OI_long = 0, OI_short still has b's position.
-    // OI is temporarily asymmetric during resolution. The wrapper must
-    // force-close ALL accounts before resuming standard-lifecycle operations.
-    assert_eq!(engine.oi_eff_long_q, 0);
-
-    // Force-close b to restore symmetry
-    engine.force_close_resolved_not_atomic(b, 100).unwrap();
+    // After force-closing one side, OI must stay symmetric so the
+    // other side's users can still close normally.
     assert_eq!(engine.oi_eff_long_q, engine.oi_eff_short_q,
-        "OI must be symmetric after all accounts force-closed");
+        "OI must stay symmetric after force-closing one side");
+
+    // b (short side) must be able to force-close without CorruptState
+    engine.force_close_resolved_not_atomic(b, 100).unwrap();
+    assert_eq!(engine.oi_eff_long_q, 0);
+    assert_eq!(engine.oi_eff_short_q, 0);
+    assert!(engine.check_conservation());
 }
 
 #[test]

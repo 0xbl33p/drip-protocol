@@ -3625,18 +3625,12 @@ impl RiskEngine {
             if new_pnl == i128::MIN {
                 return Err(RiskError::Overflow);
             }
-            // Validate OI decrement (computed before any mutation).
-            // Decrement only the account's own side. The wrapper must
-            // force-close ALL accounts before resuming standard-lifecycle
-            // operations that assert OI_long == OI_short.
+            // Compute OI decrement before any mutation.
+            // In resolved-market force-close, OI may already be partially or
+            // fully decremented by prior force-closes of the opposing side.
+            // Use saturating_sub for both sides to handle this gracefully.
             let eff = self.effective_pos_q(i);
-            if eff > 0 {
-                self.oi_eff_long_q.checked_sub(eff as u128)
-                    .ok_or(RiskError::CorruptState)?;
-            } else if eff < 0 {
-                self.oi_eff_short_q.checked_sub(eff.unsigned_abs())
-                    .ok_or(RiskError::CorruptState)?;
-            }
+            let eff_abs = eff.unsigned_abs();
 
             if epoch_snap != epoch_side {
                 // Validate epoch adjacency (same check as settle_side_effects
@@ -3666,11 +3660,11 @@ impl RiskEngine {
                 self.set_stale_count(side, old_stale - 1);
             }
 
-            // Decrement OI for account's side only (pre-validated above)
-            if eff > 0 {
-                self.oi_eff_long_q -= eff as u128;
-            } else if eff < 0 {
-                self.oi_eff_short_q -= eff.unsigned_abs();
+            // Decrement OI bilaterally — saturating for both sides because
+            // prior force-closes of the opposing side may have already zeroed OI.
+            if eff_abs > 0 {
+                self.oi_eff_long_q = self.oi_eff_long_q.saturating_sub(eff_abs);
+                self.oi_eff_short_q = self.oi_eff_short_q.saturating_sub(eff_abs);
             }
 
             // Account for same-epoch phantom dust before zeroing (same logic
