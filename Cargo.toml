@@ -17,6 +17,7 @@ proptest = "1.4"
 [features]
 default = []
 test = []  # Use MAX_ACCOUNTS=64 for tests
+stress = []  # Expose test_visible methods but keep MAX_ACCOUNTS=4096
 fuzz = ["test"]  # Enable fuzzing tests (includes test feature for test_visible helpers)
 
 [profile.release]

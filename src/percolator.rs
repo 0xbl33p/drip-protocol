@@ -51,11 +51,11 @@ macro_rules! test_visible {
         fn $name:ident($($args:tt)*) $(-> $ret:ty)? $body:block
     ) => {
         $(#[$meta])*
-        #[cfg(any(feature = "test", kani))]
+        #[cfg(any(feature = "test", feature = "stress", kani))]
         pub fn $name($($args)*) $(-> $ret)? $body
 
         $(#[$meta])*
-        #[cfg(not(any(feature = "test", kani)))]
+        #[cfg(not(any(feature = "test", feature = "stress", kani)))]
         fn $name($($args)*) $(-> $ret)? $body
     };
 }
