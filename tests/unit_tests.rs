@@ -653,9 +653,10 @@ fn test_keeper_crank_same_slot_not_advanced() {
 }
 
 #[test]
-fn test_keeper_crank_caller_touch_charges_fee() {
-    // Spec §8.2: maintenance fees enabled — keeper crank charges accrued fees.
-    let mut engine = RiskEngine::new(default_params()); // maintenance_fee_per_slot = 1
+fn test_keeper_crank_no_engine_native_maintenance_fee() {
+    // Spec v12.14.0 §8: no engine-native recurring maintenance fee.
+    // Keeper crank must NOT reduce capital from maintenance fees.
+    let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 1u64;
     engine.current_slot = slot;
@@ -665,14 +666,14 @@ fn test_keeper_crank_caller_touch_charges_fee() {
 
     let capital_before = engine.accounts[caller as usize].capital.get();
 
-    // Advance 199 slots, crank touches caller → fee = dt * 1
+    // Advance 199 slots, crank touches caller — no maintenance fee charged
     let slot2 = 200u64;
     let outcome = engine.keeper_crank_not_atomic(slot2, oracle, &[(caller, None)], 64, 0i128, 0).expect("crank");
     assert!(outcome.advanced);
 
     let capital_after = engine.accounts[caller as usize].capital.get();
-    assert!(capital_after < capital_before,
-        "maintenance fee must reduce capital");
+    assert_eq!(capital_after, capital_before,
+        "no engine-native maintenance fee in v12.14.0");
     assert!(engine.check_conservation());
 }
 
@@ -1594,7 +1595,9 @@ fn test_keeper_crank_processes_candidates() {
 }
 
 #[test]
-fn test_keeper_crank_caller_fee_discount_multi_slot() {
+fn test_keeper_crank_multi_slot_advance_no_fee() {
+    // Spec v12.14.0 §8: no engine-native recurring maintenance fee.
+    // Verify crank processes correctly across large slot gaps without fee charging.
     let mut engine = RiskEngine::new(default_params());
     let oracle = 1000u64;
     let slot = 1u64;
@@ -1604,16 +1607,18 @@ fn test_keeper_crank_caller_fee_discount_multi_slot() {
     engine.deposit(a, 10_000_000, oracle, slot).unwrap();
     engine.keeper_crank_not_atomic(slot, oracle, &[] as &[(u16, Option<LiquidationPolicy>)], 64, 0i128, 0).unwrap();
 
-    // Advance many slots to accumulate maintenance fee debt
-    let far_slot = 1000u64;
-    engine.accounts[a as usize].last_fee_slot = slot;
+    let capital_before = engine.accounts[a as usize].capital.get();
 
-    // Run crank at far_slot with account a as candidate
+    // Advance many slots
+    let far_slot = 1000u64;
+
+    // Run crank at far_slot with account a as candidate — no fee charged
     engine.keeper_crank_not_atomic(far_slot, oracle, &[(a, None)], 64, 0i128, 0).unwrap();
 
-    // Account's last_fee_slot should be updated to far_slot (post-settlement)
-    assert_eq!(engine.accounts[a as usize].last_fee_slot, far_slot,
-        "account's last_fee_slot must be updated after crank settlement");
+    let capital_after = engine.accounts[a as usize].capital.get();
+    assert_eq!(capital_after, capital_before,
+        "no engine-native maintenance fee across multi-slot gap");
+    assert!(engine.check_conservation());
 }
 
 // ============================================================================

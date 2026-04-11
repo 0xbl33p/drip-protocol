@@ -3294,7 +3294,7 @@ impl RiskEngine {
         }
 
         // No require_fresh_crank: spec §10.4 does not gate withdraw_not_atomic on keeper
-        // liveness. touch_account_full_not_atomic calls accrue_market_to with the caller's
+        // liveness. touch_account_live_local calls accrue_market_to with the caller's
         // oracle and slot, satisfying spec §0 goal 6 (liveness without external action).
 
         if !self.is_used(idx as usize) {
@@ -3437,7 +3437,7 @@ impl RiskEngine {
         }
 
         // No require_fresh_crank: spec §10.5 does not gate execute_trade_not_atomic on
-        // keeper liveness. touch_account_full_not_atomic calls accrue_market_to with the
+        // keeper liveness. touch_account_live_local calls accrue_market_to with the
         // caller's oracle and slot, satisfying spec §0 goal 6.
 
         if !self.is_used(a as usize) || !self.is_used(b as usize) {
@@ -3536,24 +3536,13 @@ impl RiskEngine {
         let trade_pnl_a = compute_trade_pnl(size_q, price_diff)?;
         let trade_pnl_b = trade_pnl_a.checked_neg().ok_or(RiskError::Overflow)?;
 
-        let old_r_a = self.accounts[a as usize].reserved_pnl;
-        let old_r_b = self.accounts[b as usize].reserved_pnl;
-
         let pnl_a = self.accounts[a as usize].pnl.checked_add(trade_pnl_a).ok_or(RiskError::Overflow)?;
         if pnl_a == i128::MIN { return Err(RiskError::Overflow); }
-        self.set_pnl(a as usize, pnl_a);
+        self.set_pnl_with_reserve(a as usize, pnl_a, ReserveMode::UseHLock(h_lock))?;
 
         let pnl_b = self.accounts[b as usize].pnl.checked_add(trade_pnl_b).ok_or(RiskError::Overflow)?;
         if pnl_b == i128::MIN { return Err(RiskError::Overflow); }
-        self.set_pnl(b as usize, pnl_b);
-
-        // Caller obligation: restart warmup if R increased
-        if self.accounts[a as usize].reserved_pnl > old_r_a {
-            self.restart_warmup_after_reserve_increase(a as usize);
-        }
-        if self.accounts[b as usize].reserved_pnl > old_r_b {
-            self.restart_warmup_after_reserve_increase(b as usize);
-        }
+        self.set_pnl_with_reserve(b as usize, pnl_b, ReserveMode::UseHLock(h_lock))?;
 
         // Step 8: attach effective positions
         self.attach_effective_position(a as usize, new_eff_a);
@@ -3901,7 +3890,7 @@ impl RiskEngine {
     ) -> Result<bool> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
 
-        // Bounds and existence check BEFORE touch_account_full_not_atomic to prevent
+        // Bounds and existence check BEFORE touch_account_live_local to prevent
         // market-state mutation (accrue_market_to) on missing accounts.
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Ok(false);
@@ -3932,7 +3921,7 @@ impl RiskEngine {
     }
 
     /// Internal liquidation routine: takes caller's shared InstructionContext.
-    /// Precondition (spec §9.4): caller has already called touch_account_full_not_atomic(i).
+    /// Precondition (spec §9.4): caller has already called touch_account_live_local(i).
     /// Does NOT call schedule/finalize resets — caller is responsible.
     fn liquidate_at_oracle_internal(
         &mut self,
@@ -4129,14 +4118,15 @@ impl RiskEngine {
             attempts += 1;
             let cidx = candidate_idx as usize;
 
-            // Per-candidate local exact-touch (spec §11.2): same as touch_account_full_not_atomic
-            // steps 7-13 on already-accrued state. MUST NOT call accrue_market_to again.
+            // Per-candidate local exact-touch (spec §11.2, v12.14.0):
+            // cohort-based warmup + h_lock side effects on already-accrued state.
+            // MUST NOT call accrue_market_to again.
 
-            // Step 7: advance_profit_warmup
-            self.advance_profit_warmup(cidx);
+            // Step 7: advance cohort-based warmup (spec §4.7)
+            self.advance_profit_warmup_cohort(cidx);
 
-            // Step 8: settle_side_effects (handles restart_warmup internally)
-            self.settle_side_effects(cidx)?;
+            // Step 8: settle side effects with h_lock (spec §5.3)
+            self.settle_side_effects_with_h_lock(cidx, h_lock)?;
 
             // Step 9: settle losses
             self.settle_losses(cidx);
@@ -4146,15 +4136,7 @@ impl RiskEngine {
                 self.resolve_flat_negative(cidx);
             }
 
-            // Step 11: maintenance fees (spec §8.2)
-            self.settle_maintenance_fee_internal(cidx, now_slot)?;
-
-            // Step 12: if flat, profit conversion
-            if self.accounts[cidx].position_basis_q == 0 {
-                self.do_profit_conversion(cidx);
-            }
-
-            // Step 13: fee debt sweep
+            // Step 11: fee debt sweep
             self.fee_debt_sweep(cidx);
 
             // Check if liquidatable after exact current-state touch.
@@ -4428,7 +4410,7 @@ impl RiskEngine {
     /// Force-close an account on a resolved market.
     ///
     /// `resolved_slot` is the market resolution boundary slot, used to anchor
-    /// `current_slot` and realize maintenance fees through that slot.
+    /// `current_slot`.
     ///
     /// Settles K-pair PnL, zeros position, settles losses, absorbs from
     /// insurance, converts profit (bypassing warmup), sweeps fee debt,
@@ -4520,8 +4502,8 @@ impl RiskEngine {
         // Step 1: Settle K-pair PnL and zero position.
         // Uses validate-then-mutate: compute pnl_delta and validate all checked
         // ops BEFORE any mutation, preventing partial-mutation-on-error.
-        // Does NOT call settle_side_effects (which interleaves mutations with
-        // fallible checked_sub on stale_count).
+        // Does NOT call settle_side_effects_with_h_lock (force_close uses inline
+        // validate-then-mutate for atomicity).
         if self.accounts[i].position_basis_q != 0 {
             let basis = self.accounts[i].position_basis_q;
             let abs_basis = basis.unsigned_abs();
@@ -4573,11 +4555,7 @@ impl RiskEngine {
 
             // Phase 2: MUTATE (all validated, safe to commit)
             if pnl_delta != 0 {
-                let old_r = self.accounts[i].reserved_pnl;
                 self.set_pnl(i, new_pnl);
-                if self.accounts[i].reserved_pnl > old_r {
-                    self.restart_warmup_after_reserve_increase(i);
-                }
             }
 
             // Decrement stale count (pre-validated above)
@@ -4622,19 +4600,15 @@ impl RiskEngine {
         // Step 3: Absorb any remaining flat negative PnL
         self.resolve_flat_negative(i);
 
-        // Step 3b: Realize recurring maintenance fees (spec §8.2).
-        // After losses and flat-negative absorption, matching touch_account_full_not_atomic
-        // ordering where fees are junior to trading losses.
-        self.settle_maintenance_fee_internal(i, self.current_slot)?;
-
         // Step 4: Convert positive PnL to capital (bypass warmup for resolved market).
-        // Uses the same release-then-haircut order as do_profit_conversion and
-        // convert_released_pnl_not_atomic. Sequential closers see progressively larger
-        // pnl_matured_pos_tot denominators, which is the same behavior as normal
-        // sequential profit conversion — this is inherent to the haircut model,
-        // not a force_close-specific issue.
+        // Uses the same release-then-haircut order as convert_released_pnl_not_atomic.
+        // Sequential closers see progressively larger pnl_matured_pos_tot denominators,
+        // which is the same behavior as normal sequential profit conversion — this is
+        // inherent to the haircut model, not a force_close-specific issue.
+        // No engine-native maintenance fee in v12.14.0 (spec §8).
         if self.accounts[i].pnl > 0 {
-            // Release all reserves unconditionally (bypass warmup)
+            // Release all reserves unconditionally (bypass warmup).
+            // set_reserved_pnl properly adjusts pnl_matured_pos_tot for the R → 0 transition.
             self.set_reserved_pnl(i, 0);
             // Convert using post-release haircut
             let released = self.released_pos(i);
@@ -4676,8 +4650,7 @@ impl RiskEngine {
 
     /// reclaim_empty_account_not_atomic(i, now_slot) — permissionless O(1) empty/dust-account recycling.
     /// Spec §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state,
-    /// MUST NOT materialize any account. Realizes recurring maintenance fees
-    /// on the already-flat state before checking final reclaim eligibility.
+    /// MUST NOT materialize any account.
     pub fn reclaim_empty_account_not_atomic(&mut self, idx: u16, now_slot: u64) -> Result<()> {
         if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
             return Err(RiskError::AccountNotFound);
@@ -4704,10 +4677,9 @@ impl RiskEngine {
         // Step 4: anchor current_slot
         self.current_slot = now_slot;
 
-        // Step 5: realize recurring maintenance fees (spec §8.2.3 item 3)
-        self.settle_maintenance_fee_internal(idx as usize, now_slot)?;
+        // No engine-native maintenance fee in v12.14.0 (spec §8).
 
-        // Step 6: final reclaim-eligibility check (spec §2.6)
+        // Step 5: final reclaim-eligibility check (spec §2.6)
         // C_i must be 0 or dust (< MIN_INITIAL_DEPOSIT)
         if self.accounts[idx as usize].capital.get() >= self.params.min_initial_deposit.get()
             && !self.accounts[idx as usize].capital.is_zero()
@@ -4775,13 +4747,9 @@ impl RiskEngine {
                 continue;
             }
 
-            // Realize recurring maintenance fees on already-flat state (spec §8.2.3).
-            // Only called after flat-clean preconditions are verified.
-            if self.settle_maintenance_fee_internal(idx, self.current_slot).is_err() {
-                continue;
-            }
+            // No engine-native maintenance fee in v12.14.0 (spec §8).
 
-            // Re-check capital after fee realization (fee may have reduced it)
+            // Check capital for dust eligibility
             if self.accounts[idx].capital.get() >= self.params.min_initial_deposit.get()
                 && !self.accounts[idx].capital.is_zero() {
                 continue;
