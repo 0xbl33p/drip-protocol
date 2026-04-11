@@ -114,6 +114,14 @@ pub const MAX_LIQUIDATION_FEE_BPS: u64 = 10_000;
 pub const MAX_PROTOCOL_FEE_ABS: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36, spec §1.4
 pub const MAX_MAINTENANCE_FEE_PER_SLOT: u128 = 10_000_000_000_000_000; // spec §1.4
 
+// Reserve cohort queue bounds (spec §1.4)
+pub const MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT: usize = 62;
+pub const MAX_OVERFLOW_RESERVE_SEGMENTS: usize = 2;
+pub const MAX_RESERVE_SEGMENTS_PER_ACCOUNT: usize =
+    MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT + MAX_OVERFLOW_RESERVE_SEGMENTS; // = 64
+pub const MAX_WARMUP_SLOTS: u64 = u64::MAX;
+pub const MAX_RESOLVE_PRICE_DEVIATION_BPS: u64 = 10_000;
+
 // ============================================================================
 // BPF-Safe 128-bit Types
 // ============================================================================
@@ -145,6 +153,40 @@ use wide_math::{
 // when casting raw slab bytes to &Account via zero-copy. u8 has no invalid
 // representations, so &*(ptr as *const Account) is always sound.
 // pub enum AccountKind { User = 0, LP = 1 }  // replaced by constants below
+
+/// Market mode (spec §2.2)
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketMode {
+    Live = 0,
+    Resolved = 1,
+}
+
+/// Reserve cohort (spec §6.1): one segment of time-locked positive PnL reserve.
+/// Used for both exact cohorts, overflow_older (scheduled), and overflow_newest (pending).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReserveCohort {
+    pub remaining_q: u128,
+    pub anchor_q: u128,
+    pub start_slot: u64,
+    pub horizon_slots: u64,
+    pub sched_release_q: u128,
+}
+
+impl ReserveCohort {
+    pub const EMPTY: Self = Self {
+        remaining_q: 0,
+        anchor_q: 0,
+        start_slot: 0,
+        horizon_slots: 0,
+        sched_release_q: 0,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        self.remaining_q == 0 && self.anchor_q == 0
+    }
+}
 
 /// Side mode for OI sides (spec §2.4)
 #[repr(u8)]
@@ -215,6 +257,17 @@ pub struct Account {
 
     /// Cumulative LP trading fees
     pub fees_earned_total: U128,
+
+    // ---- Reserve cohort queue (spec §6.1) ----
+    /// Exact reserve cohorts, oldest first. Only [0..exact_cohort_count) are active.
+    pub exact_reserve_cohorts: [ReserveCohort; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
+    pub exact_cohort_count: u8,
+    /// Preserved overflow (scheduled). Present iff overflow_older_present.
+    pub overflow_older: ReserveCohort,
+    pub overflow_older_present: bool,
+    /// Newest pending overflow. Present iff overflow_newest_present.
+    pub overflow_newest: ReserveCohort,
+    pub overflow_newest_present: bool,
 }
 
 impl Account {
@@ -249,6 +302,12 @@ fn empty_account() -> Account {
         fee_credits: I128::ZERO,
         last_fee_slot: 0,
         fees_earned_total: U128::ZERO,
+        exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
+        exact_cohort_count: 0,
+        overflow_older: ReserveCohort::EMPTY,
+        overflow_older_present: false,
+        overflow_newest: ReserveCohort::EMPTY,
+        overflow_newest_present: false,
     }
 }
 
@@ -280,6 +339,11 @@ pub struct RiskParams {
     pub min_nonzero_im_req: u128,
     /// Insurance fund floor (spec §1.4: 0 <= I_floor <= MAX_VAULT_TVL)
     pub insurance_floor: U128,
+    /// Warmup horizon bounds (spec §6.1)
+    pub h_min: u64,
+    pub h_max: u64,
+    /// Resolved settlement price deviation bound (spec §10.7)
+    pub resolve_price_deviation_bps: u64,
 }
 
 /// Main risk engine state (spec §2.2)
@@ -293,6 +357,12 @@ pub struct RiskEngine {
 
     /// Stored funding rate for anti-retroactivity
     pub funding_rate_e9_per_slot_last: i128,
+
+    /// Market mode (spec §2.2)
+    pub market_mode: MarketMode,
+    /// Resolved market state
+    pub resolved_price: u64,
+    pub resolved_slot: u64,
 
     // Keeper crank tracking
     pub last_crank_slot: u64,
@@ -532,6 +602,18 @@ impl RiskEngine {
             params.insurance_floor.get() <= MAX_VAULT_TVL,
             "insurance_floor must be <= MAX_VAULT_TVL (spec §1.4)"
         );
+
+        // Warmup horizon bounds (spec §6.1)
+        assert!(
+            params.h_min <= params.h_max,
+            "h_min must be <= h_max (spec §6.1)"
+        );
+
+        // Resolve price deviation (spec §10.7)
+        assert!(
+            params.resolve_price_deviation_bps <= MAX_RESOLVE_PRICE_DEVIATION_BPS,
+            "resolve_price_deviation_bps must be <= MAX_RESOLVE_PRICE_DEVIATION_BPS"
+        );
     }
 
     /// Create a new risk engine for testing. Initializes with
@@ -557,6 +639,9 @@ impl RiskEngine {
             params,
             current_slot: init_slot,
             funding_rate_e9_per_slot_last: 0,
+            market_mode: MarketMode::Live,
+            resolved_price: 0,
+            resolved_slot: 0,
             last_crank_slot: 0,
             max_crank_staleness_slots: params.max_crank_staleness_slots,
             c_tot: U128::ZERO,
@@ -620,6 +705,9 @@ impl RiskEngine {
         self.params = params;
         self.current_slot = init_slot;
         self.funding_rate_e9_per_slot_last = 0;
+        self.market_mode = MarketMode::Live;
+        self.resolved_price = 0;
+        self.resolved_slot = 0;
         self.last_crank_slot = 0;
         self.max_crank_staleness_slots = params.max_crank_staleness_slots;
         self.c_tot = U128::ZERO;
@@ -824,6 +912,13 @@ impl RiskEngine {
             fee_credits: I128::ZERO,
             last_fee_slot: slot_anchor,
             fees_earned_total: U128::ZERO,
+
+            exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
+            exact_cohort_count: 0,
+            overflow_older: ReserveCohort::EMPTY,
+            overflow_older_present: false,
+            overflow_newest: ReserveCohort::EMPTY,
+            overflow_newest_present: false,
         };
 
         Ok(())
@@ -2308,6 +2403,13 @@ impl RiskEngine {
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
             fees_earned_total: U128::ZERO,
+
+            exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
+            exact_cohort_count: 0,
+            overflow_older: ReserveCohort::EMPTY,
+            overflow_older_present: false,
+            overflow_newest: ReserveCohort::EMPTY,
+            overflow_newest_present: false,
         };
 
         if excess > 0 {
@@ -2385,6 +2487,13 @@ impl RiskEngine {
             fee_credits: I128::ZERO,
             last_fee_slot: self.current_slot,
             fees_earned_total: U128::ZERO,
+
+            exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
+            exact_cohort_count: 0,
+            overflow_older: ReserveCohort::EMPTY,
+            overflow_older_present: false,
+            overflow_newest: ReserveCohort::EMPTY,
+            overflow_newest_present: false,
         };
 
         if excess > 0 {
