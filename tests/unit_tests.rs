@@ -2962,3 +2962,66 @@ fn test_advance_profit_warmup_cohort_multiple_cohorts() {
     assert_eq!(engine.accounts[idx as usize].reserved_pnl, 2_500);
     assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1, "fully matured cohort removed");
 }
+
+#[test]
+fn test_set_pnl_with_reserve_positive_increase_creates_cohort() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 100_000, 1000, 100).unwrap();
+    engine.current_slot = 100;
+
+    // Set PnL from 0 to 10_000 with H_lock=50
+    engine.set_pnl_with_reserve(idx as usize, 10_000, ReserveMode::UseHLock(50)).unwrap();
+
+    assert_eq!(engine.accounts[idx as usize].pnl, 10_000);
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 10_000);
+    assert_eq!(engine.accounts[idx as usize].exact_cohort_count, 1);
+    assert_eq!(engine.pnl_pos_tot, 10_000);
+    // Matured should NOT increase (reserve not yet matured)
+    assert_eq!(engine.pnl_matured_pos_tot, 0);
+}
+
+#[test]
+fn test_set_pnl_with_reserve_immediate_release() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 100_000, 1000, 100).unwrap();
+
+    engine.set_pnl_with_reserve(idx as usize, 10_000, ReserveMode::ImmediateRelease).unwrap();
+
+    assert_eq!(engine.accounts[idx as usize].pnl, 10_000);
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 0); // no reserve
+    assert_eq!(engine.pnl_matured_pos_tot, 10_000); // immediately matured
+}
+
+#[test]
+fn test_set_pnl_with_reserve_negative_lifo_loss() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 100_000, 1000, 100).unwrap();
+    engine.current_slot = 100;
+
+    // Start with 10_000 reserved
+    engine.set_pnl_with_reserve(idx as usize, 10_000, ReserveMode::UseHLock(50)).unwrap();
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 10_000);
+
+    // PnL drops to 3_000 → loss of 7_000 from positive, consumed from reserve LIFO
+    engine.set_pnl_with_reserve(idx as usize, 3_000, ReserveMode::NoPositiveIncreaseAllowed).unwrap();
+
+    assert_eq!(engine.accounts[idx as usize].pnl, 3_000);
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 3_000); // 10_000 - 7_000
+    assert_eq!(engine.pnl_pos_tot, 3_000);
+}
+
+#[test]
+fn test_set_pnl_with_reserve_h_lock_zero_immediate() {
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    engine.deposit(idx, 100_000, 1000, 100).unwrap();
+
+    // H_lock = 0 means immediate release (no cohort)
+    engine.set_pnl_with_reserve(idx as usize, 5_000, ReserveMode::UseHLock(0)).unwrap();
+
+    assert_eq!(engine.accounts[idx as usize].reserved_pnl, 0);
+    assert_eq!(engine.pnl_matured_pos_tot, 5_000);
+}

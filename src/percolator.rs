@@ -188,6 +188,17 @@ impl ReserveCohort {
     }
 }
 
+/// Reserve mode for set_pnl (spec §4.5, v12.14.0)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveMode {
+    /// Route positive increase into cohort queue with this horizon
+    UseHLock(u64),
+    /// Positive increase is immediately released (no reserve)
+    ImmediateRelease,
+    /// Positive increase is forbidden (returns Err)
+    NoPositiveIncreaseAllowed,
+}
+
 /// Side mode for OI sides (spec §2.4)
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -990,6 +1001,105 @@ impl RiskEngine {
         // Steps 14-15: write PNL_i and R_i
         self.accounts[idx].pnl = new_pnl;
         self.accounts[idx].reserved_pnl = new_r;
+    }
+    }
+
+    /// set_pnl with reserve_mode (spec §4.5, v12.14.0).
+    /// Canonical PNL mutation that routes positive increases through the cohort queue.
+    test_visible! {
+    fn set_pnl_with_reserve(&mut self, idx: usize, new_pnl: i128, reserve_mode: ReserveMode) -> Result<()> {
+        assert!(new_pnl != i128::MIN, "set_pnl_with_reserve: i128::MIN forbidden");
+
+        let old = self.accounts[idx].pnl;
+        let old_pos = i128_clamp_pos(old);
+        let old_rel = if self.market_mode == MarketMode::Live {
+            old_pos - self.accounts[idx].reserved_pnl
+        } else {
+            assert!(self.accounts[idx].reserved_pnl == 0);
+            old_pos
+        };
+        let new_pos = i128_clamp_pos(new_pnl);
+
+        assert!(new_pos <= MAX_ACCOUNT_POSITIVE_PNL, "set_pnl_with_reserve: exceeds MAX_ACCOUNT_POSITIVE_PNL");
+
+        // Step 3: update PNL_pos_tot
+        if new_pos > old_pos {
+            let delta = new_pos - old_pos;
+            self.pnl_pos_tot = self.pnl_pos_tot.checked_add(delta)
+                .expect("set_pnl_with_reserve: pnl_pos_tot overflow");
+        } else if old_pos > new_pos {
+            let delta = old_pos - new_pos;
+            self.pnl_pos_tot = self.pnl_pos_tot.checked_sub(delta)
+                .expect("set_pnl_with_reserve: pnl_pos_tot underflow");
+        }
+        assert!(self.pnl_pos_tot <= MAX_PNL_POS_TOT);
+
+        if new_pos > old_pos {
+            // Case A: positive increase
+            let reserve_add = new_pos - old_pos;
+            self.accounts[idx].pnl = new_pnl;
+
+            match reserve_mode {
+                ReserveMode::NoPositiveIncreaseAllowed => {
+                    return Err(RiskError::Overflow);
+                }
+                ReserveMode::ImmediateRelease => {
+                    self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
+                        .expect("pnl_matured_pos_tot overflow");
+                    assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot);
+                    return Ok(());
+                }
+                ReserveMode::UseHLock(h_lock) => {
+                    if h_lock == 0 {
+                        self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
+                            .expect("pnl_matured_pos_tot overflow");
+                        assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot);
+                        return Ok(());
+                    }
+                    assert!(self.market_mode == MarketMode::Live,
+                        "set_pnl_with_reserve: UseHLock requires Live market");
+                    assert!(h_lock >= self.params.h_min && h_lock <= self.params.h_max,
+                        "set_pnl_with_reserve: H_lock out of bounds");
+                    self.append_or_route_new_reserve(idx, reserve_add, self.current_slot, h_lock);
+                    // PNL_matured_pos_tot unchanged (reserve is not yet matured)
+                    assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot);
+                    return Ok(());
+                }
+            }
+        } else {
+            // Case B: no positive increase
+            let pos_loss = old_pos - new_pos;
+            if self.market_mode == MarketMode::Live {
+                let reserve_loss = core::cmp::min(pos_loss, self.accounts[idx].reserved_pnl);
+                if reserve_loss > 0 {
+                    self.apply_reserve_loss_lifo(idx, reserve_loss);
+                }
+                let matured_loss = pos_loss - reserve_loss;
+                if matured_loss > 0 {
+                    self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_sub(matured_loss)
+                        .expect("pnl_matured_pos_tot underflow");
+                }
+            } else {
+                // Resolved: R_i must be 0
+                assert!(self.accounts[idx].reserved_pnl == 0);
+                if pos_loss > 0 {
+                    self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_sub(pos_loss)
+                        .expect("pnl_matured_pos_tot underflow (resolved)");
+                }
+            }
+            self.accounts[idx].pnl = new_pnl;
+
+            // Step 20: if new_pos == 0 and Live, require empty queue
+            if new_pos == 0 && self.market_mode == MarketMode::Live {
+                assert!(self.accounts[idx].reserved_pnl == 0);
+                assert!(self.accounts[idx].exact_cohort_count == 0);
+                assert!(!self.accounts[idx].overflow_older_present);
+                assert!(!self.accounts[idx].overflow_newest_present);
+            }
+
+            assert!(self.pnl_matured_pos_tot <= self.pnl_pos_tot);
+            return Ok(());
+        }
     }
     }
 
