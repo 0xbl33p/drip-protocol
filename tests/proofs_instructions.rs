@@ -326,12 +326,12 @@ fn t10_38_accrue_funding_payer_driven() {
     let k_long_after = engine.adl_coeff_long;
     let k_short_after = engine.adl_coeff_short;
 
-    // Engine computes: fund_term = floor_div_signed_conservative(fund_px_0 * rate * dt / 10000)
+    // Engine computes: fund_term = floor_div_signed_conservative(fund_px_0 * rate * dt / 1e9)
     // With fund_px_0=100, dt=1: fund_num = 100 * rate * 1 = 100 * rate
-    // fund_term = floor(fund_num / 10000)
+    // fund_term = floor(fund_num / 1_000_000_000)
     // delta_k = A_side * fund_term
     let fund_num = 100i128 * (rate as i128);
-    let fund_term = floor_div_signed_conservative_i128(fund_num, 10_000u128);
+    let fund_term = floor_div_signed_conservative_i128(fund_num, 1_000_000_000u128);
 
     // K_long -= A_long * fund_term, K_short += A_short * fund_term
     let a_long = ADL_ONE as i128;

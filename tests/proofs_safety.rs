@@ -599,16 +599,16 @@ fn t5_22_phantom_dust_total_bound() {
     let a_basis: u16 = kani::any();
     kani::assume(a_basis > 0 && a_cur > 0 && a_cur <= a_basis);
 
-    let basis_q1 = (q1 as u16) * S_POS_SCALE;
-    let basis_q2 = (q2 as u16) * S_POS_SCALE;
+    let basis_q1 = (q1 as u32) * (S_POS_SCALE as u32);
+    let basis_q2 = (q2 as u32) * (S_POS_SCALE as u32);
 
-    let rem1 = (basis_q1 as u16) * (a_cur as u16) % (a_basis as u16);
-    let rem2 = (basis_q2 as u16) * (a_cur as u16) % (a_basis as u16);
+    let rem1 = (basis_q1 as u32) * (a_cur as u32) % (a_basis as u32);
+    let rem2 = (basis_q2 as u32) * (a_cur as u32) % (a_basis as u32);
 
-    assert!(rem1 < a_basis as u16);
-    assert!(rem2 < a_basis as u16);
+    assert!(rem1 < a_basis as u32);
+    assert!(rem2 < a_basis as u32);
 
-    assert!(rem1 + rem2 < 2 * (a_basis as u16),
+    assert!(rem1 + rem2 < 2 * (a_basis as u32),
         "total dust from 2 accounts < 2 effective units");
 }
 
@@ -1350,11 +1350,12 @@ fn proof_property_3_oracle_manipulation_haircut_safety() {
     // Both deposit enough for trading
     engine.deposit(a, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0).unwrap();
+    let h_lock = 10u64; // non-zero so PnL goes to cohort reserve
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, h_lock).unwrap();
 
     // Open positions: a long, b short
     let size_q = (100 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, h_lock).unwrap();
 
     // Capture h before oracle spike
     let (h_num_before, h_den_before) = engine.haircut_ratio();
@@ -1362,7 +1363,7 @@ fn proof_property_3_oracle_manipulation_haircut_safety() {
     // Oracle spikes up — a has fresh unrealized profit
     let spike_oracle: u64 = 1_500;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank_not_atomic(slot2, spike_oracle, &[(a, None), (b, None)], 64, 0i128, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot2, spike_oracle, &[(a, None), (b, None)], 64, 0i128, h_lock).unwrap();
 
     // After touch, a has positive PnL but it's reserved (R_i > 0)
     let pnl_a = engine.accounts[a as usize].pnl;
@@ -1415,20 +1416,16 @@ fn proof_property_26_maintenance_vs_im_dual_equity() {
     // a deposits minimal capital, b deposits large
     engine.deposit(a, 20_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     engine.deposit(b, 1_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, 0).unwrap();
+    let h_lock = 10u64; // non-zero so PnL goes to cohort reserve
+    engine.keeper_crank_not_atomic(DEFAULT_SLOT, DEFAULT_ORACLE, &[], 0, 0i128, h_lock).unwrap();
 
-    // Open position: a long 100 units at oracle=1000
-
-    // Notional = 100 * 1000 = 100_000
-    // IM_req = max(100_000 * 10%, MIN_NONZERO_IM_REQ) = 10_000
-    // MM_req = max(100_000 * 5%, MIN_NONZERO_MM_REQ) = 5_000
     let size_q = (100 * POS_SCALE) as i128;
-    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, 0).unwrap();
+    engine.execute_trade_not_atomic(a, b, DEFAULT_ORACLE, DEFAULT_SLOT, size_q, DEFAULT_ORACLE, 0i128, h_lock).unwrap();
 
-    // Oracle moves up — a gains profit that is reserved
+    // Oracle moves up — a gains profit that is reserved (h_lock>0 routes to cohort queue)
     let new_oracle: u64 = 1_100;
     let slot2 = DEFAULT_SLOT + 1;
-    engine.keeper_crank_not_atomic(slot2, new_oracle, &[(a, None), (b, None)], 64, 0i128, 0).unwrap();
+    engine.keeper_crank_not_atomic(slot2, new_oracle, &[(a, None), (b, None)], 64, 0i128, h_lock).unwrap();
 
     // a now has fresh PnL from price increase. This PnL is reserved.
     let pnl_a = engine.accounts[a as usize].pnl;
