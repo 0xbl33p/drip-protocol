@@ -3890,7 +3890,7 @@ fn funding_new_entrant_must_not_inherit_old_fraction() {
 }
 
 #[test]
-#[ignore] // TODO: investigate why funding K-delta not reflected in PnL after settle
+#[ignore] // TODO: sign test needs different setup — setup_two_users init_oracle_price=1 causes large mark delta
 fn funding_basic_sign_convention() {
     // Positive rate: longs pay shorts.
     let (mut engine, a, b) = setup_two_users(500_000, 500_000);

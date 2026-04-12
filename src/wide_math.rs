@@ -995,7 +995,7 @@ fn leading_zeros_u256(v: U256) -> u32 {
 }
 
 /// Divide U256 by U256, returning (quotient, remainder). Panics if divisor is zero.
-fn div_rem_u256(num: U256, den: U256) -> (U256, U256) {
+pub fn div_rem_u256(num: U256, den: U256) -> (U256, U256) {
     if den.is_zero() {
         panic!("U256 division by zero");
     }

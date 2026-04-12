@@ -1,6 +1,6 @@
-//! Formally Verified Risk Engine for Perpetual DEX — v12.14.0
+//! Formally Verified Risk Engine for Perpetual DEX — v12.15.0
 //!
-//! Implements the v12.14.0 spec: Native 128-bit Architecture.
+//! Implements the v12.15.0 spec: High-Precision Funding Architecture.
 //!
 //! This module implements a formally verified risk engine that guarantees:
 //! 1. Protected principal for flat accounts
@@ -99,6 +99,9 @@ pub const MAX_ORACLE_PRICE: u64 = 1_000_000_000_000;
 
 /// MAX_FUNDING_DT = 65535 (spec §1.4)
 pub const MAX_FUNDING_DT: u64 = u16::MAX as u64;
+
+/// FUNDING_DEN = 1_000_000_000 (spec v12.15 §5.4)
+pub const FUNDING_DEN: u128 = 1_000_000_000;
 
 /// MAX_ABS_FUNDING_E9_PER_SLOT = 1_000_000_000 (spec §1.4, parts-per-billion)
 pub const MAX_ABS_FUNDING_E9_PER_SLOT: i128 = 1_000_000_000;
@@ -285,6 +288,9 @@ pub struct Account {
     /// K coefficient snapshot (i128)
     pub adl_k_snap: i128,
 
+    /// Per-account funding snapshot at last attachment (v12.15)
+    pub f_snap: i128,
+
     /// Side epoch snapshot
     pub adl_epoch_snap: u64,
 
@@ -336,6 +342,7 @@ fn empty_account() -> Account {
         position_basis_q: 0i128,
         adl_a_basis: ADL_ONE,
         adl_k_snap: 0i128,
+        f_snap: 0i128,
         adl_epoch_snap: 0,
         matcher_program: [0; 32],
         matcher_context: [0; 32],
@@ -456,8 +463,14 @@ pub struct RiskEngine {
     /// Funding price sample (for anti-retroactivity)
     pub funding_price_sample_last: u64,
 
-    /// Signed funding remainder accumulator for exact carry (no per-step floor bias)
-    pub funding_remainder: i128,
+    /// Cumulative funding numerator for long side (v12.15)
+    pub f_long_num: i128,
+    /// Cumulative funding numerator for short side (v12.15)
+    pub f_short_num: i128,
+    /// F snapshot at epoch start for long side (v12.15)
+    pub f_epoch_start_long_num: i128,
+    /// F snapshot at epoch start for short side (v12.15)
+    pub f_epoch_start_short_num: i128,
 
 
     // Insurance floor is read from self.params.insurance_floor (no duplicate field)
@@ -756,7 +769,10 @@ impl RiskEngine {
             oracle_initialized: 0,
             last_market_slot: init_slot,
             funding_price_sample_last: init_oracle_price,
-            funding_remainder: 0,
+            f_long_num: 0,
+            f_short_num: 0,
+            f_epoch_start_long_num: 0,
+            f_epoch_start_short_num: 0,
             used: [0; BITMAP_WORDS],
             num_used_accounts: 0,
             next_account_id: 0,
@@ -822,7 +838,10 @@ impl RiskEngine {
         self.oracle_initialized = 0;
         self.last_market_slot = init_slot;
         self.funding_price_sample_last = init_oracle_price;
-        self.funding_remainder = 0;
+        self.f_long_num = 0;
+        self.f_short_num = 0;
+        self.f_epoch_start_long_num = 0;
+        self.f_epoch_start_short_num = 0;
         // insurance_floor is now read directly from self.params.insurance_floor
         self.used = [0; BITMAP_WORDS];
         self.num_used_accounts = 0;
@@ -908,6 +927,7 @@ impl RiskEngine {
         a.position_basis_q = 0;
         a.adl_a_basis = ADL_ONE;
         a.adl_k_snap = 0;
+        a.f_snap = 0;
         a.adl_epoch_snap = 0;
         a.matcher_program = [0; 32];
         a.matcher_context = [0; 32];
@@ -996,6 +1016,7 @@ impl RiskEngine {
             a.position_basis_q = 0i128;
             a.adl_a_basis = ADL_ONE;
             a.adl_k_snap = 0i128;
+            a.f_snap = 0i128;
             a.adl_epoch_snap = 0;
             a.matcher_program = [0; 32];
             a.matcher_context = [0; 32];
@@ -1260,6 +1281,7 @@ impl RiskEngine {
             // Reset to canonical zero-position defaults (spec §2.4)
             self.accounts[idx].adl_a_basis = ADL_ONE;
             self.accounts[idx].adl_k_snap = 0i128;
+            self.accounts[idx].f_snap = 0i128;
             self.accounts[idx].adl_epoch_snap = 0;
         } else {
             // Spec §4.6: abs(new_eff_pos_q) <= MAX_POSITION_ABS_Q
@@ -1274,11 +1296,13 @@ impl RiskEngine {
                 Side::Long => {
                     self.accounts[idx].adl_a_basis = self.adl_mult_long;
                     self.accounts[idx].adl_k_snap = self.adl_coeff_long;
+                    self.accounts[idx].f_snap = self.f_long_num;
                     self.accounts[idx].adl_epoch_snap = self.adl_epoch_long;
                 }
                 Side::Short => {
                     self.accounts[idx].adl_a_basis = self.adl_mult_short;
                     self.accounts[idx].adl_k_snap = self.adl_coeff_short;
+                    self.accounts[idx].f_snap = self.f_short_num;
                     self.accounts[idx].adl_epoch_snap = self.adl_epoch_short;
                 }
             }
@@ -1315,6 +1339,20 @@ impl RiskEngine {
         match s {
             Side::Long => self.adl_epoch_start_k_long,
             Side::Short => self.adl_epoch_start_k_short,
+        }
+    }
+
+    fn get_f_side(&self, s: Side) -> i128 {
+        match s {
+            Side::Long => self.f_long_num,
+            Side::Short => self.f_short_num,
+        }
+    }
+
+    fn get_f_epoch_start(&self, s: Side) -> i128 {
+        match s {
+            Side::Long => self.f_epoch_start_long_num,
+            Side::Short => self.f_epoch_start_short_num,
         }
     }
 
@@ -1357,6 +1395,40 @@ impl RiskEngine {
         match s {
             Side::Long => self.adl_coeff_long = v,
             Side::Short => self.adl_coeff_short = v,
+        }
+    }
+
+    /// Compute per-account F-delta PnL (v12.15).
+    /// result = floor(abs_basis * (f_now - f_snap) / (den * FUNDING_DEN))
+    /// Uses I256/U256 wide arithmetic to avoid i128 overflow.
+    /// Mirrors the pattern of wide_signed_mul_div_floor_from_k_pair.
+    fn compute_f_pnl_delta(abs_basis: u128, f_snap: i128, f_now: i128, den: u128) -> Result<i128> {
+        // Compute f_diff = f_now - f_snap in wide signed arithmetic
+        let f_diff_wide = I256::from_i128(f_now).checked_sub(I256::from_i128(f_snap))
+            .ok_or(RiskError::Overflow)?;
+        if f_diff_wide.is_zero() || abs_basis == 0 {
+            return Ok(0i128);
+        }
+        let negative = f_diff_wide.is_negative();
+        let abs_diff = f_diff_wide.abs_u256();
+        let abs_basis_u256 = U256::from_u128(abs_basis);
+        let den_wide = U256::from_u128(den).checked_mul(U256::from_u128(FUNDING_DEN))
+            .ok_or(RiskError::Overflow)?;
+        // p = abs_basis * |f_diff|, exact wide product
+        let p = abs_basis_u256.checked_mul(abs_diff).ok_or(RiskError::Overflow)?;
+        let (q, rem) = wide_math::div_rem_u256(p, den_wide);
+        if negative {
+            // floor(-x) = -(x + 1) if remainder != 0, else -x
+            let mag = if !rem.is_zero() {
+                q.checked_add(U256::ONE).ok_or(RiskError::Overflow)?
+            } else { q };
+            let mag_u128 = mag.try_into_u128().ok_or(RiskError::Overflow)?;
+            if mag_u128 > i128::MAX as u128 { return Err(RiskError::Overflow); }
+            Ok(-(mag_u128 as i128))
+        } else {
+            let q_u128 = q.try_into_u128().ok_or(RiskError::Overflow)?;
+            if q_u128 > i128::MAX as u128 { return Err(RiskError::Overflow); }
+            Ok(q_u128 as i128)
         }
     }
 
@@ -1478,7 +1550,14 @@ impl RiskEngine {
             let k_snap = self.accounts[idx].adl_k_snap;
             let q_eff_new = mul_div_floor_u128(abs_basis, a_side, a_basis);
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_side, den);
+            let pnl_delta_k = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_side, den);
+
+            // F-delta PnL (v12.15): floor(abs_basis * f_diff / (den * FUNDING_DEN))
+            let f_side = self.get_f_side(side);
+            let f_snap = self.accounts[idx].f_snap;
+            let pnl_delta_f = Self::compute_f_pnl_delta(abs_basis, f_snap, f_side, den)?;
+
+            let pnl_delta = pnl_delta_k.checked_add(pnl_delta_f).ok_or(RiskError::Overflow)?;
 
             let new_pnl = self.accounts[idx].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
@@ -1491,9 +1570,11 @@ impl RiskEngine {
                 self.set_position_basis_q(idx, 0i128);
                 self.accounts[idx].adl_a_basis = ADL_ONE;
                 self.accounts[idx].adl_k_snap = 0i128;
+                self.accounts[idx].f_snap = 0i128;
                 self.accounts[idx].adl_epoch_snap = 0;
             } else {
                 self.accounts[idx].adl_k_snap = k_side;
+                self.accounts[idx].f_snap = f_side;
                 self.accounts[idx].adl_epoch_snap = epoch_side;
             }
         } else {
@@ -1505,7 +1586,14 @@ impl RiskEngine {
             let k_epoch_start = self.get_k_epoch_start(side);
             let k_snap = self.accounts[idx].adl_k_snap;
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
+            let pnl_delta_k = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_epoch_start, den);
+
+            // F-delta PnL for epoch mismatch (v12.15)
+            let f_end = self.get_f_epoch_start(side);
+            let f_snap = self.accounts[idx].f_snap;
+            let pnl_delta_f = Self::compute_f_pnl_delta(abs_basis, f_snap, f_end, den)?;
+
+            let pnl_delta = pnl_delta_k.checked_add(pnl_delta_f).ok_or(RiskError::Overflow)?;
 
             let new_pnl = self.accounts[idx].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
@@ -1520,6 +1608,7 @@ impl RiskEngine {
             self.set_stale_count(side, new_stale);
             self.accounts[idx].adl_a_basis = ADL_ONE;
             self.accounts[idx].adl_k_snap = 0i128;
+            self.accounts[idx].f_snap = 0i128;
             self.accounts[idx].adl_epoch_snap = 0;
         }
 
@@ -1581,14 +1670,18 @@ impl RiskEngine {
             }
         }
 
-        // Step 6: Funding transfer via sub-stepping (spec v12.14.0 §5.4)
+        // Step 6: Funding transfer via sub-stepping (spec v12.15 §5.4)
+        // K gets the integer fund_term (backward compatible). F accumulates
+        // the per-side fractional remainder for high-precision per-account settlement.
         let r_last = self.funding_rate_e9_per_slot_last;
-        let mut fund_accum = self.funding_remainder;
+        let mut f_long = self.f_long_num;
+        let mut f_short = self.f_short_num;
         if r_last != 0 && total_dt > 0 && long_live && short_live {
             let fund_px_0 = self.funding_price_sample_last;
 
             if fund_px_0 > 0 {
                 let mut dt_remaining = total_dt;
+                let mut fund_accum: i128 = 0;
 
                 while dt_remaining > 0 {
                     let dt_sub = core::cmp::min(dt_remaining, MAX_FUNDING_DT);
@@ -1601,10 +1694,10 @@ impl RiskEngine {
                         .checked_mul(dt_sub as i128)
                         .ok_or(RiskError::Overflow)?;
 
-                    // Accumulate with carry — symmetric rounding via truncation
+                    // Integer part goes into K (backward compatible)
                     fund_accum = fund_accum.checked_add(fund_num).ok_or(RiskError::Overflow)?;
-                    let fund_term = fund_accum / (1_000_000_000i128);
-                    fund_accum -= fund_term * 1_000_000_000i128;
+                    let fund_term = fund_accum / (FUNDING_DEN as i128);
+                    fund_accum -= fund_term * (FUNDING_DEN as i128);
 
                     if fund_term != 0 {
                         let dk_long = checked_u128_mul_i128(self.adl_mult_long, fund_term)?;
@@ -1612,14 +1705,31 @@ impl RiskEngine {
                         let dk_short = checked_u128_mul_i128(self.adl_mult_short, fund_term)?;
                         k_short = k_short.checked_add(dk_short).ok_or(RiskError::Overflow)?;
                     }
+
+                    // F tracks the remainder delta (fractional correction per side)
+                    // remainder_delta = fund_accum - old_accum + fund_term * FUNDING_DEN
+                    //                 = fund_num   (by algebra: old + fund_num = fund_term * DEN + new_accum)
+                    // Wait, we want only the remainder contribution. The remainder changed from
+                    // old_accum to fund_accum. If fund_term was extracted, the remainder delta is
+                    // fund_num - fund_term * FUNDING_DEN = the sub-unit part of this step.
+                    let remainder_delta = fund_num.checked_sub(
+                        fund_term.checked_mul(FUNDING_DEN as i128).ok_or(RiskError::Overflow)?
+                    ).ok_or(RiskError::Overflow)?;
+                    if remainder_delta != 0 {
+                        let df_long = checked_u128_mul_i128(self.adl_mult_long, remainder_delta)?;
+                        f_long = f_long.checked_sub(df_long).ok_or(RiskError::Overflow)?;
+                        let df_short = checked_u128_mul_i128(self.adl_mult_short, remainder_delta)?;
+                        f_short = f_short.checked_add(df_short).ok_or(RiskError::Overflow)?;
+                    }
                 }
             }
         }
 
-        // ALL computations succeeded — commit K values and synchronize state
+        // ALL computations succeeded — commit K/F values and synchronize state
         self.adl_coeff_long = k_long;
         self.adl_coeff_short = k_short;
-        self.funding_remainder = fund_accum;
+        self.f_long_num = f_long;
+        self.f_short_num = f_short;
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
@@ -1861,6 +1971,12 @@ impl RiskEngine {
         match side {
             Side::Long => self.adl_epoch_start_k_long = k,
             Side::Short => self.adl_epoch_start_k_short = k,
+        }
+
+        // F_epoch_start_side = F_side (v12.15)
+        match side {
+            Side::Long => self.f_epoch_start_long_num = self.f_long_num,
+            Side::Short => self.f_epoch_start_short_num = self.f_short_num,
         }
 
         // Increment epoch
@@ -2838,6 +2954,7 @@ impl RiskEngine {
             a.position_basis_q = 0i128;
             a.adl_a_basis = ADL_ONE;
             a.adl_k_snap = 0i128;
+            a.f_snap = 0i128;
             a.adl_epoch_snap = 0;
             a.matcher_program = matcher_program;
             a.matcher_context = matcher_context;
@@ -4453,12 +4570,9 @@ impl RiskEngine {
         // Save and zero funding state for zero-funding final accrual.
         // Restore on error to maintain validate-then-mutate contract.
         let saved_rate = self.funding_rate_e9_per_slot_last;
-        let saved_rem = self.funding_remainder;
         self.funding_rate_e9_per_slot_last = 0;
-        self.funding_remainder = 0;
         if let Err(e) = self.accrue_market_to(now_slot, resolved_price) {
             self.funding_rate_e9_per_slot_last = saved_rate;
-            self.funding_remainder = saved_rem;
             return Err(e);
         }
 
@@ -4545,15 +4659,20 @@ impl RiskEngine {
             let a_basis = self.accounts[i].adl_a_basis;
             if a_basis == 0 { return Err(RiskError::CorruptState); }
             let k_snap = self.accounts[i].adl_k_snap;
+            let f_snap_acct = self.accounts[i].f_snap;
             let side = side_of_i128(basis).unwrap();
             let epoch_snap = self.accounts[i].adl_epoch_snap;
             let epoch_side = self.get_epoch_side(side);
 
-            let k_end = if epoch_snap == epoch_side {
-                self.get_k_side(side)
-            } else { self.get_k_epoch_start(side) };
+            let (k_end, f_end) = if epoch_snap == epoch_side {
+                (self.get_k_side(side), self.get_f_side(side))
+            } else {
+                (self.get_k_epoch_start(side), self.get_f_epoch_start(side))
+            };
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
-            let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den);
+            let pnl_delta_k = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den);
+            let pnl_delta_f = Self::compute_f_pnl_delta(abs_basis, f_snap_acct, f_end, den)?;
+            let pnl_delta = pnl_delta_k.checked_add(pnl_delta_f).ok_or(RiskError::Overflow)?;
             let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
             if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
@@ -4580,6 +4699,7 @@ impl RiskEngine {
             self.set_position_basis_q(i, 0);
             self.accounts[i].adl_a_basis = ADL_ONE;
             self.accounts[i].adl_k_snap = 0;
+            self.accounts[i].f_snap = 0;
             self.accounts[i].adl_epoch_snap = 0;
         }
 
