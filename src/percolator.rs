@@ -3675,6 +3675,11 @@ impl RiskEngine {
             return Err(RiskError::Unauthorized);
         }
 
+        // Clamp max_revalidations to MAX_TOUCHED_PER_INSTRUCTION to ensure
+        // finalize_touched_accounts_post_live can process all touched accounts.
+        let max_revalidations = core::cmp::min(
+            max_revalidations, MAX_TOUCHED_PER_INSTRUCTION as u16);
+
         // Step 1: initialize instruction context
         let mut ctx = InstructionContext::new_with_h_lock(h_lock);
 
@@ -4231,18 +4236,9 @@ impl RiskEngine {
         let (h_num, h_den) = self.haircut_ratio();
         assert!(h_den > 0, "convert_released_pnl_not_atomic: h_den must be > 0 when x_req > 0");
 
-        // Step 6a: safe conversion ceiling — reject if x_req exceeds per-account
-        // safe maximum. x_safe = floor(released * h_den / (h_den - h_num)) when h < 1.
-        // Converting more than x_safe would reduce the account's equity below zero
-        // after the haircut loss is absorbed.
-        if h_den > h_num {
-            let gap = h_den - h_num;
-            let x_safe = wide_mul_div_floor_u128(released, h_den, gap);
-            if x_req > x_safe {
-                return Err(RiskError::Overflow);
-            }
-        }
-
+        // Note: x_safe = floor(released * h_den / (h_den - h_num)) is always >= released
+        // (since h_den / (h_den - h_num) >= 1), and step 5 already requires x_req <= released.
+        // So x_req <= released <= x_safe always holds — no additional cap needed.
         let y: u128 = wide_mul_div_floor_u128(x_req, h_num, h_den);
 
         // Step 7: consume_released_pnl(i, x_req)
