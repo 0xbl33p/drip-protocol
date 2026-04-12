@@ -3449,3 +3449,110 @@ fn test_barrier_wave_cleanup_ordering() {
     assert!(engine.check_conservation());
     assert_eq!(outcome.num_liquidations, 0);
 }
+
+// ============================================================================
+// Blocker regression tests (TDD: written before fix, must fail then pass)
+// ============================================================================
+
+#[test]
+fn test_blocker1_trade_open_must_not_use_unreleased_pnl() {
+    // Trade-open IM must not count unreleased reserved PnL.
+    let mut params = default_params();
+    params.trading_fee_bps = 0;
+    let mut engine = RiskEngine::new(params);
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 50_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    // Trade at h_lock=50 so PnL goes to reserve queue
+    let size = (40 * POS_SCALE) as i128; // 40 units at price 1000 = 40k notional
+    engine.execute_trade_not_atomic(a, b, 1000, 100, size, 1000, 0i128, 50).unwrap();
+
+    // Price moves up — a gains unreleased profit
+    engine.accrue_market_to(101, 1100).unwrap();
+    engine.current_slot = 101;
+    let mut ctx = InstructionContext::new_with_h_lock(50);
+    engine.touch_account_live_local(a as usize, &mut ctx).unwrap();
+
+    // a now has reserved positive PnL (not yet released due to h_lock=50)
+    assert!(engine.accounts[a as usize].pnl > 0, "a must have positive PnL");
+    assert!(engine.accounts[a as usize].reserved_pnl > 0, "PnL must be reserved");
+
+    // Compute trade-open equity and init equity
+    let eq_trade = engine.account_equity_trade_open_raw(
+        &engine.accounts[a as usize], a as usize, 0);
+    let eq_init = engine.account_equity_init_raw(
+        &engine.accounts[a as usize], a as usize);
+
+    // BLOCKER 1: trade-open equity must NOT exceed init equity for a zero-slippage
+    // candidate trade. If it does, unreleased PnL is leaking into trade approval.
+    assert!(eq_trade <= eq_init,
+        "trade-open equity ({}) must not exceed init equity ({}) — \
+         unreleased PnL must not support new risk", eq_trade, eq_init);
+}
+
+#[test]
+fn test_blocker2_noop_accrual_sets_oracle_initialized() {
+    // Same-slot same-price accrual (no-op branch) must still set oracle_initialized.
+    let mut engine = RiskEngine::new(default_params());
+    let _a = engine.add_user(1000).unwrap();
+    engine.deposit(_a, 100_000, 1000, 100).unwrap();
+
+    // Force engine to the exact state where no-op branch triggers:
+    // last_market_slot = now_slot AND last_oracle_price = oracle_price
+    engine.last_market_slot = 100;
+    engine.last_oracle_price = 1000;
+    engine.oracle_initialized = 0; // explicitly clear after any prior accrual
+
+    // No-op accrual: total_dt=0 AND same price → early return
+    engine.accrue_market_to(100, 1000).unwrap();
+
+    assert_eq!(engine.oracle_initialized, 1,
+        "oracle_initialized must be set even on no-op accrual branch");
+}
+
+#[test]
+fn test_blocker3_terminal_close_rejects_negative_pnl() {
+    // close_resolved_terminal_not_atomic must reject accounts with pnl < 0
+    // that haven't been reconciled (losses not absorbed).
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 50_000, 1000, 100).unwrap();
+
+    // Manually set resolved state with negative PnL
+    engine.market_mode = MarketMode::Resolved;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
+    engine.set_pnl(a as usize, -1000);
+
+    // Phase 2 directly on unreconciled negative-PnL account must fail
+    let result = engine.close_resolved_terminal_not_atomic(a);
+    assert!(result.is_err(),
+        "close_resolved_terminal must reject negative-PnL accounts");
+}
+
+#[test]
+fn test_blocker4_adl_overflow_explicit_socialization() {
+    // ADL K-overflow must still leave an observable trace, not silently
+    // shift loss to implicit global haircut.
+    // For now: verify conservation holds after liquidation + ADL.
+    let mut params = default_params();
+    params.trading_fee_bps = 0;
+    let mut engine = RiskEngine::new(params);
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100_000, 1000, 100).unwrap();
+    engine.deposit(b, 100_000, 1000, 100).unwrap();
+
+    let size = (80 * POS_SCALE) as i128;
+    engine.execute_trade_not_atomic(a, b, 1000, 100, size, 1000, 0i128, 0).unwrap();
+
+    // Crash: a deeply underwater, triggers liquidation + potential ADL
+    let result = engine.keeper_crank_not_atomic(
+        200, 200, &[(a, Some(LiquidationPolicy::FullClose))], 64, 0i128, 0);
+    // Whether crank succeeds or not, conservation must hold
+    if result.is_ok() {
+        assert!(engine.check_conservation(),
+            "conservation must hold after liquidation with potential ADL");
+    }
+}

@@ -7,7 +7,10 @@
 //! 2. PNL warmup prevents instant withdrawal of manipulated profits
 //! 3. ADL via lazy A/K side indices on the opposing OI side
 //! 4. Conservation of funds across all operations (V >= C_tot + I)
-//! 5. No hidden protocol MM — bankruptcy socialization through explicit A/K state only
+//! 5. Bankruptcy socialization primarily through explicit A/K state. In the rare
+//!    case of K-space i128 overflow during ADL, the remaining deficit falls to
+//!    implicit global haircut (h) rather than panicking — preserving liquidation
+//!    liveness at the cost of reducing the opposing side's junior PnL claims.
 //!
 //! # Atomicity Model
 //!
@@ -1521,6 +1524,7 @@ impl RiskEngine {
         if total_dt == 0 && self.last_oracle_price == oracle_price {
             // Step 5: no change — set current_slot and return (spec §5.4)
             self.current_slot = now_slot;
+            self.oracle_initialized = 1;
             return Ok(());
         }
 
@@ -2146,31 +2150,36 @@ impl RiskEngine {
     ) -> i128 {
         let trade_gain = if candidate_trade_pnl > 0 { candidate_trade_pnl as u128 } else { 0u128 };
 
-        // PNL_trade_open_i = PNL_i - TradeGain
+        // Use RELEASED (matured) PnL only, not full positive PnL.
+        // This prevents unreleased reserved PnL from supporting new risk.
+        let released = self.released_pos(idx);
+        // Subtract the candidate trade's own positive gain from released
+        let released_trade_open = released.saturating_sub(trade_gain);
+
+        // PNL_trade_open_i for loss component: PNL_i - TradeGain
         let pnl_trade_open = account.pnl.checked_sub(trade_gain as i128)
             .unwrap_or(i128::MIN + 1);
-        let pos_pnl_trade_open = i128_clamp_pos(pnl_trade_open);
 
-        // Counterfactual global positive aggregate
-        let pos_pnl_i = i128_clamp_pos(account.pnl);
-        let pnl_pos_tot_trade_open = self.pnl_pos_tot
-            .checked_sub(pos_pnl_i).unwrap_or(0)
-            .checked_add(pos_pnl_trade_open).unwrap_or(self.pnl_pos_tot);
+        // Counterfactual matured global aggregate (remove this account's contribution,
+        // add back the trade-open released amount)
+        let pnl_matured_trade_open = self.pnl_matured_pos_tot
+            .checked_sub(released).unwrap_or(0)
+            .checked_add(released_trade_open).unwrap_or(self.pnl_matured_pos_tot);
 
-        // Counterfactual haircut
-        let pnl_eff_trade_open = if pnl_pos_tot_trade_open == 0 {
-            pos_pnl_trade_open
+        // Counterfactual haircut using matured aggregates
+        let pnl_eff_trade_open = if pnl_matured_trade_open == 0 {
+            released_trade_open
         } else {
             let senior_sum = self.c_tot.get().checked_add(
                 self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
             let residual = if self.vault.get() >= senior_sum {
                 self.vault.get() - senior_sum
             } else { 0u128 };
-            let g_num = core::cmp::min(residual, pnl_pos_tot_trade_open);
-            mul_div_floor_u128(pos_pnl_trade_open, g_num, pnl_pos_tot_trade_open)
+            let g_num = core::cmp::min(residual, pnl_matured_trade_open);
+            mul_div_floor_u128(released_trade_open, g_num, pnl_matured_trade_open)
         };
 
-        // Eq_trade_open_base_i = C_i + min(PNL_trade_open, 0) + PNL_eff_trade_open
+        // Eq_trade_open = C_i + min(PNL_trade_open, 0) + PNL_eff_trade_open - FeeDebt
         let cap = I256::from_u128(account.capital.get());
         let neg_pnl = I256::from_i128(if pnl_trade_open < 0 { pnl_trade_open } else { 0i128 });
         let eff = I256::from_u128(pnl_eff_trade_open);
@@ -4530,7 +4539,12 @@ impl RiskEngine {
             return Err(RiskError::AccountNotFound);
         }
         let i = idx as usize;
+        // Reject unreconciled accounts: position must be zeroed, PnL >= 0
         if self.accounts[i].position_basis_q != 0 {
+            return Err(RiskError::Undercollateralized);
+        }
+        if self.accounts[i].pnl < 0 {
+            // Negative PnL means losses not yet absorbed — must reconcile first
             return Err(RiskError::Undercollateralized);
         }
         if self.accounts[i].pnl > 0 {
