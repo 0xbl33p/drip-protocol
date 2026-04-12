@@ -984,30 +984,33 @@ impl RiskEngine {
         let account_id = self.next_account_id;
         self.next_account_id = self.next_account_id.saturating_add(1);
 
-        // Initialize per spec §2.5
-        self.accounts[idx as usize] = Account {
-            kind: Account::KIND_USER,
-            account_id,
-            capital: U128::ZERO,
-            pnl: 0i128,
-            reserved_pnl: 0u128,
-            position_basis_q: 0i128,
-            adl_a_basis: ADL_ONE,
-            adl_k_snap: 0i128,
-            adl_epoch_snap: 0,
-            matcher_program: [0; 32],
-            matcher_context: [0; 32],
-            owner: [0; 32],
-            fee_credits: I128::ZERO,
-            fees_earned_total: U128::ZERO,
-
-            exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
-            exact_cohort_count: 0,
-            overflow_older: ReserveCohort::EMPTY,
-            overflow_older_present: 0,
-            overflow_newest: ReserveCohort::EMPTY,
-            overflow_newest_present: 0,
-        };
+        // Initialize per spec §2.5 — field-by-field to avoid constructing
+        // a ~4KB temporary Account on the stack (SBF stack limit is 4KB).
+        {
+            let a = &mut self.accounts[idx as usize];
+            a.kind = Account::KIND_USER;
+            a.account_id = account_id;
+            a.capital = U128::ZERO;
+            a.pnl = 0i128;
+            a.reserved_pnl = 0u128;
+            a.position_basis_q = 0i128;
+            a.adl_a_basis = ADL_ONE;
+            a.adl_k_snap = 0i128;
+            a.adl_epoch_snap = 0;
+            a.matcher_program = [0; 32];
+            a.matcher_context = [0; 32];
+            a.owner = [0; 32];
+            a.fee_credits = I128::ZERO;
+            a.fees_earned_total = U128::ZERO;
+            for i in 0..MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
+                a.exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
+            }
+            a.exact_cohort_count = 0;
+            a.overflow_older = ReserveCohort::EMPTY;
+            a.overflow_older_present = 0;
+            a.overflow_newest = ReserveCohort::EMPTY;
+            a.overflow_newest_present = 0;
+        }
 
         Ok(())
     }
@@ -2772,6 +2775,10 @@ impl RiskEngine {
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
         }
+        // Only valid account kinds allowed
+        if kind != Account::KIND_USER && kind != Account::KIND_LP {
+            return Err(RiskError::Overflow);
+        }
         let used_count = self.num_used_accounts as u64;
         if used_count >= self.params.max_accounts {
             return Err(RiskError::Overflow);
@@ -2782,7 +2789,8 @@ impl RiskEngine {
             return Err(RiskError::InsufficientBalance);
         }
 
-        // Post-fee capital must meet MIN_INITIAL_DEPOSIT
+        // Post-fee capital: reject dust (0 < excess < min_initial_deposit).
+        // excess == 0 is allowed (user deposits separately after materialization).
         let excess = fee_payment.saturating_sub(required_fee);
         if excess > 0 && excess < self.params.min_initial_deposit.get() {
             return Err(RiskError::InsufficientBalance);
@@ -2819,29 +2827,32 @@ impl RiskEngine {
         let account_id = self.next_account_id;
         self.next_account_id = self.next_account_id.saturating_add(1);
 
-        self.accounts[idx as usize] = Account {
-            kind,
-            account_id,
-            capital: U128::new(excess),
-            pnl: 0i128,
-            reserved_pnl: 0u128,
-            position_basis_q: 0i128,
-            adl_a_basis: ADL_ONE,
-            adl_k_snap: 0i128,
-            adl_epoch_snap: 0,
-            matcher_program,
-            matcher_context,
-            owner: [0; 32],
-            fee_credits: I128::ZERO,
-            fees_earned_total: U128::ZERO,
-
-            exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
-            exact_cohort_count: 0,
-            overflow_older: ReserveCohort::EMPTY,
-            overflow_older_present: 0,
-            overflow_newest: ReserveCohort::EMPTY,
-            overflow_newest_present: 0,
-        };
+        // Field-by-field init to avoid ~4KB Account temporary on SBF stack.
+        {
+            let a = &mut self.accounts[idx as usize];
+            a.kind = kind;
+            a.account_id = account_id;
+            a.capital = U128::new(excess);
+            a.pnl = 0i128;
+            a.reserved_pnl = 0u128;
+            a.position_basis_q = 0i128;
+            a.adl_a_basis = ADL_ONE;
+            a.adl_k_snap = 0i128;
+            a.adl_epoch_snap = 0;
+            a.matcher_program = matcher_program;
+            a.matcher_context = matcher_context;
+            a.owner = [0; 32];
+            a.fee_credits = I128::ZERO;
+            a.fees_earned_total = U128::ZERO;
+            for i in 0..MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
+                a.exact_reserve_cohorts[i] = ReserveCohort::EMPTY;
+            }
+            a.exact_cohort_count = 0;
+            a.overflow_older = ReserveCohort::EMPTY;
+            a.overflow_older_present = 0;
+            a.overflow_newest = ReserveCohort::EMPTY;
+            a.overflow_newest_present = 0;
+        }
 
         if excess > 0 {
             self.c_tot = U128::new(self.c_tot.get().checked_add(excess)

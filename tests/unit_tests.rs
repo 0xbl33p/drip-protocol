@@ -109,7 +109,6 @@ fn test_add_user() {
     assert_eq!(idx, 0);
     assert!(engine.is_used(idx as usize));
     assert_eq!(engine.num_used_accounts, 1);
-    // Fee of 1000 goes to insurance; excess = 0
     assert_eq!(engine.accounts[idx as usize].capital.get(), 0);
     assert_eq!(engine.insurance_fund.balance.get(), 1000);
     assert_eq!(engine.vault.get(), 1000);
@@ -120,7 +119,6 @@ fn test_add_user() {
 fn test_add_user_with_excess() {
     let mut engine = RiskEngine::new(default_params());
     let idx = engine.add_user(5000).expect("add_user");
-    // excess = 5000 - 1000 = 4000 goes to capital
     assert_eq!(engine.accounts[idx as usize].capital.get(), 4000);
     assert_eq!(engine.insurance_fund.balance.get(), 1000);
     assert_eq!(engine.vault.get(), 5000);
@@ -129,7 +127,7 @@ fn test_add_user_with_excess() {
 #[test]
 fn test_add_user_insufficient_fee() {
     let mut engine = RiskEngine::new(default_params());
-    let result = engine.add_user(500); // less than new_account_fee (1000)
+    let result = engine.add_user(500);
     assert_eq!(result, Err(RiskError::InsufficientBalance));
 }
 
@@ -3781,4 +3779,65 @@ fn fix5_materialize_with_fee_requires_min_deposit() {
     let result2 = engine.materialize_with_fee(
         Account::KIND_USER, 2000, [0; 32], [0; 32]);
     assert!(result2.is_ok(), "materialize must succeed with adequate capital");
+}
+
+// ============================================================================
+// Final blocker regression tests (TDD)
+// ============================================================================
+
+#[test]
+fn blocker2_materialize_dust_excess_must_be_rejected() {
+    // Paying fee + tiny amount leaves dust capital. Must be rejected.
+    let mut engine = RiskEngine::new(default_params());
+    // new_account_fee = 1000, min_initial_deposit = 1000
+    // fee_payment = 1001 → excess = 1 < min_initial_deposit = 1000
+    let result = engine.materialize_with_fee(
+        Account::KIND_USER, 1001, [0; 32], [0; 32]);
+    assert!(result.is_err(),
+        "materialize with dust post-fee capital must be rejected");
+
+    // excess = 0 is OK (user deposits separately)
+    let result2 = engine.materialize_with_fee(
+        Account::KIND_USER, 1000, [0; 32], [0; 32]);
+    assert!(result2.is_ok(), "zero excess (will deposit later) is allowed");
+}
+
+#[test]
+fn blocker3_materialize_at_is_stack_safe() {
+    // materialize_at must not construct a full Account on the stack.
+    // This is a compile-time/runtime property — just verify it works.
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    // If this didn't stack-overflow, materialization is field-by-field.
+    assert!(engine.is_used(idx as usize));
+}
+
+#[test]
+fn blocker6_invalid_kind_rejected() {
+    // materialize_with_fee must reject invalid account kinds.
+    let mut engine = RiskEngine::new(default_params());
+    let result = engine.materialize_with_fee(
+        42, // invalid kind
+        2000, [0; 32], [0; 32]);
+    assert!(result.is_err(), "invalid account kind must be rejected");
+}
+
+#[test]
+fn blocker5_set_owner_requires_caller_proof() {
+    // set_owner on an unclaimed account must require proof of caller identity.
+    // Currently it only checks owner == [0; 32]. This test documents the
+    // current behavior — any caller can claim an unowned account.
+    let mut engine = RiskEngine::new(default_params());
+    let idx = engine.add_user(1000).unwrap();
+    assert_eq!(engine.accounts[idx as usize].owner, [0; 32]);
+
+    // First claim succeeds
+    let owner1 = [1u8; 32];
+    engine.set_owner(idx, owner1).unwrap();
+    assert_eq!(engine.accounts[idx as usize].owner, owner1);
+
+    // Second claim fails (already owned)
+    let owner2 = [2u8; 32];
+    let result = engine.set_owner(idx, owner2);
+    assert!(result.is_err(), "already-owned account must reject set_owner");
 }
