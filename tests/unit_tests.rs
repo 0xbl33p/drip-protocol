@@ -3059,6 +3059,7 @@ fn test_resolve_market_rejects_out_of_band_price() {
     let mut engine = RiskEngine::new(default_params());
     let idx_tmp = engine.add_user(1000).unwrap(); engine.deposit(idx_tmp, 100_000, 1000, 100).unwrap();
     engine.last_oracle_price = 1000;
+    engine.oracle_initialized = 1;
 
     // resolve_price_deviation_bps = 1000 (10%)
     // Price must be within 10% of P_last=1000 → [900, 1100]

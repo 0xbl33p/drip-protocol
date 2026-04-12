@@ -211,7 +211,7 @@ pub enum SideMode {
 }
 
 /// Max accounts that can be touched in a single instruction
-pub const MAX_TOUCHED_PER_INSTRUCTION: usize = 4;
+pub const MAX_TOUCHED_PER_INSTRUCTION: usize = 64;
 
 /// Instruction context for deferred reset scheduling (spec §5.7-5.8)
 /// and shared touched-account tracking (spec §7.8, v12.14.0).
@@ -446,6 +446,8 @@ pub struct RiskEngine {
 
     /// Last oracle price used in accrue_market_to
     pub last_oracle_price: u64,
+    /// 1 if accrue_market_to has been called at least once with a real oracle price.
+    pub oracle_initialized: u8,
     /// Last slot used in accrue_market_to
     pub last_market_slot: u64,
     /// Funding price sample (for anti-retroactivity)
@@ -748,6 +750,7 @@ impl RiskEngine {
             phantom_dust_bound_short_q: 0u128,
             materialized_account_count: 0,
             last_oracle_price: init_oracle_price,
+            oracle_initialized: 0,
             last_market_slot: init_slot,
             funding_price_sample_last: init_oracle_price,
             funding_remainder: 0,
@@ -813,6 +816,7 @@ impl RiskEngine {
         self.phantom_dust_bound_short_q = 0;
         self.materialized_account_count = 0;
         self.last_oracle_price = init_oracle_price;
+        self.oracle_initialized = 0;
         self.last_market_slot = init_slot;
         self.funding_price_sample_last = init_oracle_price;
         self.funding_remainder = 0;
@@ -1583,6 +1587,7 @@ impl RiskEngine {
         self.current_slot = now_slot;
         self.last_market_slot = now_slot;
         self.last_oracle_price = oracle_price;
+        self.oracle_initialized = 1;
         self.funding_price_sample_last = oracle_price;
 
         Ok(())
@@ -1732,14 +1737,14 @@ impl RiskEngine {
                             self.set_k_side(opp, new_k);
                         }
                         None => {
-                            // K-space overflow: corruption signal
-                            return Err(RiskError::CorruptState);
+                            // K-space overflow: deficit uninsurable, implicit haircut.
+                            // Liquidation must still proceed for liveness.
                         }
                     }
                 }
                 Err(OverI128Magnitude) => {
-                    // Quotient overflow: corruption signal
-                    return Err(RiskError::CorruptState);
+                    // Quotient overflow: deficit uninsurable, implicit haircut.
+                    // Liquidation must still proceed for liveness.
                 }
             }
         }
@@ -3683,20 +3688,6 @@ impl RiskEngine {
             self.last_crank_slot = now_slot;
         }
 
-        // Compute shared whole-only conversion snapshot before candidate loop.
-        // This is the same computation finalize_touched_accounts_post_live does,
-        // but we apply it inline per-candidate to avoid the 4-account truncation.
-        let senior_sum = self.c_tot.get().checked_add(
-            self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
-        let residual = if self.vault.get() >= senior_sum {
-            self.vault.get() - senior_sum
-        } else { 0u128 };
-        let h_snapshot_den = self.pnl_matured_pos_tot;
-        let h_snapshot_num = if h_snapshot_den == 0 { 0 } else {
-            core::cmp::min(residual, h_snapshot_den)
-        };
-        let is_whole = h_snapshot_den > 0 && h_snapshot_num == h_snapshot_den;
-
         // Step 7-8: process candidates in keeper-supplied order
         let mut attempts: u16 = 0;
         let mut num_liquidations: u32 = 0;
@@ -3719,25 +3710,8 @@ impl RiskEngine {
             attempts += 1;
             let cidx = candidate_idx as usize;
 
-            // Per-candidate: touch + inline finalize (not deferred to avoid
-            // the MAX_TOUCHED_PER_INSTRUCTION=4 truncation issue).
+            // Touch candidate (adds to ctx.touched_accounts, up to 64 slots).
             self.touch_account_live_local(cidx, &mut ctx)?;
-
-            // Inline whole-only flat conversion (same logic as finalize but
-            // per-candidate, using the snapshot computed before the loop).
-            // This ensures ALL crank-touched accounts get equal treatment.
-            if is_whole
-                && self.accounts[cidx].position_basis_q == 0
-                && self.accounts[cidx].pnl > 0
-            {
-                let released = self.released_pos(cidx);
-                if released > 0 {
-                    self.consume_released_pnl(cidx, released);
-                    let new_cap = add_u128(self.accounts[cidx].capital.get(), released);
-                    self.set_capital(cidx, new_cap);
-                }
-            }
-
             self.fee_debt_sweep(cidx);
 
             // Check if liquidatable after exact current-state touch.
@@ -3761,7 +3735,10 @@ impl RiskEngine {
             }
         }
 
-        // Whole-only conversion and fee_debt_sweep already done inline per-candidate.
+        // Finalize: compute fresh snapshot from post-mutation state, apply
+        // whole-only conversion + fee sweep to all tracked accounts.
+        // MAX_TOUCHED_PER_INSTRUCTION = 64 matches LIQ_BUDGET_PER_CRANK.
+        self.finalize_touched_accounts_post_live(&ctx);
 
         // GC dust accounts
         let gc_closed = self.garbage_collect_dust();
@@ -4378,9 +4355,9 @@ impl RiskEngine {
         }
 
         // Step 5: price deviation check (exact wide arithmetic).
-        // Skip if last_oracle_price is uninitialized/sentinel (no oracle activity yet).
-        let p_last = self.last_oracle_price;
-        if p_last > 1 {
+        // Skip if oracle has never been initialized (no accrue_market_to call yet).
+        if self.oracle_initialized != 0 {
+            let p_last = self.last_oracle_price;
             let p_last_i = p_last as i128;
             let p_res = resolved_price as i128;
             let dev_bps = self.params.resolve_price_deviation_bps as i128;
@@ -4539,14 +4516,27 @@ impl RiskEngine {
         // making payouts order-invariant.
         // ================================================================
 
-        let all_positions_zeroed =
-            self.stored_pos_count_long == 0 && self.stored_pos_count_short == 0;
+        // Terminal readiness: all positions zeroed AND no negative PnL
+        // accounts remain (all losses fully absorbed into insurance/haircut).
+        // Without the negative-PnL check, flat losers could still consume
+        // insurance after the snapshot is locked, corrupting the payout ratio.
+        let terminal_ready = self.resolved_payout_ready != 0 || {
+            let positions_clear = self.stored_pos_count_long == 0
+                && self.stored_pos_count_short == 0;
+            if !positions_clear { false }
+            else {
+                // Scan for any remaining negative PnL (flat losers not yet absorbed)
+                let mut has_negative = false;
+                self.for_each_used(|_idx, acct| {
+                    if acct.pnl < 0 { has_negative = true; }
+                });
+                !has_negative
+            }
+        };
 
-        if self.accounts[i].pnl > 0 && all_positions_zeroed {
+        if self.accounts[i].pnl > 0 && terminal_ready {
             // Lock the payout snapshot exactly once
             if self.resolved_payout_ready == 0 {
-                // All latent K-pair PnL is now materialized. Snapshot the
-                // terminal-state haircut for all remaining closers.
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
                 let senior_sum = self.c_tot.get().checked_add(
                     self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
@@ -4578,11 +4568,11 @@ impl RiskEngine {
                 self.set_capital(i, new_cap);
             }
         } else if self.accounts[i].pnl > 0 {
-            // Positive PnL but not all positions zeroed yet — cannot pay out.
-            // The account stays in the engine; caller must reconcile all
-            // remaining positions first, then re-call force_close.
-            // Return 0 to indicate no payout (account not freed).
-            return Ok(0);
+            // Positive PnL but terminal state not reached — positions remain
+            // or negative-PnL accounts haven't been absorbed yet.
+            // Account is NOT freed. Caller must reconcile all remaining
+            // accounts first, then re-call force_close.
+            return Err(RiskError::Undercollateralized);
         }
 
         // Sweep fee debt from capital
