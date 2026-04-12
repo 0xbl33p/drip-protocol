@@ -1751,7 +1751,9 @@ impl RiskEngine {
     /// Validate h_lock before any state mutation.
     fn validate_h_lock(h_lock: u64, params: &RiskParams) -> Result<()> {
         if h_lock > params.h_max { return Err(RiskError::Overflow); }
-        if h_lock > 0 && h_lock < params.h_min { return Err(RiskError::Overflow); }
+        // h_lock=0 only allowed when h_min=0 (ImmediateRelease permitted).
+        // When h_min > 0, zero bypasses the minimum warmup — reject it.
+        if h_lock < params.h_min { return Err(RiskError::Overflow); }
         Ok(())
     }
 
@@ -4808,6 +4810,12 @@ impl RiskEngine {
         if account.reserved_pnl != 0 {
             return Err(RiskError::Undercollateralized);
         }
+        // Require queue metadata empty (not just reserved_pnl == 0)
+        if account.exact_cohort_count != 0
+            || account.overflow_older_present != 0
+            || account.overflow_newest_present != 0 {
+            return Err(RiskError::Undercollateralized);
+        }
         if account.fee_credits.get() > 0 {
             return Err(RiskError::Undercollateralized);
         }
@@ -4881,11 +4889,14 @@ impl RiskEngine {
             if account.reserved_pnl != 0 {
                 continue;
             }
+            if account.exact_cohort_count != 0
+                || account.overflow_older_present != 0
+                || account.overflow_newest_present != 0 {
+                continue;
+            }
             if account.fee_credits.get() > 0 {
                 continue;
             }
-
-            // No engine-native maintenance fee in v12.14.0 (spec §8).
 
             // Check capital for dust eligibility
             if self.accounts[idx].capital.get() >= self.params.min_initial_deposit.get()
