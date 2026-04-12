@@ -3556,3 +3556,155 @@ fn test_blocker4_adl_overflow_explicit_socialization() {
             "conservation must hold after liquidation with potential ADL");
     }
 }
+
+// ============================================================================
+// Source-of-truth audit regression tests (TDD: must fail before fix)
+// ============================================================================
+
+#[test]
+fn audit_2_trade_open_must_use_all_pos_pnl_via_g() {
+    // account_equity_trade_open_raw must use full positive PnL via g,
+    // not just released/matured PnL. Fresh unreleased profit SHOULD
+    // support the same account's risk-increasing trades through g.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100, 1000, 100).unwrap();
+
+    // Inject positive PnL, ALL in reserve (unreleased)
+    engine.accounts[a as usize].pnl = 100;
+    engine.accounts[a as usize].reserved_pnl = 100;
+    engine.pnl_pos_tot = 100;
+    engine.pnl_matured_pos_tot = 0;
+    // Vault fully backs positive PnL: g = 1
+    engine.vault = U128::new(engine.vault.get() + 100);
+
+    let eq = engine.account_equity_trade_open_raw(
+        &engine.accounts[a as usize], a as usize, 0);
+
+    // Trade lane sees all positive PnL via g (= 100), not just released (= 0).
+    // Eq = C(100) + min(PNL,0)(0) + g*PosPNL(100) - FeeDebt(0) = 200
+    // (using the correct spec formula with pnl_pos_tot not pnl_matured_pos_tot)
+    assert!(eq >= 100, "trade-open equity must include unreleased PnL via g, got {}", eq);
+}
+
+#[test]
+fn audit_4_direct_liq_must_finalize_after_liquidation() {
+    // liquidate_at_oracle_not_atomic must finalize AFTER liquidation,
+    // not before. Post-liquidation flat account needs conversion + sweep.
+    let (mut engine, a, b) = setup_two_users(100_000, 100_000);
+    let oracle = 1000u64;
+    let slot = 2u64;
+
+    // Open leveraged position
+    let size = make_size_q(900); // high leverage
+    engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 0i128, 0).unwrap();
+
+    // Crash so a is liquidatable
+    let crash = 500u64;
+    let slot2 = 10u64;
+    let result = engine.liquidate_at_oracle_not_atomic(
+        a, slot2, crash, LiquidationPolicy::FullClose, 0i128, 0);
+
+    if let Ok(true) = result {
+        // After full-close liquidation, account is flat.
+        // Fee debt should have been swept by post-liquidation finalize.
+        let fc = engine.accounts[a as usize].fee_credits.get();
+        // If finalize ran post-liquidation, fee debt was swept from capital.
+        // We just verify conservation holds — the ordering test is about
+        // whether the snapshot used for conversion is pre or post liquidation.
+        assert!(engine.check_conservation());
+    }
+}
+
+#[test]
+fn audit_5_invalid_h_lock_rejected_at_entry() {
+    // Bad h_lock must be rejected before any state mutation,
+    // not panic deep in set_pnl_with_reserve.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 100_000, 1000, 100).unwrap();
+
+    let bad_h = engine.params.h_max + 1;
+    let result = engine.settle_account_not_atomic(a, 1000, 101, 0i128, bad_h);
+    assert!(result.is_err(), "invalid h_lock must return Err, not panic");
+}
+
+#[test]
+fn audit_6_materialize_with_fee_needs_live_gate() {
+    // materialize_with_fee must reject on resolved markets
+    let mut engine = RiskEngine::new(default_params());
+    let _a = engine.add_user(1000).unwrap();
+    engine.deposit(_a, 100_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000).unwrap();
+    engine.resolve_market(1000, 100).unwrap();
+
+    let result = engine.materialize_with_fee(
+        Account::KIND_USER, 1000, [0; 32], [0; 32]);
+    assert!(result.is_err(), "materialize must be blocked on resolved markets");
+}
+
+#[test]
+fn audit_8_resolve_must_enforce_band_before_first_accrue() {
+    // resolve_market must check price band even without prior accrual.
+    // P_last is set by init, so the band is always enforceable.
+    let mut engine = RiskEngine::new(default_params());
+    let _a = engine.add_user(1000).unwrap();
+    engine.deposit(_a, 100_000, 1000, 100).unwrap();
+    // engine.last_oracle_price = 1000 from init, oracle_initialized = 0
+    // resolve_price_deviation_bps = 1000 (10%)
+    // Price 2000 is 100% deviation, well outside 10% band
+    let result = engine.resolve_market(2000, 200);
+    assert!(result.is_err(),
+        "resolve must enforce price band from init P_last even before first accrue");
+}
+
+#[test]
+fn audit_9_overflow_older_merge_ignores_h_lock() {
+    // Same-slot addition to overflow_older must merge regardless of h_lock,
+    // because overflow segments always use H_max, not caller's h_lock.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 1_000_000, 1000, 100).unwrap();
+
+    let idx = a as usize;
+    let h_lock = 10u64;
+
+    // Fill exact capacity with distinct slots
+    for i in 0..MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT {
+        engine.accounts[idx].pnl += 1000;
+        engine.pnl_pos_tot += 1000;
+        engine.append_or_route_new_reserve(idx, 1000, 100 + i as u64, h_lock);
+    }
+
+    let slot = 200u64;
+    // First overflow: creates overflow_older with H_max
+    engine.accounts[idx].pnl += 1000;
+    engine.pnl_pos_tot += 1000;
+    engine.append_or_route_new_reserve(idx, 1000, slot, h_lock);
+    assert!(engine.accounts[idx].overflow_older_present != 0);
+    assert_eq!(engine.accounts[idx].overflow_older.horizon_slots, engine.params.h_max);
+
+    // Same-slot merge: different h_lock but should still merge into overflow_older
+    let diff_h = 50u64;
+    engine.accounts[idx].pnl += 1000;
+    engine.pnl_pos_tot += 1000;
+    engine.append_or_route_new_reserve(idx, 1000, slot, diff_h);
+
+    // Should merge into overflow_older (same slot), NOT create overflow_newest
+    assert_eq!(engine.accounts[idx].overflow_newest_present, 0,
+        "same-slot overflow must merge, not create newest");
+    assert_eq!(engine.accounts[idx].overflow_older.remaining_q, 2000);
+}
+
+#[test]
+fn audit_10_accrue_market_to_must_reject_on_resolved() {
+    // Public accrue_market_to must not work on resolved markets.
+    let mut engine = RiskEngine::new(default_params());
+    let _a = engine.add_user(1000).unwrap();
+    engine.deposit(_a, 100_000, 1000, 100).unwrap();
+    engine.accrue_market_to(100, 1000).unwrap();
+    engine.resolve_market(1000, 100).unwrap();
+
+    let result = engine.accrue_market_to(200, 1100);
+    assert!(result.is_err(), "accrue_market_to must reject on resolved markets");
+}

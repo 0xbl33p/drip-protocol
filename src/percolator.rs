@@ -1530,6 +1530,9 @@ impl RiskEngine {
     // ========================================================================
 
     pub fn accrue_market_to(&mut self, now_slot: u64, oracle_price: u64) -> Result<()> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
         }
@@ -1629,6 +1632,13 @@ impl RiskEngine {
         if rate.unsigned_abs() > MAX_ABS_FUNDING_E9_PER_SLOT as u128 {
             return Err(RiskError::Overflow);
         }
+        Ok(())
+    }
+
+    /// Validate h_lock before any state mutation.
+    fn validate_h_lock(h_lock: u64, params: &RiskParams) -> Result<()> {
+        if h_lock > params.h_max { return Err(RiskError::Overflow); }
+        if h_lock > 0 && h_lock < params.h_min { return Err(RiskError::Overflow); }
         Ok(())
     }
 
@@ -2176,36 +2186,36 @@ impl RiskEngine {
     ) -> i128 {
         let trade_gain = if candidate_trade_pnl > 0 { candidate_trade_pnl as u128 } else { 0u128 };
 
-        // Use RELEASED (matured) PnL only, not full positive PnL.
-        // This prevents unreleased reserved PnL from supporting new risk.
-        let released = self.released_pos(idx);
-        // Subtract the candidate trade's own positive gain from released
-        let released_trade_open = released.saturating_sub(trade_gain);
+        // Trade lane uses FULL positive PnL via g (spec §3.5), not just released.
+        // This allows unreleased reserved PnL to support the same account's
+        // risk-increasing trades through the global haircut.
+        // Only the candidate trade's own positive gain is neutralized.
+        let pos_pnl = i128_clamp_pos(account.pnl);
+        let pos_pnl_trade_open = pos_pnl.saturating_sub(trade_gain);
 
-        // PNL_trade_open_i for loss component: PNL_i - TradeGain
+        // PNL_trade_open_i for loss component
         let pnl_trade_open = account.pnl.checked_sub(trade_gain as i128)
             .unwrap_or(i128::MIN + 1);
 
-        // Counterfactual matured global aggregate (remove this account's contribution,
-        // add back the trade-open released amount)
-        let pnl_matured_trade_open = self.pnl_matured_pos_tot
-            .checked_sub(released).unwrap_or(0)
-            .checked_add(released_trade_open).unwrap_or(self.pnl_matured_pos_tot);
+        // Counterfactual global positive aggregate (using pnl_pos_tot, not matured)
+        let pnl_pos_tot_trade_open = self.pnl_pos_tot
+            .checked_sub(pos_pnl).unwrap_or(0)
+            .checked_add(pos_pnl_trade_open).unwrap_or(self.pnl_pos_tot);
 
-        // Counterfactual haircut using matured aggregates
-        let pnl_eff_trade_open = if pnl_matured_trade_open == 0 {
-            released_trade_open
+        // Counterfactual trade haircut g
+        let pnl_eff_trade_open = if pnl_pos_tot_trade_open == 0 {
+            pos_pnl_trade_open
         } else {
             let senior_sum = self.c_tot.get().checked_add(
                 self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
             let residual = if self.vault.get() >= senior_sum {
                 self.vault.get() - senior_sum
             } else { 0u128 };
-            let g_num = core::cmp::min(residual, pnl_matured_trade_open);
-            mul_div_floor_u128(released_trade_open, g_num, pnl_matured_trade_open)
+            let g_num = core::cmp::min(residual, pnl_pos_tot_trade_open);
+            mul_div_floor_u128(pos_pnl_trade_open, g_num, pnl_pos_tot_trade_open)
         };
 
-        // Eq_trade_open = C_i + min(PNL_trade_open, 0) + PNL_eff_trade_open - FeeDebt
+        // Eq_trade_open = C_i + min(PNL_trade_open, 0) + g*PosPNL_trade_open - FeeDebt
         let cap = I256::from_u128(account.capital.get());
         let neg_pnl = I256::from_i128(if pnl_trade_open < 0 { pnl_trade_open } else { 0i128 });
         let eff = I256::from_u128(pnl_eff_trade_open);
@@ -2317,10 +2327,10 @@ impl RiskEngine {
             }
         }
 
-        // Step 4: exact merge into overflow_older
+        // Step 4: merge into overflow_older (horizon is always H_max, not h_lock)
         if a.overflow_older_present != 0 && a.overflow_newest_present == 0 {
             let o = &mut a.overflow_older;
-            if o.start_slot == now_slot && o.horizon_slots == h_lock && o.sched_release_q == 0 {
+            if o.start_slot == now_slot && o.horizon_slots == self.params.h_max && o.sched_release_q == 0 {
                 o.remaining_q = o.remaining_q.checked_add(reserve_add).expect("reserve overflow");
                 o.anchor_q = o.anchor_q.checked_add(reserve_add).expect("anchor overflow");
                 a.reserved_pnl = a.reserved_pnl.checked_add(reserve_add).expect("R_i overflow");
@@ -2759,6 +2769,9 @@ impl RiskEngine {
         matcher_program: [u8; 32],
         matcher_context: [u8; 32],
     ) -> Result<u16> {
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
         let used_count = self.num_used_accounts as u64;
         if used_count >= self.params.max_accounts {
             return Err(RiskError::Overflow);
@@ -2939,6 +2952,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<()> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3027,6 +3041,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<()> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3078,6 +3093,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<()> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -3508,6 +3524,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<bool> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         // Bounds and existence check BEFORE touch_account_live_local to prevent
         // market-state mutation (accrue_market_to) on missing accounts.
@@ -3692,6 +3709,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<CrankOutcome> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -4022,6 +4040,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<CrankOutcome> {
         Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -4227,6 +4246,7 @@ impl RiskEngine {
         h_lock: u64,
     ) -> Result<()> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -4299,6 +4319,7 @@ impl RiskEngine {
 
     pub fn close_account_not_atomic(&mut self, idx: u16, now_slot: u64, oracle_price: u64, funding_rate_e9: i128, h_lock: u64) -> Result<u128> {
                 Self::validate_funding_rate_e9(funding_rate_e9)?;
+                Self::validate_h_lock(h_lock, &self.params)?;
 
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
@@ -4386,8 +4407,8 @@ impl RiskEngine {
         }
 
         // Step 5: price deviation check (exact wide arithmetic).
-        // Skip if oracle has never been initialized (no accrue_market_to call yet).
-        if self.oracle_initialized != 0 {
+        // P_last is initialized from new_with_market, so band is always enforceable.
+        {
             let p_last = self.last_oracle_price;
             let p_last_i = p_last as i128;
             let p_res = resolved_price as i128;
