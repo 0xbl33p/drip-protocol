@@ -3708,3 +3708,77 @@ fn audit_10_accrue_market_to_must_reject_on_resolved() {
     let result = engine.accrue_market_to(200, 1100);
     assert!(result.is_err(), "accrue_market_to must reject on resolved markets");
 }
+
+// ============================================================================
+// Audit round — fixes verification
+// ============================================================================
+
+#[test]
+fn fix2_tiny_position_withdrawal_floor() {
+    // Microscopic position with notional flooring to 0 must still require
+    // min_nonzero_im_req for withdrawal.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 10_000, 1000, 100).unwrap();
+    engine.deposit(b, 100_000, 1000, 100).unwrap();
+
+    // Trade tiny position: 1 base unit. notional = floor(1 * 1000 / 1e6) = 0
+    let tiny = 1i128;
+    engine.execute_trade_not_atomic(a, b, 1000, 100, tiny, 1000, 0i128, 0).unwrap();
+    assert!(engine.effective_pos_q(a as usize) != 0, "position must exist");
+
+    // Try to withdraw all capital — must be rejected because min_nonzero_im_req > 0
+    let cap = engine.accounts[a as usize].capital.get();
+    let result = engine.withdraw_not_atomic(a, cap, 1000, 101, 0i128, 0);
+    assert!(result.is_err(),
+        "withdrawal to zero with nonzero position must be rejected even when notional floors to 0");
+}
+
+#[test]
+fn fix3_flat_conversion_rejects_if_post_eq_negative() {
+    // Flat account with fee debt: haircutted conversion + sweep must not
+    // leave Eq_maint_raw < 0.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    engine.deposit(a, 1, 1000, 100).unwrap(); // minimal capital
+
+    let idx = a as usize;
+    // Inject: flat, positive PnL, large fee debt
+    engine.set_pnl(idx, 100);
+    engine.accounts[idx].fee_credits = I128::new(-90);
+
+    // Make haircut h = 1/2: vault barely covers senior claims
+    // senior = c_tot + insurance. residual = vault - senior.
+    // We need residual < pnl_matured_pos_tot for h < 1.
+    // pnl_matured_pos_tot = 100 (all released with h_lock=0/ImmediateRelease)
+    // If residual = 50, h = 50/100 = 0.5
+    // Current vault includes the deposit. Let's adjust.
+    let senior = engine.c_tot.get() + engine.insurance_fund.balance.get();
+    let target_residual = 50u128;
+    engine.vault = U128::new(senior + target_residual);
+
+    // Try converting 50: y = 50 * 0.5 = 25. Then sweep 25 from 25 capital.
+    // Post state: C=0, PNL=50, fee_debt=65. Eq_maint = 0 + 50 - 65 = -15. BAD.
+    let result = engine.convert_released_pnl_not_atomic(a, 50, 1000, 101, 0i128, 0);
+    assert!(result.is_err(),
+        "flat conversion must reject if post-conversion Eq_maint_raw < 0");
+}
+
+#[test]
+fn fix5_materialize_with_fee_requires_min_deposit() {
+    // materialize_with_fee must reject when post-fee capital < MIN_INITIAL_DEPOSIT
+    let mut engine = RiskEngine::new(default_params());
+    // new_account_fee = 1000, min_initial_deposit = 1000
+    // Paying exactly fee (1000) leaves excess = 0. Excess of 0 is OK (no capital).
+    // Paying fee + 1 leaves excess = 1 < min_initial_deposit. Must reject.
+    let result = engine.materialize_with_fee(
+        Account::KIND_USER, 1001, [0; 32], [0; 32]);
+    assert!(result.is_err(),
+        "materialize must reject when excess (1) < min_initial_deposit (1000)");
+
+    // Paying fee + min_initial_deposit should succeed
+    let result2 = engine.materialize_with_fee(
+        Account::KIND_USER, 2000, [0; 32], [0; 32]);
+    assert!(result2.is_ok(), "materialize must succeed with adequate capital");
+}

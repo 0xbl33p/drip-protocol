@@ -2782,6 +2782,12 @@ impl RiskEngine {
             return Err(RiskError::InsufficientBalance);
         }
 
+        // Post-fee capital must meet MIN_INITIAL_DEPOSIT
+        let excess = fee_payment.saturating_sub(required_fee);
+        if excess > 0 && excess < self.params.min_initial_deposit.get() {
+            return Err(RiskError::InsufficientBalance);
+        }
+
         // MAX_VAULT_TVL bound
         let v_candidate = self.vault.get().checked_add(fee_payment)
             .ok_or(RiskError::Overflow)?;
@@ -3003,12 +3009,12 @@ impl RiskEngine {
             let eq_withdraw = self.account_equity_withdraw_raw(&self.accounts[idx as usize]);
             let eq_post = eq_withdraw.saturating_sub(amount as i128);
             let notional = self.notional(idx as usize, oracle_price);
-            let im_req = if notional == 0 { 0u128 } else {
-                core::cmp::max(
-                    mul_div_floor_u128(notional, self.params.initial_margin_bps as u128, 10_000),
-                    self.params.min_nonzero_im_req,
-                )
-            };
+            // eff != 0 here, so always enforce min_nonzero_im_req even if
+            // notional floors to 0 for microscopic positions.
+            let im_req = core::cmp::max(
+                mul_div_floor_u128(notional, self.params.initial_margin_bps as u128, 10_000),
+                self.params.min_nonzero_im_req,
+            );
             if eq_post < im_req as i128 {
                 return Err(RiskError::Undercollateralized);
             }
@@ -3545,10 +3551,12 @@ impl RiskEngine {
         // Step 3: live local touch
         self.touch_account_live_local(idx as usize, &mut ctx)?;
 
-        // Finalize touched accounts
-        self.finalize_touched_accounts_post_live(&ctx);
-
+        // Step 4: liquidate (before finalize, so post-liquidation state gets finalized)
         let result = self.liquidate_at_oracle_internal(idx, now_slot, oracle_price, policy, &mut ctx)?;
+
+        // Step 5: finalize AFTER liquidation — post-liquidation flat accounts
+        // get whole-only conversion and fee sweep
+        self.finalize_touched_accounts_post_live(&ctx);
 
         // End-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
@@ -4297,10 +4305,19 @@ impl RiskEngine {
         // Step 9: sweep fee debt
         self.fee_debt_sweep(idx as usize);
 
-        // Step 10: require maintenance healthy if still has position
+        // Step 10: post-conversion health check
         let eff = self.effective_pos_q(idx as usize);
         if eff != 0 {
+            // Open position: require maintenance margin
             if !self.is_above_maintenance_margin(&self.accounts[idx as usize], idx as usize, oracle_price) {
+                return Err(RiskError::Undercollateralized);
+            }
+        } else {
+            // Flat account: require non-negative raw maintenance equity.
+            // Without this, a haircutted conversion + fee sweep can leave
+            // the account with Eq_maint_raw < 0 (more debt than capital).
+            let eq = self.account_equity_maint_raw(&self.accounts[idx as usize]);
+            if eq < 0 {
                 return Err(RiskError::Undercollateralized);
             }
         }
