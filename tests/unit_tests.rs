@@ -2471,6 +2471,82 @@ fn test_force_close_resolved_unused_slot_rejected() {
 }
 
 #[test]
+fn test_resolved_two_phase_no_deadlock() {
+    // Regression: prior single-function design deadlocked when two
+    // positive-PnL accounts both needed reconciliation. Err on phase 2
+    // rolled back phase 1, preventing either from making progress.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    // Open positions: a long, b short
+    engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
+
+    // Price up within 10% band — a gets positive PnL, b negative
+    let resolve_price = 1050u64;
+    engine.accrue_market_to(200, resolve_price).unwrap();
+    engine.resolve_market(resolve_price, 200).unwrap();
+
+    // Phase 1: reconcile both (persists progress, no deadlock)
+    engine.reconcile_resolved_not_atomic(a, 200).unwrap();
+    engine.reconcile_resolved_not_atomic(b, 200).unwrap();
+
+    // Both positions now zeroed, b's loss absorbed
+    assert_eq!(engine.stored_pos_count_long, 0);
+    assert_eq!(engine.stored_pos_count_short, 0);
+
+    // Phase 2: terminal close both
+    let a_cap = engine.close_resolved_terminal_not_atomic(a).unwrap();
+    let b_cap = engine.close_resolved_terminal_not_atomic(b).unwrap();
+
+    assert!(a_cap > 0 || b_cap > 0, "at least one gets capital back");
+    assert!(!engine.is_used(a as usize));
+    assert!(!engine.is_used(b as usize));
+    assert!(engine.check_conservation());
+}
+
+#[test]
+fn test_force_close_combined_convenience() {
+    // Combined force_close_resolved_not_atomic: returns Ok(0) for
+    // positive-PnL accounts that aren't terminal-ready yet, then
+    // completes on re-call after all accounts reconciled.
+    let mut engine = RiskEngine::new(default_params());
+    let a = engine.add_user(1000).unwrap();
+    let b = engine.add_user(1000).unwrap();
+    engine.deposit(a, 500_000, 1000, 100).unwrap();
+    engine.deposit(b, 500_000, 1000, 100).unwrap();
+
+    engine.execute_trade_not_atomic(a, b, 1000, 100, (100 * POS_SCALE) as i128, 1000, 0i128, 0).unwrap();
+    let resolve_price = 1050u64;
+    engine.accrue_market_to(200, resolve_price).unwrap();
+    engine.resolve_market(resolve_price, 200).unwrap();
+
+    // First call on positive-PnL account: reconciles, returns Ok(0)
+    let a_result = engine.force_close_resolved_not_atomic(a, 200).unwrap();
+    // a is reconciled (position zeroed) but b still has a position
+    // So a gets deferred payout
+    if engine.accounts[a as usize].pnl > 0 {
+        assert_eq!(a_result, 0, "positive PnL deferred until terminal");
+        assert!(engine.is_used(a as usize), "account stays open when deferred");
+    }
+
+    // Close b (loser, no payout gate)
+    let b_result = engine.force_close_resolved_not_atomic(b, 200).unwrap();
+    assert!(!engine.is_used(b as usize), "b closed");
+
+    // Now re-call a — terminal ready
+    if engine.is_used(a as usize) {
+        let a_final = engine.close_resolved_terminal_not_atomic(a).unwrap();
+        assert!(a_final > 0, "a gets payout after terminal ready");
+        assert!(!engine.is_used(a as usize));
+    }
+
+    assert!(engine.check_conservation());
+}
+
+#[test]
 fn test_force_close_same_epoch_positive_k_pair_pnl() {
     // Account opened long, price moved up → unrealized profit from K-pair
     let mut engine = RiskEngine::new(default_params());

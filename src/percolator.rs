@@ -4421,13 +4421,32 @@ impl RiskEngine {
         Ok(())
     }
 
-    /// Two-phase resolved close. Phase 1 (reconcile): materialize latent K-pair
-    /// PnL, settle losses, absorb insurance. Phase 2 (terminal payout): only after
-    /// ALL positions are zeroed, lock a payout snapshot and convert/return capital.
-    ///
-    /// This ensures payouts are order-invariant: every closer uses the same frozen
-    /// h_num/h_den computed from the fully-materialized terminal state.
+    /// Combined convenience: reconcile + terminal close if ready.
+    /// For pnl <= 0 accounts or terminal-ready markets, completes in one call.
+    /// For positive-PnL on non-terminal markets, reconciliation persists and
+    /// Ok(0) is returned (account stays open — re-call close_resolved_terminal
+    /// after all accounts reconciled).
     pub fn force_close_resolved_not_atomic(&mut self, idx: u16, resolved_slot: u64) -> Result<u128> {
+        // Phase 1: always reconcile (persists on success)
+        self.reconcile_resolved_not_atomic(idx, resolved_slot)?;
+
+        let i = idx as usize;
+
+        // pnl <= 0: can close immediately (loser/zero — no payout gate)
+        // pnl > 0: needs terminal readiness for payout
+        if self.accounts[i].pnl > 0 && !self.is_terminal_ready() {
+            // Reconciled but not yet payable. Progress persisted.
+            return Ok(0);
+        }
+
+        // Phase 2: terminal close
+        self.close_resolved_terminal_not_atomic(idx)
+    }
+
+    /// Phase 1: Reconcile a resolved account. Materializes K-pair PnL,
+    /// zeroes position, settles losses, absorbs insurance. Always persists
+    /// on success. Idempotent on already-reconciled accounts.
+    pub fn reconcile_resolved_not_atomic(&mut self, idx: u16, resolved_slot: u64) -> Result<()> {
         if self.market_mode != MarketMode::Resolved {
             return Err(RiskError::Unauthorized);
         }
@@ -4438,161 +4457,120 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
         self.current_slot = resolved_slot;
-
         let i = idx as usize;
-
-        // ================================================================
-        // Phase 1: RECONCILE — materialize K-pair PnL, zero position,
-        // settle losses, absorb insurance. No payout yet.
-        // ================================================================
 
         if self.accounts[i].position_basis_q != 0 {
             let basis = self.accounts[i].position_basis_q;
             let abs_basis = basis.unsigned_abs();
             let a_basis = self.accounts[i].adl_a_basis;
+            if a_basis == 0 { return Err(RiskError::CorruptState); }
             let k_snap = self.accounts[i].adl_k_snap;
             let side = side_of_i128(basis).unwrap();
             let epoch_snap = self.accounts[i].adl_epoch_snap;
             let epoch_side = self.get_epoch_side(side);
 
-            if a_basis == 0 {
-                return Err(RiskError::CorruptState);
-            }
-
-            // Compute K-pair PnL delta (validate before mutate)
             let k_end = if epoch_snap == epoch_side {
                 self.get_k_side(side)
-            } else {
-                self.get_k_epoch_start(side)
-            };
+            } else { self.get_k_epoch_start(side) };
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
             let pnl_delta = wide_signed_mul_div_floor_from_k_pair(abs_basis, k_snap, k_end, den);
-
             let new_pnl = self.accounts[i].pnl.checked_add(pnl_delta)
                 .ok_or(RiskError::Overflow)?;
-            if new_pnl == i128::MIN {
-                return Err(RiskError::Overflow);
-            }
+            if new_pnl == i128::MIN { return Err(RiskError::Overflow); }
 
             if epoch_snap != epoch_side {
                 if epoch_snap.checked_add(1) != Some(epoch_side) {
                     return Err(RiskError::CorruptState);
                 }
-                let old_stale = self.get_stale_count(side);
-                if old_stale == 0 {
+                if self.get_stale_count(side) == 0 {
                     return Err(RiskError::CorruptState);
                 }
             }
 
-            // MUTATE (all validated)
+            // MUTATE
             self.prepare_account_for_resolved_touch(i);
             if pnl_delta != 0 {
                 self.set_pnl(i, new_pnl);
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
             }
-
             if epoch_snap != epoch_side {
-                let old_stale = self.get_stale_count(side);
-                self.set_stale_count(side, old_stale - 1);
+                let old = self.get_stale_count(side);
+                self.set_stale_count(side, old - 1);
             }
-
-            // Zero position
             self.set_position_basis_q(i, 0);
             self.accounts[i].adl_a_basis = ADL_ONE;
             self.accounts[i].adl_k_snap = 0;
             self.accounts[i].adl_epoch_snap = 0;
         }
 
-        // Settle losses from principal (senior to payout)
         self.settle_losses(i);
-
-        // Absorb any remaining flat negative PnL
         self.resolve_flat_negative(i);
+        Ok(())
+    }
 
-        // ================================================================
-        // Phase 2: TERMINAL PAYOUT — only possible after all positions
-        // are zeroed (stored_pos_count == 0 on both sides). The payout
-        // snapshot is locked once and reused for all subsequent closers,
-        // making payouts order-invariant.
-        // ================================================================
+    /// Check if resolved market is terminal-ready for payouts.
+    pub fn is_terminal_ready(&self) -> bool {
+        if self.resolved_payout_ready != 0 { return true; }
+        if self.stored_pos_count_long != 0 || self.stored_pos_count_short != 0 {
+            return false;
+        }
+        let mut has_negative = false;
+        self.for_each_used(|_idx, acct| {
+            if acct.pnl < 0 { has_negative = true; }
+        });
+        !has_negative
+    }
 
-        // Terminal readiness: all positions zeroed AND no negative PnL
-        // accounts remain (all losses fully absorbed into insurance/haircut).
-        // Without the negative-PnL check, flat losers could still consume
-        // insurance after the snapshot is locked, corrupting the payout ratio.
-        let terminal_ready = self.resolved_payout_ready != 0 || {
-            let positions_clear = self.stored_pos_count_long == 0
-                && self.stored_pos_count_short == 0;
-            if !positions_clear { false }
-            else {
-                // Scan for any remaining negative PnL (flat losers not yet absorbed)
-                let mut has_negative = false;
-                self.for_each_used(|_idx, acct| {
-                    if acct.pnl < 0 { has_negative = true; }
-                });
-                !has_negative
+    /// Phase 2: Terminal close. Requires terminal readiness.
+    pub fn close_resolved_terminal_not_atomic(&mut self, idx: u16) -> Result<u128> {
+        if self.market_mode != MarketMode::Resolved {
+            return Err(RiskError::Unauthorized);
+        }
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+        let i = idx as usize;
+        if self.accounts[i].position_basis_q != 0 {
+            return Err(RiskError::Undercollateralized);
+        }
+        if self.accounts[i].pnl > 0 {
+            if !self.is_terminal_ready() {
+                return Err(RiskError::Unauthorized);
             }
-        };
-
-        if self.accounts[i].pnl > 0 && terminal_ready {
-            // Lock the payout snapshot exactly once
             if self.resolved_payout_ready == 0 {
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
-                let senior_sum = self.c_tot.get().checked_add(
+                let senior = self.c_tot.get().checked_add(
                     self.insurance_fund.balance.get()).unwrap_or(u128::MAX);
-                let residual = if self.vault.get() >= senior_sum {
-                    self.vault.get() - senior_sum
-                } else { 0u128 };
+                let residual = if self.vault.get() >= senior {
+                    self.vault.get() - senior } else { 0u128 };
                 let h_den = self.pnl_matured_pos_tot;
                 let h_num = if h_den == 0 { 0 } else {
-                    core::cmp::min(residual, h_den)
-                };
+                    core::cmp::min(residual, h_den) };
                 self.resolved_payout_h_num = h_num;
                 self.resolved_payout_h_den = h_den;
                 self.resolved_payout_ready = 1;
             }
-
-            // Release all reserves
             self.prepare_account_for_resolved_touch(i);
-
-            // Convert using frozen terminal snapshot (order-invariant)
             let released = self.released_pos(i);
             if released > 0 {
-                let h_num = self.resolved_payout_h_num;
-                let h_den = self.resolved_payout_h_den;
-                let y = if h_den == 0 { released } else {
-                    wide_mul_div_floor_u128(released, h_num, h_den)
+                let y = if self.resolved_payout_h_den == 0 { released } else {
+                    wide_mul_div_floor_u128(released,
+                        self.resolved_payout_h_num, self.resolved_payout_h_den)
                 };
                 self.consume_released_pnl(i, released);
                 let new_cap = add_u128(self.accounts[i].capital.get(), y);
                 self.set_capital(i, new_cap);
             }
-        } else if self.accounts[i].pnl > 0 {
-            // Positive PnL but terminal state not reached — positions remain
-            // or negative-PnL accounts haven't been absorbed yet.
-            // Account is NOT freed. Caller must reconcile all remaining
-            // accounts first, then re-call force_close.
-            return Err(RiskError::Undercollateralized);
         }
-
-        // Sweep fee debt from capital
         self.fee_debt_sweep(i);
-
-        // Forgive any remaining fee debt
         if self.accounts[i].fee_credits.get() < 0 {
             self.accounts[i].fee_credits = I128::ZERO;
         }
-
-        // Return capital and free slot
         let capital = self.accounts[i].capital;
-        if capital > self.vault {
-            return Err(RiskError::InsufficientBalance);
-        }
+        if capital > self.vault { return Err(RiskError::InsufficientBalance); }
         self.vault = self.vault - capital;
         self.set_capital(i, 0);
-
         self.free_slot(idx);
-
         Ok(capital.get())
     }
 
