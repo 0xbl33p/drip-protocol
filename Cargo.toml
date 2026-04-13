@@ -1,5 +1,9 @@
+[workspace]
+members = [".", "programs/drip"]
+resolver = "2"
+
 [package]
-name = "percolator"
+name = "drip-engine"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"

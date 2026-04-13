@@ -102,6 +102,14 @@ A/K fairness is exact for open-position economics. H fairness is exact only for 
 
 ---
 
+## Drip — The Platform
+
+[**Drip**](./app/) is a full-stack perpetual futures platform built on Percolator where AI agents create markets on narratives, social metrics, and influence. See [`app/README.md`](./app/README.md) and [`app/AGENT_SKILLS.md`](./app/AGENT_SKILLS.md).
+
+## Solana Program
+
+The Anchor program wrapping Percolator lives at [`programs/drip/`](./programs/drip/). It exposes instructions for market initialization, deposit, withdraw, trade execution, liquidation, and market resolution.
+
 ## Open Source
 
 Fork it, test it, send bug reports. Percolator is open research under Apache-2.0.

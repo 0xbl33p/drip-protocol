@@ -39,3 +39,17 @@ desktop.ini
 .env
 .env.local
 test-ledger/
+
+# Claude Code / AI tooling
+.claude/
+.agents/
+skills-lock.json
+
+# Node
+node_modules/
+
+# Next.js (in app/)
+app/.next/
+app/out/
+app/.env
+app/.env.local

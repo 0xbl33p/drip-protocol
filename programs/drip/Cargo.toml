@@ -1,0 +1,27 @@
+[package]
+name = "drip"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Drip — Perpetual futures on everything. Anchor program wrapping the Percolator risk engine."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "drip"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.30", features = ["init-if-needed"] }
+percolator = { package = "drip-engine", path = "../..", features = ["test"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[profile.sbf]
+inherits = "release"
+panic = "abort"

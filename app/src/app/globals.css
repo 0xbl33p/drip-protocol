@@ -1,0 +1,229 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── Drip Design Tokens ──────────────────────────────────── */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-data);
+  --font-heading: var(--font-display);
+
+  /* Drip accent palette */
+  --color-cyan: #00D9FF;
+  --color-cyan-dim: #00D9FF40;
+  --color-violet: #8B5CF6;
+  --color-violet-dim: #8B5CF640;
+  --color-gold: #FFB800;
+  --color-gold-dim: #FFB80040;
+  --color-emerald: #10B981;
+  --color-coral: #FF6B6B;
+
+  /* Shadcn compatibility */
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+}
+
+/* ── Dark-only theme (Drip is always dark) ──────────────── */
+
+:root {
+  /* Ocean depths */
+  --background: #050a14;
+  --foreground: #e2e8f0;
+
+  /* Surface layers */
+  --bg-deep: #0a1628;
+  --bg-surface: #111d33;
+  --bg-raised: #162240;
+
+  /* Shadcn token mapping */
+  --card: #0a1628;
+  --card-foreground: #e2e8f0;
+  --popover: #0f1a2e;
+  --popover-foreground: #e2e8f0;
+  --primary: #00D9FF;
+  --primary-foreground: #050a14;
+  --secondary: #162240;
+  --secondary-foreground: #e2e8f0;
+  --muted: #162240;
+  --muted-foreground: #64748b;
+  --accent: #1e293b;
+  --accent-foreground: #e2e8f0;
+  --destructive: #FF6B6B;
+  --border: rgba(255, 255, 255, 0.08);
+  --input: rgba(255, 255, 255, 0.08);
+  --ring: #00D9FF;
+  --radius: 0.75rem;
+
+  /* Chart colors */
+  --chart-1: #00D9FF;
+  --chart-2: #8B5CF6;
+  --chart-3: #10B981;
+  --chart-4: #FFB800;
+  --chart-5: #FF6B6B;
+
+  /* Glass tokens */
+  --glass-bg-1: rgba(255, 255, 255, 0.03);
+  --glass-bg-2: rgba(255, 255, 255, 0.06);
+  --glass-bg-3: rgba(255, 255, 255, 0.09);
+  --glass-border-1: rgba(255, 255, 255, 0.06);
+  --glass-border-2: rgba(255, 255, 255, 0.10);
+  --glass-border-3: rgba(0, 217, 255, 0.20);
+  --glass-glow-cyan: 0 0 30px rgba(0, 217, 255, 0.12);
+  --glass-glow-gold: 0 0 30px rgba(255, 184, 0, 0.10);
+  --glass-glow-violet: 0 0 30px rgba(139, 92, 246, 0.12);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    overflow-x: hidden;
+  }
+  html {
+    @apply font-sans;
+    color-scheme: dark;
+  }
+}
+
+/* ── Glass Tier Utilities ────────────────────────────────── */
+
+@layer utilities {
+  .glass-1 {
+    background: var(--glass-bg-1);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--glass-border-1);
+  }
+  .glass-2 {
+    background: var(--glass-bg-2);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--glass-border-2);
+  }
+  .glass-3 {
+    background: var(--glass-bg-3);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid var(--glass-border-3);
+    box-shadow: var(--glass-glow-cyan);
+  }
+  .glass-gold {
+    background: var(--glass-bg-3);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(255, 184, 0, 0.25);
+    box-shadow: var(--glass-glow-gold);
+  }
+  .glass-violet {
+    background: var(--glass-bg-2);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(139, 92, 246, 0.20);
+    box-shadow: var(--glass-glow-violet);
+  }
+
+  /* Text utilities */
+  .text-gain { color: #10B981; }
+  .text-loss { color: #FF6B6B; }
+
+  /* Shimmer loading animation */
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      var(--glass-bg-1) 0%,
+      var(--glass-bg-2) 50%,
+      var(--glass-bg-1) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  /* Scrollbar hiding */
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* ── Mobile Responsive ───────────────────────────────────── */
+
+@layer base {
+  /* Touch targets — minimum 44px on interactive elements */
+  @media (pointer: coarse) {
+    button, a, [role="button"] {
+      min-height: 44px;
+      min-width: 44px;
+    }
+  }
+
+  /* Safe area insets for notched phones */
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+
+  /* Prevent text size adjustment on orientation change */
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+}
+
+/* ── Glass Fallback (no backdrop-filter support) ──────────── */
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-1 { background: rgba(10, 22, 40, 0.9); }
+  .glass-2 { background: rgba(15, 26, 46, 0.92); }
+  .glass-3 { background: rgba(17, 29, 51, 0.95); }
+  .glass-gold { background: rgba(17, 29, 51, 0.95); }
+  .glass-violet { background: rgba(17, 20, 51, 0.95); }
+}
+
+/* ── Reduced Motion ──────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
