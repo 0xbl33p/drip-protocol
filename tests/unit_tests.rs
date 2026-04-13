@@ -1434,7 +1434,8 @@ fn test_accrue_market_funding_rate_zero_no_funding_applied() {
 
 #[test]
 fn test_accrue_market_applies_funding_transfer() {
-    // Spec v12.14.0 §5.4: live funding — K coefficients change when r_last != 0
+    // Spec v12.16.5 §5.5: funding goes to F indices, not K.
+    // fund_num_total = fund_px_0 * rate * dt (one exact delta, no substeps)
     let mut engine = RiskEngine::new(default_params());
     engine.last_oracle_price = 1000;
     engine.last_market_slot = 0;
@@ -1443,24 +1444,24 @@ fn test_accrue_market_applies_funding_transfer() {
     engine.oi_eff_long_q = POS_SCALE;
     engine.oi_eff_short_q = POS_SCALE;
 
+    let f_long_before = engine.f_long_num;
+    let f_short_before = engine.f_short_num;
     let k_long_before = engine.adl_coeff_long;
-    let k_short_before = engine.adl_coeff_short;
 
     // Positive rate: longs pay shorts (10% in ppb)
-    engine.accrue_market_to(10, 1000, 100_000_000).unwrap(); // same price, dt=10
+    engine.accrue_market_to(10, 1000, 100_000_000).unwrap();
 
-    // fund_num = 1000 * 100_000_000 * 10 = 1_000_000_000_000
-    // fund_term = floor(1_000_000_000_000 / 1_000_000_000) = 1000
-    // K_long -= A_long * 1000 = ADL_ONE * 1000 = 1_000_000_000
-    // K_short += A_short * 1000 = ADL_ONE * 1000 = 1_000_000_000
-    assert!(engine.adl_coeff_long < k_long_before,
-        "positive rate: long K must decrease");
-    assert!(engine.adl_coeff_short > k_short_before,
-        "positive rate: short K must increase");
-    assert_eq!(k_long_before - engine.adl_coeff_long, 1_000_000_000,
-        "long K delta must equal A_long * fund_term");
-    assert_eq!(engine.adl_coeff_short - k_short_before, 1_000_000_000,
-        "short K delta must equal A_short * fund_term");
+    // fund_num_total = 1000 * 100_000_000 * 10 = 1_000_000_000_000
+    // F_long -= A_long * fund_num_total = ADL_ONE * 1e12 = 1e18
+    // F_short += A_short * fund_num_total = ADL_ONE * 1e12 = 1e18
+    assert!(engine.f_long_num < f_long_before,
+        "positive rate: F_long must decrease");
+    assert!(engine.f_short_num > f_short_before,
+        "positive rate: F_short must increase");
+
+    // K unchanged by funding (only mark changes K)
+    assert_eq!(engine.adl_coeff_long, k_long_before,
+        "K must not change from funding (funding goes to F only)");
 }
 
 #[test]
@@ -3542,13 +3543,12 @@ fn funding_basic_sign_convention() {
     // Trade at oracle price — no slippage, no mark delta
     engine.execute_trade_not_atomic(a, b, oracle, slot, size, oracle, 50_000_000i128, 0).unwrap();
 
-    // Manually accrue to verify funding changes K (pass rate directly)
-    let k_before = engine.adl_coeff_long;
+    // Manually accrue to verify funding changes F (v12.16.5: funding goes to F, not K)
+    let f_long_before = engine.f_long_num;
     engine.accrue_market_to(slot + 10, oracle, 50_000_000).unwrap();
-    let k_after = engine.adl_coeff_long;
-    assert!(k_after != k_before,
-        "K must change from funding: before={} after={} oi_long={} oi_short={}",
-        k_before, k_after, engine.oi_eff_long_q, engine.oi_eff_short_q);
+    assert!(engine.f_long_num != f_long_before,
+        "F_long must change from funding: before={} after={}",
+        f_long_before, engine.f_long_num);
 
     engine.current_slot = slot + 10;
 

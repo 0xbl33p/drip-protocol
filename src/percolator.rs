@@ -218,14 +218,17 @@ impl InstructionContext {
     }
 
     /// Add account to touched set if not already present
-    pub fn add_touched(&mut self, idx: u16) {
+    pub fn add_touched(&mut self, idx: u16) -> bool {
         let count = self.touched_count as usize;
         for i in 0..count {
-            if self.touched_accounts[i] == idx { return; }
+            if self.touched_accounts[i] == idx { return true; } // dedup
         }
         if count < MAX_TOUCHED_PER_INSTRUCTION {
             self.touched_accounts[count] = idx;
             self.touched_count += 1;
+            true
+        } else {
+            false // capacity exceeded — caller MUST fail
         }
     }
 }
@@ -1606,54 +1609,32 @@ impl RiskEngine {
             }
         }
 
-        // Step 6: Funding transfer via sub-stepping (spec v12.15 §5.4)
-        // K gets the integer fund_term (backward compatible). F accumulates
-        // the per-side fractional remainder for high-precision per-account settlement.
-        // Use passed-in funding_rate_e9 directly (v12.16.4: no stored rate).
-        // Use self.last_oracle_price as fund_px_0 (v12.16.4: no separate funding_price_sample_last).
+        // Step 8: Funding transfer — one exact total delta (spec v12.16.5 §5.5).
+        // fund_num_total = fund_px_0 * funding_rate_e9_per_slot * dt
+        // computed in exact wide signed domain. No substep loop.
         let mut f_long = self.f_long_num;
         let mut f_short = self.f_short_num;
         if funding_rate_e9 != 0 && total_dt > 0 && long_live && short_live {
             let fund_px_0 = self.last_oracle_price;
 
             if fund_px_0 > 0 {
-                let mut dt_remaining = total_dt;
-                let mut fund_accum: i128 = 0;
+                // Exact computation: fund_num_total = fund_px_0 * rate * dt
+                // fund_px_0 <= MAX_ORACLE_PRICE (1e12), rate <= 1e9, dt <= u64::MAX
+                // Product can exceed i128, so use checked i128 arithmetic with
+                // overflow routing to Err.
+                let fund_num_total: i128 = (fund_px_0 as i128)
+                    .checked_mul(funding_rate_e9)
+                    .ok_or(RiskError::Overflow)?
+                    .checked_mul(total_dt as i128)
+                    .ok_or(RiskError::Overflow)?;
 
-                while dt_remaining > 0 {
-                    let dt_sub = core::cmp::min(dt_remaining, MAX_FUNDING_DT);
-                    dt_remaining -= dt_sub;
+                // F_long -= A_long * fund_num_total
+                let df_long = checked_u128_mul_i128(self.adl_mult_long, fund_num_total)?;
+                f_long = f_long.checked_sub(df_long).ok_or(RiskError::Overflow)?;
 
-                    // fund_num = fund_px_0 * funding_rate_e9_per_slot * dt_sub
-                    let fund_num: i128 = (fund_px_0 as i128)
-                        .checked_mul(funding_rate_e9)
-                        .ok_or(RiskError::Overflow)?
-                        .checked_mul(dt_sub as i128)
-                        .ok_or(RiskError::Overflow)?;
-
-                    // Integer part goes into K (backward compatible)
-                    fund_accum = fund_accum.checked_add(fund_num).ok_or(RiskError::Overflow)?;
-                    let fund_term = fund_accum / (FUNDING_DEN as i128);
-                    fund_accum -= fund_term * (FUNDING_DEN as i128);
-
-                    if fund_term != 0 {
-                        let dk_long = checked_u128_mul_i128(self.adl_mult_long, fund_term)?;
-                        k_long = k_long.checked_sub(dk_long).ok_or(RiskError::Overflow)?;
-                        let dk_short = checked_u128_mul_i128(self.adl_mult_short, fund_term)?;
-                        k_short = k_short.checked_add(dk_short).ok_or(RiskError::Overflow)?;
-                    }
-
-                    // F tracks the remainder delta (fractional correction per side)
-                    let remainder_delta = fund_num.checked_sub(
-                        fund_term.checked_mul(FUNDING_DEN as i128).ok_or(RiskError::Overflow)?
-                    ).ok_or(RiskError::Overflow)?;
-                    if remainder_delta != 0 {
-                        let df_long = checked_u128_mul_i128(self.adl_mult_long, remainder_delta)?;
-                        f_long = f_long.checked_sub(df_long).ok_or(RiskError::Overflow)?;
-                        let df_short = checked_u128_mul_i128(self.adl_mult_short, remainder_delta)?;
-                        f_short = f_short.checked_add(df_short).ok_or(RiskError::Overflow)?;
-                    }
-                }
+                // F_short += A_short * fund_num_total
+                let df_short = checked_u128_mul_i128(self.adl_mult_short, fund_num_total)?;
+                f_short = f_short.checked_add(df_short).ok_or(RiskError::Overflow)?;
             }
         }
 
@@ -2587,7 +2568,9 @@ impl RiskEngine {
         if idx >= MAX_ACCOUNTS || !self.is_used(idx) {
             return Err(RiskError::AccountNotFound);
         }
-        ctx.add_touched(idx as u16);
+        if !ctx.add_touched(idx as u16) {
+            return Err(RiskError::Overflow); // touched-set capacity exceeded
+        }
 
         // Step 4: advance cohort-based warmup
         self.advance_profit_warmup(idx);
