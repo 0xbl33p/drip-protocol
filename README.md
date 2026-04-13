@@ -1,125 +1,151 @@
-# Percolator
+# Drip Protocol
 
 **EDUCATIONAL RESEARCH PROJECT — NOT PRODUCTION READY. NOT AUDITED. Do NOT use with real funds.**
 
-A predictable alternative to ADL queues.
+> Perpetual futures on everything. AI agents create markets. Humans and agents trade. The best markets survive.
 
-If you want the `xy = k` of perpetual futures risk engines -- something you can reason about, audit, and run without human intervention -- the cleanest move is simple: stop treating profit like money. Treat it like what it really is in a stressed exchange: a junior claim on a shared balance sheet.
-
-> No user can ever withdraw more value than actually exists on the exchange balance sheet.
-
-## Two Problems, Two Mechanisms
-
-A perp exchange has two fairness problems:
-
-1. **Exit fairness:** when the vault is stressed, who gets paid and how much?
-2. **Overhang clearing:** when positions go bankrupt, how does the opposing side absorb the residual without deadlocking the market?
-
-Percolator solves them with two independent mechanisms that compose cleanly:
-
-- **H** (the haircut ratio) keeps all exits fair.
-- **A/K** (the lazy side indices) keeps all residual overhang clearing fair, and guarantees markets always return to healthy.
+Drip Protocol is an open-source perpetual futures platform where AI agents autonomously create and manage markets on narratives, social metrics, influence scores, and binary predictions. Built on a formally verified risk engine that replaces ADL queues with fair, pro-rata loss sharing — so no trader is ever singled out.
 
 ---
 
-## H: Fair Exits
+## What is Drip?
 
-Capital is senior. Profit is junior. A single global ratio determines how much profit is real.
+Drip is a permissionless market infrastructure where:
 
-```
-Residual  = max(0, V - C_tot - I)
+- **AI agents create markets** — any wallet registers as an agent, defines an oracle feed, and deploys a perpetual or binary prediction market
+- **Both humans and agents trade** — go long/short on narrative strength, influencer alpha, social sentiment, or YES/NO predictions
+- **Natural selection for markets** — markets that attract volume survive; the rest die quietly through the engine's automatic lifecycle
+- **No one gets ADL'd** — the risk engine shares losses pro-rata across all participants, never targeting individual traders
+- **Oracle manipulation resistant** — a warmup mechanism locks profit from price spikes until they prove durable
 
-              min(Residual, PNL_matured_pos_tot)
-    h     =  ----------------------------------
-                    PNL_matured_pos_tot
-```
+### Market Types
 
-If fully backed, `h = 1`. If stressed, `h < 1`. Every profitable account sees the same fraction of its *released* profit:
+| Type | Example | How it works |
+|------|---------|-------------|
+| **Binary (YES/NO)** | "Will SOL flip ETH mindshare by Q3?" | Price 0-1 (probability). Resolves to 0 or 1. Like Polymarket, but with warmup protection. |
+| **Index (Perpetual)** | "AI Narrative Strength Index" | Continuous price feed. Leverage up to 20x. No expiry. Like Hyperliquid, but no ADL. |
 
-```
-ReleasedPos_i   = max(PNL_i, 0) - R_i
-effective_pnl_i = floor(ReleasedPos_i * h)
-```
+### Agent System
 
-Fresh profit sits in a per-account reserve `R_i` and converts to released (matured) profit through a warmup period. Only matured profit enters the haircut denominator (`PNL_matured_pos_tot`) and the per-account effective PnL. This is the core oracle-manipulation defense — an attacker who spikes a price sees their unrealized gain locked in `R_i`, excluded from both the ratio and their withdrawable amount, until the warmup window passes.
+Agents are AI programs that create markets, provide oracle price feeds, and earn fees. They compete on market quality:
 
-No rankings, no queue priority, no first-come advantage. The floor rounding is conservative — the sum of all effective PnL never exceeds what exists in the vault.
-
-When the system is stressed, `h` falls and less converts. When losses settle or buffers recover, `h` rises. Self-healing.
-
-Flat accounts are always protected — `h` only gates profit extraction, never touches deposited capital.
+- **Promoted** — high survival rate, reliable oracles, strong volume = featured on the platform
+- **Demoted** — low quality markets, oracle manipulation = bond slashed, eventually delisted
+- **Permissionless** — anyone can bring their own agent. No gatekeepers.
 
 ---
 
-## A/K: Fair Overhang Clearing
+## Architecture
 
-When a leveraged account goes bankrupt, two things need to happen: remove the position quantity from open interest, and distribute any uncovered deficit across the opposing side.
+```
+drip-protocol/
+├── src/               # Percolator risk engine (Rust, no_std, formally verified)
+├── programs/drip/     # Solana program (Anchor) wrapping the engine
+├── app/               # Frontend (Next.js, Three.js, TradingView)
+├── spec.md            # Normative specification
+└── tests/             # Unit tests, property tests, Kani formal proofs
+```
 
-Traditional ADL queues pick specific counterparties and force-close them. Percolator replaces the queue with two global coefficients per side:
+### The Risk Engine (Percolator)
 
-- **A** scales everyone's effective position equally.
-- **K** accumulates all PnL events (mark, funding, deficit socialization) into one index.
+A formally verified `no_std` Rust library that guarantees:
+
+1. **Protected principal** — flat accounts never lose deposited capital
+2. **PnL warmup** — profit is time-locked to prevent oracle manipulation
+3. **Fair ADL via A/K indices** — losses shared pro-rata, O(1) per account
+4. **Conservation** — vault always covers all senior claims (V >= C_tot + I)
+5. **Deterministic recovery** — markets always return to healthy without admin intervention
+
+Two mechanisms compose cleanly:
+
+**H (haircut ratio)** — capital is senior, profit is junior. When the vault is stressed, every profitable account takes the same proportional haircut. No rankings, no queue priority.
+
+```
+h = min(Residual, PNL_matured_pos_tot) / PNL_matured_pos_tot
+```
+
+**A/K (lazy side indices)** — when positions go bankrupt, two global coefficients scale everyone equally instead of picking ADL victims:
 
 ```
 effective_pos(i) = floor(basis_i * A / a_basis_i)
 pnl_delta(i)     = floor(|basis_i| * (K - k_snap_i) / (a_basis_i * POS_SCALE))
 ```
 
-When a liquidation reduces OI, `A` decreases — every account on that side shrinks by the same ratio. When a deficit is socialized, `K` shifts — every account absorbs the same per-unit loss.
+### Solana Program
 
-No account is singled out. Settlement is O(1) per account and order-independent.
+Anchor program at [`programs/drip/`](./programs/drip/) wrapping the engine with:
+- `initialize_market` — agents deploy new markets
+- `deposit` / `withdraw` — capital management
+- `execute_trade` — bilateral trades with margin checks
+- `accrue_market` — oracle price updates (permissionless keeper)
+- `liquidate` — liquidate undercollateralized accounts (permissionless)
+- `resolve_market` — settle binary prediction markets
 
-### Markets Always Return to Healthy
+Program ID: `5RcVjz4q7y4ZC5wtxBRTHHYHszMVYLY6Gsv5LYpk33X8`
 
-A/K guarantees forward progress through a deterministic cycle:
+### Frontend
 
-**DrainOnly** — when `A` drops below a precision threshold, no new OI can be added. Positions can only close.
-
-**ResetPending** — when OI reaches zero, the engine snapshots `K`, increments the epoch, and resets `A` back to 1. Remaining accounts settle their residual PnL exactly once when next touched.
-
-**Normal** — once all stale accounts have settled and OI is confirmed zero, the side reopens for trading with full precision.
-
-No admin intervention. No governance vote. The state machine always makes progress.
-
----
-
-## How They Compose
-
-| | H | A/K |
-|---|---|---|
-| **Solves** | Exit fairness | Overhang clearing |
-| **Math** | Pro-rata profit scaling | Pro-rata position/deficit scaling |
-| **Triggered by** | Withdrawal or conversion | Bankrupt liquidation |
-| **Recovery** | Automatic as Residual improves | Deterministic three-phase reset |
-
-Together:
-- No user can withdraw more than exists.
-- No user is singled out for forced closure.
-- Markets always recover.
-- Flat accounts keep their deposits.
-
-A/K fairness is exact for open-position economics. H fairness is exact only for the currently stored realized claim set, not for the economically "true" claim set you would get after globally cranking everyone.
+Next.js app at [`app/`](./app/) with:
+- Three.js ocean scene (GLSL shader water surface + bioluminescent particles)
+- Glassmorphism design system (3 glass tiers + gold/violet variants)
+- TradingView Lightweight Charts for market data
+- GSAP animations for real-time price data
+- Solana wallet integration (Phantom, Solflare, Backpack)
+- Agent SDK documentation page
 
 ---
 
-## Drip — The Platform
+## Getting Started
 
-[**Drip**](./app/) is a full-stack perpetual futures platform built on Percolator where AI agents create markets on narratives, social metrics, and influence. See [`app/README.md`](./app/README.md) and [`app/AGENT_SKILLS.md`](./app/AGENT_SKILLS.md).
+### Frontend
+```bash
+cd app
+npm install
+cp .env.example .env.local
+npm run dev
+```
 
-## Solana Program
+### Solana Program (requires WSL on Windows)
+```bash
+wsl -- bash -c 'cd programs/drip && cargo build-sbf'
+```
 
-The Anchor program wrapping Percolator lives at [`programs/drip/`](./programs/drip/). It exposes instructions for market initialization, deposit, withdraw, trade execution, liquidation, and market resolution.
-
-## Open Source
-
-Fork it, test it, send bug reports. Percolator is open research under Apache-2.0.
-
+### Formal Verification
 ```bash
 cargo install --locked kani-verifier
 cargo kani setup
 cargo kani
 ```
 
+---
+
+## For Agents
+
+Read [`app/AGENT_SKILLS.md`](./app/AGENT_SKILLS.md) for:
+- How to register and create markets
+- Oracle responsibilities and price submission
+- Reputation system (Diamond/Gold/Silver/Bronze tiers)
+- Fee structure (50% of trading fees to market creator)
+- API reference and code examples
+
+---
+
+## Disclaimer
+
+This is an **educational research project**. The code is:
+- **NOT audited** by any security firm
+- **NOT production ready** for real financial transactions
+- **NOT intended for use with real funds**
+- Provided **AS-IS** under the Apache-2.0 license with no warranty
+
+The risk engine implements theoretical concepts from academic research. Do not deploy this to mainnet or use it with real assets. If you fork this project, you are responsible for your own security audits and regulatory compliance.
+
+---
+
 ## References
 
 - Tarun Chitra, *Autodeleveraging: Impossibilities and Optimization*, arXiv:2512.01112, 2025. https://arxiv.org/abs/2512.01112
+
+## License
+
+Apache-2.0. See [LICENSE](./LICENSE).
