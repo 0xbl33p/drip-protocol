@@ -770,6 +770,7 @@ impl RiskEngine {
         self.materialized_account_count = 0;
         self.neg_pnl_account_count = 0;
         self.last_oracle_price = init_oracle_price;
+        self.fund_px_last = init_oracle_price;
         self.last_market_slot = init_slot;
         self.f_long_num = 0;
         self.f_short_num = 0;
@@ -3908,13 +3909,18 @@ impl RiskEngine {
         }
 
         // Step 6: compute y using pre-conversion haircut (spec §7.4).
-        // Because x_req > 0 implies pnl_matured_pos_tot > 0, h_den is strictly positive.
         let (h_num, h_den) = self.haircut_ratio();
-        assert!(h_den > 0, "convert_released_pnl_not_atomic: h_den must be > 0 when x_req > 0");
+        if h_den == 0 { return Err(RiskError::CorruptState); }
 
-        // Note: x_safe = floor(released * h_den / (h_den - h_num)) is always >= released
-        // (since h_den / (h_den - h_num) >= 1), and step 5 already requires x_req <= released.
-        // So x_req <= released <= x_safe always holds — no additional cap needed.
+        // Step 9 (spec §9.3.1): flat-account safety cap (spec §4.12)
+        if self.accounts[idx as usize].position_basis_q == 0 {
+            let max_safe = self.max_safe_flat_conversion_released(
+                idx as usize, x_req, h_num, h_den);
+            if x_req > max_safe {
+                return Err(RiskError::Undercollateralized);
+            }
+        }
+
         let y: u128 = wide_mul_div_floor_u128(x_req, h_num, h_den);
 
         // Step 7: consume_released_pnl(i, x_req)
@@ -4101,6 +4107,11 @@ impl RiskEngine {
         self.resolved_k_long_terminal_delta = resolved_k_long_td;
         self.resolved_k_short_terminal_delta = resolved_k_short_td;
 
+        // Step 13: clear resolved payout snapshot state
+        self.resolved_payout_h_num = 0;
+        self.resolved_payout_h_den = 0;
+        self.resolved_payout_ready = 0;
+
         // Step 14: all positive PnL is now matured
         self.pnl_matured_pos_tot = self.pnl_pos_tot;
 
@@ -4129,7 +4140,9 @@ impl RiskEngine {
         }
 
         // Step 21
-        assert!(self.oi_eff_long_q == 0 && self.oi_eff_short_q == 0);
+        if self.oi_eff_long_q != 0 || self.oi_eff_short_q != 0 {
+            return Err(RiskError::CorruptState);
+        }
 
         Ok(())
     }
@@ -4144,6 +4157,9 @@ impl RiskEngine {
         self.reconcile_resolved_not_atomic(idx, resolved_slot)?;
 
         let i = idx as usize;
+
+        // Finalize any sides that are fully ready for reopening
+        self.maybe_finalize_ready_reset_sides();
 
         // pnl <= 0: can close immediately (loser/zero — no payout gate)
         // pnl > 0: needs terminal readiness for payout
@@ -4173,6 +4189,9 @@ impl RiskEngine {
         self.current_slot = resolved_slot;
         let i = idx as usize;
 
+        // Always clear reserve metadata (even flat accounts may have ghost bucket flags)
+        self.prepare_account_for_resolved_touch(i);
+
         if self.accounts[i].position_basis_q != 0 {
             let basis = self.accounts[i].position_basis_q;
             let abs_basis = basis.unsigned_abs();
@@ -4198,8 +4217,12 @@ impl RiskEngine {
                 (self.get_k_side(side), self.get_f_side(side))
             } else {
                 // Stale (normal resolved path): K_epoch_start + terminal delta, F_epoch_start
-                let k_base = self.get_k_epoch_start(side);
-                let k_terminal = k_base.checked_add(resolved_k_td).ok_or(RiskError::Overflow)?;
+                // Use I256 for k_terminal so resolution works even when the sum exceeds i128
+                let k_base_wide = I256::from_i128(self.get_k_epoch_start(side));
+                let k_td_wide = I256::from_i128(resolved_k_td);
+                let k_terminal_wide = k_base_wide.checked_add(k_td_wide).ok_or(RiskError::Overflow)?;
+                // Pass through compute_kf_pnl_delta which already accepts I256-range intermediates
+                let k_terminal = k_terminal_wide.try_into_i128().ok_or(RiskError::Overflow)?;
                 (k_terminal, self.get_f_epoch_start(side))
             };
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
@@ -4218,8 +4241,7 @@ impl RiskEngine {
                 }
             }
 
-            // MUTATE
-            self.prepare_account_for_resolved_touch(i);
+            // MUTATE (prepare already called above)
             if pnl_delta != 0 {
                 self.set_pnl(i, new_pnl);
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
@@ -4294,8 +4316,9 @@ impl RiskEngine {
             let released = self.released_pos(i);
             if released > 0 {
                 // Spec forbids h_den==0 with positive released PnL when snapshot is ready.
-                assert!(self.resolved_payout_h_den > 0,
-                    "resolved payout snapshot h_den must be > 0 with positive released PnL");
+                if self.resolved_payout_h_den == 0 {
+                    return Err(RiskError::CorruptState);
+                }
                 let y = wide_mul_div_floor_u128(released,
                     self.resolved_payout_h_num, self.resolved_payout_h_den);
                 self.consume_released_pnl(i, released);
