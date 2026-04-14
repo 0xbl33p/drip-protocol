@@ -446,7 +446,7 @@ impl FuzzState {
                 let before = (*self.engine).clone();
                 let vault_before = self.engine.vault;
 
-                let result = self.engine.deposit(idx, *amount, oracle, 0);
+                let result = self.engine.deposit_not_atomic(idx, *amount, oracle, 0);
 
                 match result {
                     Ok(()) => {
@@ -653,7 +653,7 @@ proptest! {
 
         // Initial deposits
         for &idx in &state.live_accounts.clone() {
-            let _ = state.engine.deposit(idx, 10_000, DEFAULT_ORACLE, 0);
+            let _ = state.engine.deposit_not_atomic(idx, 10_000, DEFAULT_ORACLE, 0);
         }
 
         // Top up insurance using proper API (maintains conservation)
@@ -691,7 +691,7 @@ proptest! {
 
         // Initial deposits
         for &idx in &state.live_accounts.clone() {
-            let _ = state.engine.deposit(idx, 10_000, DEFAULT_ORACLE, 0);
+            let _ = state.engine.deposit_not_atomic(idx, 10_000, DEFAULT_ORACLE, 0);
         }
 
         // Top up insurance using proper API (maintains conservation)
@@ -901,7 +901,7 @@ fn run_deterministic_fuzzer(
 
         // Initial deposits
         for &idx in &state.live_accounts.clone() {
-            let _ = state.engine.deposit(idx, rng.u128(5_000, 50_000), DEFAULT_ORACLE, 0);
+            let _ = state.engine.deposit_not_atomic(idx, rng.u128(5_000, 50_000), DEFAULT_ORACLE, 0);
         }
 
         // Top up insurance using proper API (maintains conservation)
@@ -1026,7 +1026,7 @@ proptest! {
         let vault_before = engine.vault;
         let principal_before = engine.accounts[user_idx as usize].capital;
 
-        let _ = engine.deposit(user_idx, amount, DEFAULT_ORACLE, 0);
+        let _ = engine.deposit_not_atomic(user_idx, amount, DEFAULT_ORACLE, 0);
 
         prop_assert_eq!(engine.vault, vault_before + amount);
         prop_assert_eq!(engine.accounts[user_idx as usize].capital, principal_before + amount);
@@ -1041,7 +1041,7 @@ proptest! {
         let mut engine = Box::new(RiskEngine::new(params_regime_a()));
         let user_idx = engine.add_user(1).unwrap();
 
-        engine.deposit(user_idx, deposit_amount, DEFAULT_ORACLE, 0).unwrap();
+        engine.deposit_not_atomic(user_idx, deposit_amount, DEFAULT_ORACLE, 0).unwrap();
 
         // Snapshot for rollback simulation
         let before = (*engine).clone();
@@ -1069,7 +1069,7 @@ proptest! {
         let user_idx = engine.add_user(1).unwrap();
 
         for amount in deposits {
-            let _ = engine.deposit(user_idx, amount, DEFAULT_ORACLE, 0);
+            let _ = engine.deposit_not_atomic(user_idx, amount, DEFAULT_ORACLE, 0);
         }
 
         prop_assert!(engine.check_conservation());
@@ -1096,8 +1096,8 @@ fn conservation_after_trade_and_funding_regression() {
     // Create LP and user with positions
     let lp_idx = engine.add_lp([0u8; 32], [0u8; 32], 1).unwrap();
     let user_idx = engine.add_user(1).unwrap();
-    engine.deposit(lp_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
-    engine.deposit(user_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
+    engine.deposit_not_atomic(lp_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
+    engine.deposit_not_atomic(user_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
 
     // Make crank fresh
     engine.last_crank_slot = 0;
@@ -1142,7 +1142,7 @@ fn harness_rollback_simulation_test() {
 
     // Create user with some capital
     let user_idx = engine.add_user(1).unwrap();
-    engine.deposit(user_idx, 1000, DEFAULT_ORACLE, 0).unwrap();
+    engine.deposit_not_atomic(user_idx, 1000, DEFAULT_ORACLE, 0).unwrap();
 
     // Accrue market to create state that could be mutated (rate passed directly)
     engine.last_oracle_price = DEFAULT_ORACLE;

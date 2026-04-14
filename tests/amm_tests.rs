@@ -67,8 +67,8 @@ fn test_e2e_complete_user_journey() {
     let oracle_price: u64 = 100; // 100 quote per base
 
     // Users deposit principal
-    engine.deposit(alice, 100_000, oracle_price, 0).unwrap();
-    engine.deposit(bob, 150_000, oracle_price, 0).unwrap();
+    engine.deposit_not_atomic(alice, 100_000, oracle_price, 0).unwrap();
+    engine.deposit_not_atomic(bob, 150_000, oracle_price, 0).unwrap();
 
     // Make crank fresh
     crank(&mut engine, 0, oracle_price);
@@ -180,8 +180,8 @@ fn test_e2e_funding_complete_cycle() {
 
     let oracle_price: u64 = 100;
 
-    engine.deposit(alice, 200_000, oracle_price, 0).unwrap();
-    engine.deposit(bob, 200_000, oracle_price, 0).unwrap();
+    engine.deposit_not_atomic(alice, 200_000, oracle_price, 0).unwrap();
+    engine.deposit_not_atomic(bob, 200_000, oracle_price, 0).unwrap();
 
     crank(&mut engine, 0, oracle_price);
 
@@ -263,8 +263,8 @@ fn test_e2e_negative_funding_rate() {
 
     let oracle_price: u64 = 100;
 
-    engine.deposit(alice, 200_000, oracle_price, 0).unwrap();
-    engine.deposit(bob, 200_000, oracle_price, 0).unwrap();
+    engine.deposit_not_atomic(alice, 200_000, oracle_price, 0).unwrap();
+    engine.deposit_not_atomic(bob, 200_000, oracle_price, 0).unwrap();
 
     crank(&mut engine, 0, oracle_price);
 

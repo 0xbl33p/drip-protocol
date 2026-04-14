@@ -47,8 +47,8 @@ fn t11_44_trade_path_reopens_ready_reset_side() {
 
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
-    engine.deposit(a, 10_000_000, 100, 0).unwrap();
-    engine.deposit(b, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
 
     engine.side_mode_long = SideMode::ResetPending;
     engine.oi_eff_long_q = 0u128;
@@ -225,21 +225,21 @@ fn t11_53_keeper_crank_quiesces_after_pending_reset() {
     let c = engine.add_user(0).unwrap();
 
     // a: long POS_SCALE (entire long side OI), tiny capital → deeply underwater
-    engine.deposit(a, 1, 100, 0).unwrap();
+    engine.deposit_not_atomic(a, 1, 100, 0).unwrap();
     engine.accounts[a as usize].position_basis_q = POS_SCALE as i128;
     engine.accounts[a as usize].adl_a_basis = ADL_ONE;
     engine.accounts[a as usize].adl_k_snap = 0i128;
     engine.accounts[a as usize].adl_epoch_snap = 0;
 
     // b: short POS_SCALE, well-funded
-    engine.deposit(b, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
     engine.accounts[b as usize].position_basis_q = -(POS_SCALE as i128);
     engine.accounts[b as usize].adl_a_basis = ADL_ONE;
     engine.accounts[b as usize].adl_k_snap = 0i128;
     engine.accounts[b as usize].adl_epoch_snap = 0;
 
     // c: NO position, just capital (should NOT be touched after pending reset)
-    engine.deposit(c, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(c, 10_000_000, 100, 0).unwrap();
 
     // BALANCED OI: 1 long (a) = PS, 1 short (b) = PS
     engine.stored_pos_count_long = 1;
@@ -311,14 +311,14 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
     let b = engine.add_user(0).unwrap();
 
     // a: the last stale long account — has a position from epoch 0 (stale)
-    engine.deposit(a, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(a, 10_000_000, 100, 0).unwrap();
     engine.accounts[a as usize].position_basis_q = POS_SCALE as i128;
     engine.accounts[a as usize].adl_a_basis = ADL_ONE;
     engine.accounts[a as usize].adl_k_snap = 0i128;
     engine.accounts[a as usize].adl_epoch_snap = 0;  // mismatches adl_epoch_long=1
 
     // b: a short account (non-stale, current epoch)
-    engine.deposit(b, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(b, 10_000_000, 100, 0).unwrap();
     engine.accounts[b as usize].position_basis_q = 0i128;
     engine.accounts[b as usize].adl_a_basis = ADL_ONE;
     engine.accounts[b as usize].adl_k_snap = 0i128;
@@ -396,9 +396,9 @@ fn proof_adl_pipeline_trade_liquidate_reopen() {
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
     let c = engine.add_user(0).unwrap();
-    engine.deposit(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.deposit(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.deposit(c, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(a, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(b, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(c, 500_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Step 1: a goes long, b goes short (bilateral position)
     let size = (500 * POS_SCALE) as i128;

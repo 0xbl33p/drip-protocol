@@ -997,7 +997,7 @@ impl RiskEngine {
         let old = self.accounts[idx].pnl;
         let old_pos = i128_clamp_pos(old);
         let old_rel = if self.market_mode == MarketMode::Live {
-            old_pos - self.accounts[idx].reserved_pnl
+            old_pos.checked_sub(self.accounts[idx].reserved_pnl).ok_or(RiskError::CorruptState)?
         } else {
             if self.accounts[idx].reserved_pnl != 0 { return Err(RiskError::CorruptState); }
             old_pos
@@ -1127,11 +1127,11 @@ impl RiskEngine {
 
         let old_pos = i128_clamp_pos(self.accounts[idx].pnl);
         let old_r = self.accounts[idx].reserved_pnl;
-        let old_rel = old_pos - old_r;
+        let old_rel = old_pos.checked_sub(old_r).ok_or(RiskError::CorruptState)?;
         if x > old_rel { return Err(RiskError::CorruptState); }
 
-        let new_pos = old_pos - x;
-        let new_rel = old_rel - x;
+        let new_pos = old_pos.checked_sub(x).ok_or(RiskError::CorruptState)?;
+        let new_rel = old_rel.checked_sub(x).ok_or(RiskError::CorruptState)?;
         if new_pos < old_r { return Err(RiskError::CorruptState); }
 
         // Update pnl_pos_tot
@@ -1199,14 +1199,20 @@ impl RiskEngine {
                 Side::Long => {
                     self.stored_pos_count_long = self.stored_pos_count_long
                         .checked_add(1).expect("stored_pos_count_long overflow");
-                    assert!(self.stored_pos_count_long <= MAX_ACTIVE_POSITIONS_PER_SIDE,
-                        "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
+                    if self.stored_pos_count_long > MAX_ACTIVE_POSITIONS_PER_SIDE {
+                        self.stored_pos_count_long -= 1; // rollback
+                        self.accounts[idx].position_basis_q = old; // rollback
+                        return; // reject silently (caller checks OI)
+                    }
                 }
                 Side::Short => {
                     self.stored_pos_count_short = self.stored_pos_count_short
                         .checked_add(1).expect("stored_pos_count_short overflow");
-                    assert!(self.stored_pos_count_short <= MAX_ACTIVE_POSITIONS_PER_SIDE,
-                        "set_position_basis_q: exceeds MAX_ACTIVE_POSITIONS_PER_SIDE");
+                    if self.stored_pos_count_short > MAX_ACTIVE_POSITIONS_PER_SIDE {
+                        self.stored_pos_count_short -= 1; // rollback
+                        self.accounts[idx].position_basis_q = old; // rollback
+                        return; // reject silently (caller checks OI)
+                    }
                 }
             }
         }
@@ -1553,7 +1559,10 @@ impl RiskEngine {
         let a_basis = self.accounts[idx].adl_a_basis;
 
         if a_basis == 0 {
-            return 0i128; // missing account or pre-attach state
+            // a_basis==0 with nonzero basis is corrupt; with zero basis it's pre-attach/missing.
+            // Both return 0 (treating as flat). Callers of mutation paths should
+            // check basis != 0 && a_basis == 0 separately if they need to reject.
+            return 0i128;
         }
 
         let abs_basis = basis.unsigned_abs();
@@ -2419,6 +2428,9 @@ impl RiskEngine {
     pub fn released_pos(&self, idx: usize) -> u128 {
         let pnl = self.accounts[idx].pnl;
         let pos_pnl = i128_clamp_pos(pnl);
+        // Checked: reserved_pnl > pos_pnl would be CorruptState,
+        // but this is a view fn (no Result). Saturating is safe here
+        // because callers validate before mutation.
         pos_pnl.saturating_sub(self.accounts[idx].reserved_pnl)
     }
 
@@ -2942,7 +2954,7 @@ impl RiskEngine {
     // deposit (spec §10.2)
     // ========================================================================
 
-    pub fn deposit(&mut self, idx: u16, amount: u128, _oracle_price: u64, now_slot: u64) -> Result<()> {
+    pub fn deposit_not_atomic(&mut self, idx: u16, amount: u128, _oracle_price: u64, now_slot: u64) -> Result<()> {
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
         }

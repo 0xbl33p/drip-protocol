@@ -117,7 +117,7 @@ fn inductive_top_up_insurance_preserves_accounting() {
 
     let dep: u32 = kani::any();
     kani::assume(dep > 0 && dep <= 1_000_000);
-    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 
     let ins_amt: u32 = kani::any();
@@ -135,7 +135,7 @@ fn inductive_set_capital_decrease_preserves_accounting() {
 
     let dep: u32 = kani::any();
     kani::assume(dep >= 1000 && dep <= 1_000_000);
-    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 
     let new_cap: u32 = kani::any();
@@ -174,7 +174,7 @@ fn inductive_deposit_preserves_accounting() {
 
     let dep: u32 = kani::any();
     kani::assume(dep >= 1 && dep <= 1_000_000);
-    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 }
 
@@ -186,7 +186,7 @@ fn inductive_withdraw_preserves_accounting() {
     let idx = engine.add_user(0).unwrap();
 
     // Concrete deposit to reduce symbolic state space
-    engine.deposit(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     // Symbolic withdrawal amount
     let w: u32 = kani::any();
@@ -207,7 +207,7 @@ fn inductive_settle_loss_preserves_accounting() {
 
     let dep: u32 = kani::any();
     kani::assume(dep >= 1000 && dep <= 1_000_000);
-    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 
     let loss: i32 = kani::any();
@@ -264,7 +264,7 @@ fn prop_conservation_holds_after_all_ops() {
 
     let dep: u32 = kani::any();
     kani::assume(dep > 0 && dep <= 5_000_000);
-    engine.deposit(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, dep as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
     assert!(engine.check_conservation());
 
     let ins_amt: u32 = kani::any();
@@ -378,7 +378,7 @@ fn proof_set_capital_maintains_c_tot() {
 
     let initial: u32 = kani::any();
     kani::assume(initial > 0 && initial <= 1_000_000);
-    engine.deposit(idx, initial as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, initial as u128, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     assert!(engine.c_tot.get() == engine.accounts[idx as usize].capital.get());
 
@@ -488,8 +488,8 @@ fn proof_side_mode_gating() {
 
     let a = engine.add_user(0).unwrap();
     let b = engine.add_user(0).unwrap();
-    engine.deposit(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
-    engine.deposit(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(a, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(b, 5_000_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     engine.side_mode_long = SideMode::DrainOnly;
 
