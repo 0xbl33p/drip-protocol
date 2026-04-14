@@ -847,18 +847,15 @@ impl RiskEngine {
     }
 
     test_visible! {
-    fn free_slot(&mut self, idx: u16) {
-        // Defense-in-depth: callers must ensure pnl and reserved are zero
-        // before freeing, otherwise pnl_pos_tot / pnl_matured_pos_tot corrupt.
-        assert!(self.accounts[idx as usize].reserved_pnl == 0,
-            "free_slot: reserved_pnl must be 0");
-        // Track neg_pnl_account_count before zeroing (spec §4.7, v12.16.4)
-        if self.accounts[idx as usize].pnl < 0 {
-            self.neg_pnl_account_count = self.neg_pnl_account_count.checked_sub(1)
-                .expect("free_slot: neg_pnl_account_count underflow");
+    fn free_slot(&mut self, idx: u16) -> Result<()> {
+        let i = idx as usize;
+        if self.accounts[i].pnl != 0 { return Err(RiskError::CorruptState); }
+        if self.accounts[i].reserved_pnl != 0 { return Err(RiskError::CorruptState); }
+        if self.accounts[i].position_basis_q != 0 { return Err(RiskError::CorruptState); }
+        if self.accounts[i].sched_present != 0 || self.accounts[i].pending_present != 0 {
+            return Err(RiskError::CorruptState);
         }
-        // Zero account fields in-place to avoid stack overflow (Account > 4KB).
-        let a = &mut self.accounts[idx as usize];
+        let a = &mut self.accounts[i];
         a.capital = U128::ZERO;
         a.kind = Account::KIND_USER;
         a.pnl = 0;
@@ -882,14 +879,14 @@ impl RiskEngine {
         a.pending_remaining_q = 0;
         a.pending_horizon = 0;
         a.pending_created_slot = 0;
-        self.clear_used(idx as usize);
-        self.next_free[idx as usize] = self.free_head;
+        self.clear_used(i);
+        self.next_free[i] = self.free_head;
         self.free_head = idx;
         self.num_used_accounts = self.num_used_accounts.checked_sub(1)
-            .expect("free_slot: num_used_accounts underflow — double-free corruption");
-        // Decrement materialized_account_count (spec §2.1.2)
+            .ok_or(RiskError::CorruptState)?;
         self.materialized_account_count = self.materialized_account_count.checked_sub(1)
-            .expect("free_slot: materialized_account_count underflow — double-free corruption");
+            .ok_or(RiskError::CorruptState)?;
+        Ok(())
     }
     }
 
@@ -1715,7 +1712,7 @@ impl RiskEngine {
     /// v12.16.4: no stored rate, so no recompute_r_last call.
     pub fn run_end_of_instruction_lifecycle(&mut self, ctx: &mut InstructionContext) -> Result<()> {
         self.schedule_end_of_instruction_resets(ctx)?;
-        self.finalize_end_of_instruction_resets(ctx);
+        self.finalize_end_of_instruction_resets(ctx)?;
         Ok(())
     }
 
@@ -2038,15 +2035,15 @@ impl RiskEngine {
     }
 
     test_visible! {
-    fn finalize_end_of_instruction_resets(&mut self, ctx: &InstructionContext) {
+    fn finalize_end_of_instruction_resets(&mut self, ctx: &InstructionContext) -> Result<()> {
         if ctx.pending_reset_long && self.side_mode_long != SideMode::ResetPending {
-            let _ = self.begin_full_drain_reset(Side::Long);
+            self.begin_full_drain_reset(Side::Long)?;
         }
         if ctx.pending_reset_short && self.side_mode_short != SideMode::ResetPending {
-            let _ = self.begin_full_drain_reset(Side::Short);
+            self.begin_full_drain_reset(Side::Short)?;
         }
-        // Auto-finalize sides that are fully ready for reopening
         self.maybe_finalize_ready_reset_sides();
+        Ok(())
     }
     }
 
@@ -2441,7 +2438,7 @@ impl RiskEngine {
     test_visible! {
     fn prepare_account_for_resolved_touch(&mut self, idx: usize) {
         let a = &mut self.accounts[idx];
-        if a.reserved_pnl == 0 { return; }
+        // Always clear bucket metadata even if reserved_pnl == 0.
         a.sched_present = 0;
         a.sched_remaining_q = 0;
         a.sched_anchor_q = 0;
@@ -2991,7 +2988,7 @@ impl RiskEngine {
 
         // Steps 8-9: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
         Ok(())
     }
@@ -3037,7 +3034,7 @@ impl RiskEngine {
 
         // Steps 5-6: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
         // Step 7: assert OI balance
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after settle");
@@ -3260,7 +3257,7 @@ impl RiskEngine {
 
         // Steps 16-17: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
         // Step 18: assert OI balance (spec §10.4)
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after trade");
@@ -3523,7 +3520,7 @@ impl RiskEngine {
 
         // End-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
         // Assert OI balance unconditionally (spec §10.6 step 11)
         assert!(self.oi_eff_long_q == self.oi_eff_short_q, "OI_eff_long != OI_eff_short after liquidation");
@@ -3766,11 +3763,11 @@ impl RiskEngine {
         self.finalize_touched_accounts_post_live(&ctx);
 
         // GC dust accounts
-        let gc_closed = self.garbage_collect_dust();
+        let gc_closed = self.garbage_collect_dust()?;
 
         // Steps 9-10: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
         // Step 12: assert OI balance
         assert!(self.oi_eff_long_q == self.oi_eff_short_q,
@@ -3951,7 +3948,7 @@ impl RiskEngine {
 
         // Steps 12-13: end-of-instruction resets
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
         Ok(())
     }
@@ -4009,9 +4006,9 @@ impl RiskEngine {
 
         // End-of-instruction resets before freeing
         self.schedule_end_of_instruction_resets(&mut ctx)?;
-        self.finalize_end_of_instruction_resets(&ctx);
+        self.finalize_end_of_instruction_resets(&ctx)?;
 
-        self.free_slot(idx);
+        self.free_slot(idx)?;
 
         Ok(capital.get())
     }
@@ -4313,7 +4310,7 @@ impl RiskEngine {
         if capital > self.vault { return Err(RiskError::InsufficientBalance); }
         self.vault = self.vault - capital;
         self.set_capital(i, 0);
-        self.free_slot(idx);
+        self.free_slot(idx)?;
         Ok(capital.get())
     }
 
@@ -4380,7 +4377,7 @@ impl RiskEngine {
         }
 
         // Free the slot
-        self.free_slot(idx);
+        self.free_slot(idx)?;
 
         Ok(())
     }
@@ -4390,7 +4387,7 @@ impl RiskEngine {
     // ========================================================================
 
     test_visible! {
-    fn garbage_collect_dust(&mut self) -> u32 {
+    fn garbage_collect_dust(&mut self) -> Result<u32> {
         let mut to_free: [u16; GC_CLOSE_BUDGET as usize] = [0; GC_CLOSE_BUDGET as usize];
         let mut num_to_free = 0usize;
 
@@ -4457,10 +4454,10 @@ impl RiskEngine {
         self.gc_cursor = ((start + scanned) & ACCOUNT_IDX_MASK) as u16;
 
         for i in 0..num_to_free {
-            self.free_slot(to_free[i]);
+            self.free_slot(to_free[i])?;
         }
 
-        num_to_free as u32
+        Ok(num_to_free as u32)
     }
     }
 
