@@ -236,7 +236,7 @@ fn proof_notional_scales_with_price() {
     // through the floor(abs(eff_pos_q) * price / POS_SCALE) formula.
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
-    engine.deposit(idx, 10_000_000, 100, 0).unwrap();
+    engine.deposit_not_atomic(idx, 10_000_000, 100, 0).unwrap();
 
     // Give the account a non-zero position
     let q_mul: u8 = kani::any();
@@ -260,14 +260,14 @@ fn proof_notional_scales_with_price() {
     assert!(n2 >= n1, "notional must be monotone in price");
 }
 
-/// advance_profit_warmup_cohort releases at most reserved_pnl (§4.9)
+/// advance_profit_warmup releases at most reserved_pnl (§4.9)
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn proof_warmup_release_bounded_by_reserved() {
     let mut engine = RiskEngine::new(zero_fee_params());
     let idx = engine.add_user(0).unwrap();
-    engine.deposit(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(idx, 100_000, DEFAULT_ORACLE, DEFAULT_SLOT).unwrap();
 
     let pnl_val: u16 = kani::any();
     kani::assume(pnl_val > 0 && pnl_val <= 10_000);
@@ -275,11 +275,11 @@ fn proof_warmup_release_bounded_by_reserved() {
     // After set_pnl, reserved_pnl tracks the positive PnL increase
     let r_before = engine.accounts[idx as usize].reserved_pnl;
 
-    engine.advance_profit_warmup_cohort(idx as usize);
+    engine.advance_profit_warmup(idx as usize);
     let r_after = engine.accounts[idx as usize].reserved_pnl;
 
     // reserved can only decrease or stay the same
-    assert!(r_after <= r_before, "advance_profit_warmup_cohort must not increase reserve");
+    assert!(r_after <= r_before, "advance_profit_warmup must not increase reserve");
 }
 
 // ============================================================================

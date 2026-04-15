@@ -296,7 +296,6 @@ struct FuzzState {
     engine: Box<RiskEngine>,
     live_accounts: Vec<u16>,
     lp_idx: Option<u16>,
-    account_ids: Vec<u64>, // Track allocated account IDs for uniqueness
     rng_state: u64,        // For deterministic selector resolution
     last_oracle_price: u64, // Track last oracle price for conservation checks with mark PnL
 }
@@ -307,7 +306,6 @@ impl FuzzState {
             engine: Box::new(RiskEngine::new(params)),
             live_accounts: Vec::new(),
             lp_idx: None,
-            account_ids: Vec::new(),
             rng_state: 12345,
             last_oracle_price: DEFAULT_ORACLE,
         }
@@ -375,9 +373,7 @@ impl FuzzState {
                 // Snapshot engine and harness state for rollback
                 let before = (*self.engine).clone();
                 let live_before = self.live_accounts.clone();
-                let ids_before = self.account_ids.clone();
                 let num_used_before = self.count_used();
-                let next_id_before = self.engine.next_account_id;
 
                 let result = self.engine.add_user(*fee_payment);
 
@@ -395,22 +391,7 @@ impl FuzzState {
                             "{}: num_used didn't increment",
                             context
                         );
-                        assert_eq!(
-                            self.engine.next_account_id,
-                            next_id_before + 1,
-                            "{}: next_account_id didn't increment",
-                            context
-                        );
 
-                        // Account ID should be unique
-                        let new_id = self.engine.accounts[idx as usize].account_id;
-                        assert!(
-                            !self.account_ids.contains(&new_id),
-                            "{}: duplicate account_id {}",
-                            context,
-                            new_id
-                        );
-                        self.account_ids.push(new_id);
                         self.live_accounts.push(idx);
                         assert_global_invariants(&self.engine, &context);
                     }
@@ -418,7 +399,6 @@ impl FuzzState {
                         // Simulate Solana rollback - restore engine and harness state
                         *self.engine = before;
                         self.live_accounts = live_before;
-                        self.account_ids = ids_before;
                     }
                 }
             }
@@ -427,7 +407,6 @@ impl FuzzState {
                 // Snapshot engine and harness state for rollback
                 let before = (*self.engine).clone();
                 let live_before = self.live_accounts.clone();
-                let ids_before = self.account_ids.clone();
                 let lp_before = self.lp_idx;
                 let num_used_before = self.count_used();
 
@@ -447,13 +426,6 @@ impl FuzzState {
                             context
                         );
 
-                        let new_id = self.engine.accounts[idx as usize].account_id;
-                        assert!(
-                            !self.account_ids.contains(&new_id),
-                            "{}: duplicate LP account_id",
-                            context
-                        );
-                        self.account_ids.push(new_id);
                         self.live_accounts.push(idx);
                         if self.lp_idx.is_none() {
                             self.lp_idx = Some(idx);
@@ -464,7 +436,6 @@ impl FuzzState {
                         // Simulate Solana rollback - restore engine and harness state
                         *self.engine = before;
                         self.live_accounts = live_before;
-                        self.account_ids = ids_before;
                         self.lp_idx = lp_before;
                     }
                 }
@@ -475,7 +446,7 @@ impl FuzzState {
                 let before = (*self.engine).clone();
                 let vault_before = self.engine.vault;
 
-                let result = self.engine.deposit(idx, *amount, oracle, 0);
+                let result = self.engine.deposit_not_atomic(idx, *amount, oracle, 0);
 
                 match result {
                     Ok(()) => {
@@ -539,13 +510,12 @@ impl FuzzState {
                 rate_bps,
             } => {
                 let before = (*self.engine).clone();
-                // Set funding rate for next accrue_market_to call
-                self.engine.funding_rate_e9_per_slot_last = *rate_bps as i128;
                 let now_slot = self.engine.current_slot.saturating_add(*dt);
 
+                // v12.16.4: pass funding rate directly to accrue_market_to
                 let result = self
                     .engine
-                    .accrue_market_to(now_slot, *oracle_price);
+                    .accrue_market_to(now_slot, *oracle_price, *rate_bps as i128);
 
                 match result {
                     Ok(()) => {
@@ -566,7 +536,7 @@ impl FuzzState {
 
                 let result = (|| -> Result<()> {
                     let mut ctx = InstructionContext::new_with_h_lock(0);
-                    self.engine.accrue_market_to(now_slot, oracle)?;
+                    self.engine.accrue_market_to(now_slot, oracle, 0)?;
                     self.engine.current_slot = now_slot;
                     self.engine.touch_account_live_local(idx as usize, &mut ctx)?;
                     self.engine.finalize_touched_accounts_post_live(&ctx);
@@ -673,19 +643,17 @@ proptest! {
         if let Ok(idx) = lp_result {
             state.live_accounts.push(idx);
             state.lp_idx = Some(idx);
-            state.account_ids.push(state.engine.accounts[idx as usize].account_id);
         }
 
         for _ in 0..2 {
             if let Ok(idx) = state.engine.add_user(1) {
                 state.live_accounts.push(idx);
-                state.account_ids.push(state.engine.accounts[idx as usize].account_id);
-            }
+                }
         }
 
         // Initial deposits
         for &idx in &state.live_accounts.clone() {
-            let _ = state.engine.deposit(idx, 10_000, DEFAULT_ORACLE, 0);
+            let _ = state.engine.deposit_not_atomic(idx, 10_000, DEFAULT_ORACLE, 0);
         }
 
         // Top up insurance using proper API (maintains conservation)
@@ -713,19 +681,17 @@ proptest! {
         if let Ok(idx) = lp_result {
             state.live_accounts.push(idx);
             state.lp_idx = Some(idx);
-            state.account_ids.push(state.engine.accounts[idx as usize].account_id);
         }
 
         for _ in 0..2 {
             if let Ok(idx) = state.engine.add_user(1) {
                 state.live_accounts.push(idx);
-                state.account_ids.push(state.engine.accounts[idx as usize].account_id);
-            }
+                }
         }
 
         // Initial deposits
         for &idx in &state.live_accounts.clone() {
-            let _ = state.engine.deposit(idx, 10_000, DEFAULT_ORACLE, 0);
+            let _ = state.engine.deposit_not_atomic(idx, 10_000, DEFAULT_ORACLE, 0);
         }
 
         // Top up insurance using proper API (maintains conservation)
@@ -925,23 +891,17 @@ fn run_deterministic_fuzzer(
         if let Ok(idx) = state.engine.add_lp([0u8; 32], [0u8; 32], 1) {
             state.live_accounts.push(idx);
             state.lp_idx = Some(idx);
-            state
-                .account_ids
-                .push(state.engine.accounts[idx as usize].account_id);
         }
 
         for _ in 0..2 {
             if let Ok(idx) = state.engine.add_user(1) {
                 state.live_accounts.push(idx);
-                state
-                    .account_ids
-                    .push(state.engine.accounts[idx as usize].account_id);
             }
         }
 
         // Initial deposits
         for &idx in &state.live_accounts.clone() {
-            let _ = state.engine.deposit(idx, rng.u128(5_000, 50_000), DEFAULT_ORACLE, 0);
+            let _ = state.engine.deposit_not_atomic(idx, rng.u128(5_000, 50_000), DEFAULT_ORACLE, 0);
         }
 
         // Top up insurance using proper API (maintains conservation)
@@ -1066,7 +1026,7 @@ proptest! {
         let vault_before = engine.vault;
         let principal_before = engine.accounts[user_idx as usize].capital;
 
-        let _ = engine.deposit(user_idx, amount, DEFAULT_ORACLE, 0);
+        let _ = engine.deposit_not_atomic(user_idx, amount, DEFAULT_ORACLE, 0);
 
         prop_assert_eq!(engine.vault, vault_before + amount);
         prop_assert_eq!(engine.accounts[user_idx as usize].capital, principal_before + amount);
@@ -1081,7 +1041,7 @@ proptest! {
         let mut engine = Box::new(RiskEngine::new(params_regime_a()));
         let user_idx = engine.add_user(1).unwrap();
 
-        engine.deposit(user_idx, deposit_amount, DEFAULT_ORACLE, 0).unwrap();
+        engine.deposit_not_atomic(user_idx, deposit_amount, DEFAULT_ORACLE, 0).unwrap();
 
         // Snapshot for rollback simulation
         let before = (*engine).clone();
@@ -1109,7 +1069,7 @@ proptest! {
         let user_idx = engine.add_user(1).unwrap();
 
         for amount in deposits {
-            let _ = engine.deposit(user_idx, amount, DEFAULT_ORACLE, 0);
+            let _ = engine.deposit_not_atomic(user_idx, amount, DEFAULT_ORACLE, 0);
         }
 
         prop_assert!(engine.check_conservation());
@@ -1136,25 +1096,23 @@ fn conservation_after_trade_and_funding_regression() {
     // Create LP and user with positions
     let lp_idx = engine.add_lp([0u8; 32], [0u8; 32], 1).unwrap();
     let user_idx = engine.add_user(1).unwrap();
-    engine.deposit(lp_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
-    engine.deposit(user_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
+    engine.deposit_not_atomic(lp_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
+    engine.deposit_not_atomic(user_idx, 100_000, DEFAULT_ORACLE, 0).unwrap();
 
     // Make crank fresh
     engine.last_crank_slot = 0;
     engine.last_market_slot = 0;
     engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
 
     // Execute trade to create positions
     engine
         .execute_trade_not_atomic(lp_idx, user_idx, DEFAULT_ORACLE, 0, 1000, DEFAULT_ORACLE, 0i128, 0)
         .unwrap();
 
-    // Accrue market with funding
-    engine.funding_rate_e9_per_slot_last = 500;
+    // Accrue market with funding (rate passed directly)
     engine.advance_slot(1000);
     let slot = engine.current_slot;
-    engine.accrue_market_to(slot, DEFAULT_ORACLE).unwrap();
+    engine.accrue_market_to(slot, DEFAULT_ORACLE, 500).unwrap();
 
     // Verify conservation
     assert!(
@@ -1184,15 +1142,13 @@ fn harness_rollback_simulation_test() {
 
     // Create user with some capital
     let user_idx = engine.add_user(1).unwrap();
-    engine.deposit(user_idx, 1000, DEFAULT_ORACLE, 0).unwrap();
+    engine.deposit_not_atomic(user_idx, 1000, DEFAULT_ORACLE, 0).unwrap();
 
-    // Accrue market to create state that could be mutated
+    // Accrue market to create state that could be mutated (rate passed directly)
     engine.last_oracle_price = DEFAULT_ORACLE;
-    engine.funding_price_sample_last = DEFAULT_ORACLE;
-    engine.funding_rate_e9_per_slot_last = 100;
     engine.advance_slot(100);
     let slot = engine.current_slot;
-    engine.accrue_market_to(slot, DEFAULT_ORACLE).unwrap();
+    engine.accrue_market_to(slot, DEFAULT_ORACLE, 100).unwrap();
 
     // Capture complete state before failed operation (deep clone of RiskEngine)
     let before = (*engine).clone();
